@@ -17,6 +17,20 @@ production model kernels.
 
 ## Local Testing
 
+Install Bitty from GitHub on another machine:
+
+```bash
+git clone git@github.com:askscience/bitty.git
+cd bitty
+scripts/install_bitty.sh "$PWD"
+```
+
+Install Bitty and the local BitNet runtime/model:
+
+```bash
+INSTALL_BITNET=1 scripts/install_bitty.sh "$PWD"
+```
+
 Run the full verification suite:
 
 ```bash
@@ -94,3 +108,50 @@ cargo run -p bitty-inference --bin bitty-bitnet -- \
   --model /path/to/ggml-model-i2_s.gguf \
   --prompt "What is 1-bit inference?"
 ```
+
+## License
+
+Bitty is licensed under the GNU General Public License v3.0. See
+[`LICENSE`](LICENSE) for details.
+
+## Two-PC Status
+
+The real BitNet model currently runs on one machine through the official
+`bitnet.cpp` runtime. Cross-machine registration and heartbeat are implemented;
+cross-machine sharing of one BitNet model is not implemented yet.
+
+What works today:
+
+- Install and run the project on two PCs independently.
+- Run PC 1 as a gRPC coordinator and PC 2 as a worker that registers with it.
+- Run the in-process simulator with many virtual nodes.
+- Run the real `BitNet-b1.58-2B-4T` model locally on either PC.
+- Exercise the scheduler, topology, worker profile, activation codec, and
+  simulated ring tests.
+
+Two-PC control-plane test:
+
+On PC 1:
+
+```bash
+cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --layers 30
+```
+
+On PC 2, replacing the IP address with PC 1's LAN IP:
+
+```bash
+cargo run -p bitty-worker -- \
+  --node-id pc2 \
+  --coordinator 192.168.1.10:50051 \
+  --heartbeat-count 5
+```
+
+What is still missing for real two-PC sharing:
+
+- Real activation transfer over gRPC between machines.
+- Model layer/shard loading per worker.
+- Distributed BitNet execution across those shards.
+
+The next milestone is to turn the existing coordinator and worker libraries
+into an activation ring so registered workers can execute assigned layer ranges
+instead of only reporting profile and heartbeat data.

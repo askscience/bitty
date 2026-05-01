@@ -1,4 +1,5 @@
 pub mod kv_index;
+pub mod network;
 pub mod registry;
 pub mod router;
 pub mod scheduler;

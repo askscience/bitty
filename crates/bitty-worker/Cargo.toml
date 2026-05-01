@@ -15,4 +15,5 @@ metrics.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true

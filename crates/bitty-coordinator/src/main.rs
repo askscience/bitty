@@ -1,8 +1,16 @@
-use bitty_coordinator::{Halda, RingTopology, SchedulerConfig};
+use bitty_coordinator::{network::NetworkCoordinator, Halda, RingTopology, SchedulerConfig};
 use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, NodeTier};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = CoordinatorConfig::from_env();
+    if let Some(listen_addr) = &config.listen {
+        NetworkCoordinator::new(demo_layers(config.layers))
+            .serve(listen_addr)
+            .await?;
+        return Ok(());
+    }
+
     let profiles = demo_profiles(config.nodes);
     let layers = demo_layers(config.layers);
     let assignments = Halda::new(SchedulerConfig::default()).assign(&profiles, &layers)?;
@@ -38,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct CoordinatorConfig {
     nodes: usize,
     layers: u32,
+    listen: Option<String>,
 }
 
 impl CoordinatorConfig {
@@ -45,6 +54,7 @@ impl CoordinatorConfig {
         let mut config = Self {
             nodes: 8,
             layers: 16,
+            listen: None,
         };
         let mut args = std::env::args().skip(1);
 
@@ -52,6 +62,7 @@ impl CoordinatorConfig {
             match arg.as_str() {
                 "--nodes" => config.nodes = parse_next(&mut args, "--nodes"),
                 "--layers" => config.layers = parse_next(&mut args, "--layers"),
+                "--listen" => config.listen = Some(required_next(&mut args, "--listen")),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -115,16 +126,21 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    let value = args.next().unwrap_or_else(|| {
-        eprintln!("missing value for {name}");
-        std::process::exit(2);
-    });
+    let value = required_next(args, name);
     value.parse().unwrap_or_else(|err| {
         eprintln!("invalid value for {name}: {err}");
         std::process::exit(2);
     })
 }
 
+fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> String {
+    args.next().unwrap_or_else(|| {
+        eprintln!("missing value for {name}");
+        std::process::exit(2);
+    })
+}
+
 fn print_help() {
-    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N]");
+    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR]");
+    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --layers 30");
 }

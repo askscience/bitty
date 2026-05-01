@@ -175,11 +175,13 @@ dependencies = [
  "bincode",
  "bitty-inference",
  "bitty-protocol",
+ "futures",
  "governor",
  "proptest",
  "serde",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
 ]
@@ -257,6 +259,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
 ]
 
