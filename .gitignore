@@ -1,0 +1,14 @@
+/target/
+/external/
+/.DS_Store
+**/.DS_Store
+
+# Local editor and generated logs
+/.idea/
+/.vscode/
+*.log
+
+# Local Python environments
+.venv/
+.bitty-venv/
+__pycache__/

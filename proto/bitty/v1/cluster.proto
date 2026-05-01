@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package bitty.v1;
+
+message HardwareProfile {
+  string node_id = 1;
+  double cpu_tflops = 2;
+  double gpu_tflops = 3;
+  double memory_gb = 4;
+  double memory_bandwidth_gbps = 5;
+  double disk_bandwidth_mbps = 6;
+  double network_rtt_ms = 7;
+  double uplink_mbps = 8;
+  string os = 9;
+  string tier = 10;
+}
+
+message LayerMetadata {
+  uint32 layer_id = 1;
+  uint64 weight_bytes = 2;
+  uint64 activation_bytes = 3;
+  double estimated_flops = 4;
+  bool precision_critical = 5;
+}
+
+message AssignedLayerRange {
+  uint32 start_layer = 1;
+  uint32 end_layer_exclusive = 2;
+  string quantization = 3;
+}
+
+message LayerAssignment {
+  string node_id = 1;
+  AssignedLayerRange range = 2;
+  uint64 assigned_weight_bytes = 3;
+  double expected_latency_ms = 4;
+  string next_node_id = 5;
+}
+
+message ActivationTensor {
+  string request_id = 1;
+  uint32 token_position = 2;
+  uint32 source_layer = 3;
+  uint32 target_layer = 4;
+  repeated uint32 shape = 5;
+  string dtype = 6;
+  bytes payload = 7;
+  uint32 crc32 = 8;
+}
+
+message TokenOutput {
+  string request_id = 1;
+  uint32 token_position = 2;
+  uint32 token_id = 3;
+  string text = 4;
+  bool finished = 5;
+}
+
+message RegisterWorkerRequest {
+  HardwareProfile profile = 1;
+}
+
+message RegisterWorkerResponse {
+  repeated LayerAssignment assignments = 1;
+  string topology_epoch = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  double observed_tokens_per_second = 2;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  string topology_epoch = 2;
+}
+
+message TopologyUpdate {
+  string topology_epoch = 1;
+  repeated LayerAssignment assignments = 2;
+}
+
+service CoordinatorService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc StreamTokens(ActivationTensor) returns (stream TokenOutput);
+}
+
+service WorkerService {
+  rpc ForwardActivation(ActivationTensor) returns (ActivationTensor);
+  rpc ApplyTopology(TopologyUpdate) returns (HeartbeatResponse);
+}

@@ -1,0 +1,15 @@
+[package]
+name = "bitty-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitty-coordinator.workspace = true
+bitty-inference.workspace = true
+bitty-protocol.workspace = true
+bitty-worker.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

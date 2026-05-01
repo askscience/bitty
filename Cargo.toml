@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/bitty-protocol",
+    "crates/bitty-model",
+    "crates/bitty-inference",
+    "crates/bitty-coordinator",
+    "crates/bitty-worker",
+    "crates/bitty-sim",
+    "crates/bitty-observability",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/bitty"
+rust-version = "1.78"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bincode = "1"
+bytes = "1"
+crc32fast = "1"
+futures = "0.3"
+governor = "0.6"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+prost = "0.13"
+proptest = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.28"
+tonic = "0.12"
+tonic-build = "0.12"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+bitty-protocol = { path = "crates/bitty-protocol" }
+bitty-model = { path = "crates/bitty-model" }
+bitty-inference = { path = "crates/bitty-inference" }
+bitty-coordinator = { path = "crates/bitty-coordinator" }
+bitty-worker = { path = "crates/bitty-worker" }
+bitty-observability = { path = "crates/bitty-observability" }
