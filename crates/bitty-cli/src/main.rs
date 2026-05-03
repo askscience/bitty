@@ -303,18 +303,15 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
             scheduler_service = Some(coordinator.clone());
         } else {
             let leader_addr = config.listen.clone();
+            let coordinator_server = coordinator.clone();
             tokio::spawn(async move {
-                if let Err(err) = coordinator.serve(&leader_addr).await {
+                if let Err(err) = coordinator_server.serve(&leader_addr).await {
                     eprintln!("bitty node scheduler stopped: {err}");
                 }
             });
         }
         match &iroh_node {
-            Some(iroh_node) => SchedulerTarget::Iroh {
-                endpoint: iroh_node.endpoint.clone(),
-                remote: iroh_node.endpoint.addr(),
-                token: cluster_token.clone(),
-            },
+            Some(_) => SchedulerTarget::Local(coordinator.clone()),
             None => SchedulerTarget::Tcp(leader),
         }
     };
@@ -679,6 +676,7 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
 
 #[derive(Clone)]
 enum SchedulerTarget {
+    Local(NetworkCoordinator),
     Tcp(String),
     Iroh {
         endpoint: Endpoint,
@@ -711,6 +709,39 @@ async fn register_and_heartbeat(
     };
 
     match target {
+        SchedulerTarget::Local(coordinator) => {
+            let registration = coordinator
+                .register_worker(tonic::Request::new(RegisterWorkerRequest {
+                    profile: Some((&profile).into()),
+                }))
+                .await?
+                .into_inner();
+            println!(
+                "bitty node started local scheduler; topology_epoch={} assignments={}",
+                registration.topology_epoch,
+                registration.assignments.len()
+            );
+            loop {
+                sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
+                let response = coordinator
+                    .heartbeat(tonic::Request::new(HeartbeatRequest {
+                        node_id: profile.node_id.0.clone(),
+                        observed_tokens_per_second: profile.effective_compute_score(),
+                    }))
+                    .await;
+                match response {
+                    Ok(response) => {
+                        if !response.into_inner().accepted {
+                            eprintln!(
+                                "scheduler rejected heartbeat for node {}",
+                                profile.node_id.0
+                            );
+                        }
+                    }
+                    Err(err) => eprintln!("heartbeat failed: {err}"),
+                }
+            }
+        }
         SchedulerTarget::Tcp(leader) => {
             let endpoint = normalize_endpoint(leader);
             let mut client = CoordinatorServiceClient::connect(endpoint.clone()).await?;
