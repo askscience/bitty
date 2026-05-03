@@ -247,7 +247,10 @@ impl Cli {
     }
 }
 
-async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if config.node_id.is_empty() {
+        config.node_id = default_node_id();
+    }
     logger::log_default(format!(
         "starting node id={} model={} join={}",
         config.node_id,
@@ -273,14 +276,26 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         remember_active_cluster(&data_dir, join)?;
     }
 
-    if !use_iroh {
-        let worker_listen = config.worker_listen.clone().unwrap_or_else(|| {
+    let local_worker_endpoint = if use_iroh && config.join.is_none() {
+        Some(
+            config
+                .worker_listen
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:50061".into()),
+        )
+    } else if !use_iroh {
+        Some(config.worker_listen.clone().unwrap_or_else(|| {
             if config.join.is_some() {
                 config.listen.clone()
             } else {
                 "0.0.0.0:50061".into()
             }
-        });
+        }))
+    } else {
+        None
+    };
+
+    if let Some(worker_listen) = &local_worker_endpoint {
         let worker_server = worker.clone();
         let worker_addr = worker_listen.clone();
         tokio::spawn(async move {
@@ -338,6 +353,7 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         &scheduler_target,
         &config,
         iroh_node.as_ref(),
+        local_worker_endpoint.as_deref(),
         &cluster_token,
     )
     .await
@@ -689,24 +705,33 @@ async fn register_and_heartbeat(
     target: &SchedulerTarget,
     config: &NodeConfig,
     iroh_node: Option<&IrohNode>,
+    local_worker_endpoint: Option<&str>,
     cluster_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
     profile.model_path = config.model.clone();
-    profile.worker_endpoint = if let Some(iroh_node) = iroh_node {
-        iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), cluster_token)
-    } else {
-        let worker_listen = config.worker_listen.clone().unwrap_or_else(|| {
-            if config.join.is_some() {
-                config.listen.clone()
-            } else {
-                "0.0.0.0:50061".into()
-            }
-        });
-        config
-            .public_endpoint
-            .clone()
-            .unwrap_or_else(|| public_endpoint_from_listen(&worker_listen))
+    profile.worker_endpoint = match target {
+        SchedulerTarget::Local(_) => local_worker_endpoint
+            .map(public_endpoint_from_listen)
+            .unwrap_or_else(|| "127.0.0.1:50061".into()),
+        SchedulerTarget::Iroh { .. } => iroh_node
+            .map(|iroh_node| {
+                iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), cluster_token)
+            })
+            .unwrap_or_default(),
+        SchedulerTarget::Tcp(_) => {
+            let worker_listen = config.worker_listen.clone().unwrap_or_else(|| {
+                if config.join.is_some() {
+                    config.listen.clone()
+                } else {
+                    "0.0.0.0:50061".into()
+                }
+            });
+            config
+                .public_endpoint
+                .clone()
+                .unwrap_or_else(|| public_endpoint_from_listen(&worker_listen))
+        }
     };
 
     match target {
@@ -1047,7 +1072,7 @@ fn yes_no(value: bool) -> &'static str {
 fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, String> {
     let mut config = NodeConfig {
         model: String::new(),
-        node_id: default_node_id(),
+        node_id: String::new(),
         listen: "0.0.0.0:50051".into(),
         worker_listen: None,
         public_endpoint: None,
@@ -1815,18 +1840,11 @@ fn public_endpoint_from_listen(listen: &str) -> String {
 }
 
 fn default_node_id() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .or_else(|_| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|hostname| hostname.trim().to_string())
-                .filter(|hostname| !hostname.is_empty())
-                .ok_or(std::env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| "bitty-node".into())
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("bitty-{:08x}", (nanos & 0xffff_ffff) as u32)
 }
 
 fn request_id() -> String {
