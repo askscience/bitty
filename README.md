@@ -25,6 +25,7 @@ Bitty provides:
 - An Ollama-like CLI for pulling, running, listing, showing, and managing models.
 - A local model cache under `~/.bitty/models`.
 - A settings file under `~/.bitty/config.toml`.
+- Persistent logs under `~/.bitty/logs/bitty.log` with simple rotation.
 - A Rust BitNet runtime path for Microsoft's `BitNet-b1.58-2B-4T` GGUF model.
 - An Iroh-based peer transport for encrypted peer-to-peer node communication.
 - Experimental scheduler/worker internals for distributed layer execution.
@@ -39,6 +40,7 @@ What works today:
 - Run local prompts with `bitty run MODEL`.
 - Start an API server with `bitty serve`.
 - Manage local settings, model profiles, and aliases.
+- Inspect local logs and cluster/node health from the `bitty` CLI.
 - Start advanced Bitty nodes that communicate over Iroh.
 - Run simulations, unit tests, and distributed control-plane smoke tests.
 
@@ -248,6 +250,36 @@ Creates a local model profile from a Bitty/Ollama-style `Modelfile`.
 bitty create my-bitnet -f Modelfile
 ```
 
+`bitty logs`
+
+Shows recent Bitty log lines from `~/.bitty/logs/bitty.log`.
+
+```bash
+bitty logs
+bitty logs --lines 200
+bitty logs --path
+bitty logs --clear
+```
+
+Logs rotate automatically when `bitty.log` grows past roughly 1 MB. Bitty keeps
+up to three rotated files: `bitty.log.1`, `bitty.log.2`, and `bitty.log.3`.
+
+`bitty cluster`
+
+Checks and inspects the distributed Bitty cluster.
+
+```bash
+bitty cluster status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster nodes --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster check --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster invite
+```
+
+`cluster status` prints leader, topology, worker count, model readiness, and
+layer assignments. `cluster nodes` focuses on node/layer placement. `cluster
+check` exits with an error when the cluster is not ready. `cluster invite`
+prints the local Iroh invite string for sharing with another Bitty node.
+
 ## Generation Options
 
 Common generation and runtime flags:
@@ -454,6 +486,12 @@ bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf --la
 The node prints an `iroh://...` join value containing the peer identity and
 cluster token.
 
+You can also print the current local Iroh invite:
+
+```bash
+bitty cluster invite
+```
+
 Join another machine:
 
 ```bash
@@ -477,6 +515,9 @@ Check cluster state:
 
 ```bash
 bitty status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster nodes --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster check --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
 ```
 
 Iroh first attempts direct peer-to-peer QUIC and can use relays for NAT

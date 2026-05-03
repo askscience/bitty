@@ -1,3 +1,4 @@
+mod logger;
 mod model_store;
 mod modelfile;
 mod server;
@@ -33,7 +34,9 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match Cli::parse(std::env::args().skip(1).collect()) {
+    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    logger::log_default(format!("bitty command: {}", raw_args.join(" ")));
+    let result = match Cli::parse(raw_args) {
         Ok(CliCommand::Node(config)) => run_node(config).await,
         Ok(CliCommand::Run(config)) => run_model(config).await,
         Ok(CliCommand::Pull(config)) => run_pull(config).await,
@@ -46,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Rm(config)) => run_rm(config).await,
         Ok(CliCommand::Cp(config)) => run_cp(config).await,
         Ok(CliCommand::Settings(config)) => run_settings(config).await,
+        Ok(CliCommand::Logs(config)) => run_logs(config).await,
+        Ok(CliCommand::Cluster(config)) => run_cluster(config).await,
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
@@ -58,7 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_help();
             std::process::exit(2);
         }
+    };
+    if let Err(err) = &result {
+        logger::log_default(format!("bitty error: {err}"));
     }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +84,8 @@ enum CliCommand {
     Rm(ModelCommand),
     Cp(CpConfig),
     Settings(SettingsCommand),
+    Logs(LogsConfig),
+    Cluster(ClusterCommand),
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
@@ -176,6 +187,28 @@ enum SettingsCommand {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogsConfig {
+    data_dir: Option<String>,
+    lines: usize,
+    path: bool,
+    clear: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClusterCommand {
+    Status(ClusterConfig),
+    Nodes(ClusterConfig),
+    Check(ClusterConfig),
+    Invite(DataDirConfig),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClusterConfig {
+    node: String,
+    data_dir: Option<String>,
+}
+
 struct Cli;
 
 impl Cli {
@@ -197,6 +230,8 @@ impl Cli {
             "rm" => parse_model_command(&mut args, "rm").map(CliCommand::Rm),
             "cp" => parse_cp(&mut args).map(CliCommand::Cp),
             "settings" => parse_settings(&mut args).map(CliCommand::Settings),
+            "logs" => parse_logs(&mut args).map(CliCommand::Logs),
+            "cluster" => parse_cluster(&mut args).map(CliCommand::Cluster),
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
@@ -207,6 +242,12 @@ impl Cli {
 }
 
 async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    logger::log_default(format!(
+        "starting node id={} model={} join={}",
+        config.node_id,
+        config.model,
+        config.join.as_deref().unwrap_or("leader")
+    ));
     let executor = Arc::new(BitNetLayerExecutor::load(&config.model).await?);
     let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor);
 
@@ -298,6 +339,10 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
 
 async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    logger::log(
+        &settings.data_dir,
+        format!("running model {}", config.model),
+    )?;
     let mut model = resolve_model(&settings, &config.model);
     if model.is_none() && config.auto_pull && settings.auto_pull {
         model = Some(pull_model(&settings, &config.model)?);
@@ -381,6 +426,10 @@ async fn run_local_model(
 
 async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    logger::log(
+        &settings.data_dir,
+        format!("pulling model {}", config.model),
+    )?;
     let model = pull_model(&settings, &config.model)?;
     println!(
         "pulled {} to {}",
@@ -453,6 +502,10 @@ async fn run_serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
     if let Some(host) = config.host {
         settings.api_host = host;
     }
+    logger::log(
+        &settings.data_dir,
+        format!("starting api server on {}", settings.api_host),
+    )?;
     server::serve(settings)
 }
 
@@ -502,6 +555,64 @@ async fn run_settings(config: SettingsCommand) -> Result<(), Box<dyn std::error:
         SettingsCommand::Path { data_dir } => {
             let settings = load_settings(data_dir.as_deref());
             println!("{}", settings.path().display());
+        }
+    }
+    Ok(())
+}
+
+async fn run_logs(config: LogsConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let path = logger::log_path(&data_dir);
+    if config.path {
+        println!("{}", path.display());
+        return Ok(());
+    }
+    if config.clear {
+        settings::ensure_parent(&path)?;
+        std::fs::write(&path, "")?;
+        logger::log(&data_dir, "logs cleared")?;
+        println!("cleared {}", path.display());
+        return Ok(());
+    }
+    logger::log(&data_dir, "logs read")?;
+    match logger::read_last_lines(&path, config.lines) {
+        Ok(lines) if !lines.is_empty() => println!("{lines}"),
+        Ok(_) => println!("log is empty: {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("log file does not exist yet: {}", path.display())
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match config {
+        ClusterCommand::Status(config) => {
+            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            print_cluster_status(status, true);
+        }
+        ClusterCommand::Nodes(config) => {
+            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            print_cluster_nodes(status);
+        }
+        ClusterCommand::Check(config) => {
+            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            print_cluster_check(&status);
+            if status.active_workers == 0 || !status.model_ready {
+                return Err("cluster is not ready".into());
+            }
+        }
+        ClusterCommand::Invite(config) => {
+            let data_dir = bitty_data_dir(config.data_dir.as_deref());
+            let iroh_node = start_iroh_node(&data_dir).await?;
+            let token = load_or_create_cluster_token(&data_dir);
+            println!("{}", iroh_transport::iroh_uri(&iroh_node.node_id, &token));
+            println!("Share this invite with another Bitty node:");
+            println!(
+                "bitty node --join '{}' --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
+                iroh_transport::iroh_uri(&iroh_node.node_id, &token)
+            );
         }
     }
     Ok(())
@@ -729,8 +840,17 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let status = if let Some((endpoint_id, token)) = iroh_transport::parse_iroh_uri(&config.node) {
-        let data_dir = bitty_data_dir(None);
+    let status = fetch_cluster_status(&config.node, None).await?;
+    print_cluster_status(status, true);
+    Ok(())
+}
+
+async fn fetch_cluster_status(
+    node: &str,
+    data_dir: Option<&str>,
+) -> Result<ClusterStatusResponse, Box<dyn std::error::Error>> {
+    let status = if let Some((endpoint_id, token)) = iroh_transport::parse_iroh_uri(node) {
+        let data_dir = bitty_data_dir(data_dir);
         let iroh_node = start_iroh_node(&data_dir).await?;
         let client = IrohSchedulerClient {
             endpoint: iroh_node.endpoint,
@@ -741,13 +861,16 @@ async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Erro
             .request::<_, ClusterStatusResponse>(SCHEDULER_CLUSTER_STATUS, &ClusterStatusRequest {})
             .await?
     } else {
-        let mut client =
-            CoordinatorServiceClient::connect(normalize_endpoint(&config.node)).await?;
+        let mut client = CoordinatorServiceClient::connect(normalize_endpoint(node)).await?;
         client
             .cluster_status(ClusterStatusRequest {})
             .await?
             .into_inner()
     };
+    Ok(status)
+}
+
+fn print_cluster_status(status: ClusterStatusResponse, include_assignments: bool) {
     println!("leader: {}", status.leader_id);
     println!("topology_epoch: {}", status.topology_epoch);
     println!("active_workers: {}", status.active_workers);
@@ -756,6 +879,9 @@ async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Erro
         println!("model: {}", status.model_path);
     }
     println!("assignments: {}", status.assignments.len());
+    if !include_assignments {
+        return;
+    }
     for assignment in status.assignments {
         let range = assignment.range;
         if let Some(range) = range {
@@ -769,7 +895,37 @@ async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
-    Ok(())
+}
+
+fn print_cluster_nodes(status: ClusterStatusResponse) {
+    println!("NODE\tLAYERS\tSTAGE\tNEXT");
+    for assignment in status.assignments {
+        if let Some(range) = assignment.range {
+            println!(
+                "{}\t{}..{}\t{}\t{}",
+                assignment.node_id,
+                range.start_layer,
+                range.end_layer_exclusive,
+                assignment.model_stage,
+                assignment.next_node_id
+            );
+        }
+    }
+}
+
+fn print_cluster_check(status: &ClusterStatusResponse) {
+    println!(
+        "cluster: {}",
+        if status.active_workers > 0 && status.model_ready {
+            "ready"
+        } else {
+            "not ready"
+        }
+    );
+    println!("leader: {}", status.leader_id);
+    println!("active_workers: {}", status.active_workers);
+    println!("model_ready: {}", status.model_ready);
+    println!("assignments: {}", status.assignments.len());
 }
 
 fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, String> {
@@ -1034,6 +1190,51 @@ fn parse_settings(args: &mut impl Iterator<Item = String>) -> Result<SettingsCom
         }
         other => Err(format!("unknown settings command: {other}")),
     }
+}
+
+fn parse_logs(args: &mut impl Iterator<Item = String>) -> Result<LogsConfig, String> {
+    let mut config = LogsConfig {
+        data_dir: None,
+        lines: 80,
+        path: false,
+        clear: false,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            "--lines" | "-n" => config.lines = parse_next(args, "--lines")?,
+            "--path" => config.path = true,
+            "--clear" => config.clear = true,
+            other => return Err(format!("unknown logs argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_cluster(args: &mut impl Iterator<Item = String>) -> Result<ClusterCommand, String> {
+    let action = args.next().unwrap_or_else(|| "status".into());
+    match action.as_str() {
+        "status" => parse_cluster_config(args).map(ClusterCommand::Status),
+        "nodes" => parse_cluster_config(args).map(ClusterCommand::Nodes),
+        "check" => parse_cluster_config(args).map(ClusterCommand::Check),
+        "invite" => parse_data_dir(args).map(ClusterCommand::Invite),
+        other => Err(format!("unknown cluster command: {other}")),
+    }
+}
+
+fn parse_cluster_config(args: &mut impl Iterator<Item = String>) -> Result<ClusterConfig, String> {
+    let mut config = ClusterConfig {
+        node: "127.0.0.1:50051".into(),
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--node" => config.node = required_next(args, "--node")?,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            other => return Err(format!("unknown cluster argument: {other}")),
+        }
+    }
+    Ok(config)
 }
 
 fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
@@ -1447,6 +1648,8 @@ fn print_help() {
     println!("  bitty rm MODEL");
     println!("  bitty cp SOURCE DEST");
     println!("  bitty settings get|set|path");
+    println!("  bitty logs [--lines N|--path|--clear]");
+    println!("  bitty cluster status|nodes|check|invite [--node TARGET]");
     println!("  bitty node --model PATH");
     println!("  bitty node --join 'iroh://LEADER_NODE_ID?token=TOKEN' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
@@ -1627,6 +1830,28 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::Create(CreateConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_logs_and_cluster_commands() {
+        assert!(matches!(
+            Cli::parse(vec!["logs".into(), "--lines".into(), "10".into()]).unwrap(),
+            CliCommand::Logs(LogsConfig { lines: 10, .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "cluster".into(),
+                "nodes".into(),
+                "--node".into(),
+                "iroh://abc?token=secret".into()
+            ])
+            .unwrap(),
+            CliCommand::Cluster(ClusterCommand::Nodes(ClusterConfig { .. }))
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["cluster".into(), "invite".into()]).unwrap(),
+            CliCommand::Cluster(ClusterCommand::Invite(DataDirConfig { .. }))
         ));
     }
 

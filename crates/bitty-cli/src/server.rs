@@ -1,3 +1,4 @@
+use crate::logger;
 use crate::model_store::{installed_models, resolve_model};
 use crate::settings::BittySettings;
 use serde_json::json;
@@ -6,11 +7,18 @@ use std::net::{TcpListener, TcpStream};
 
 pub fn serve(settings: BittySettings) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&settings.api_host)?;
+    logger::log(
+        &settings.data_dir,
+        format!("api server listening on {}", settings.api_host),
+    )?;
     println!("bitty serve listening on http://{}", settings.api_host);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => handle_stream(stream, &settings)?,
-            Err(err) => eprintln!("bitty serve connection failed: {err}"),
+            Err(err) => {
+                let _ = logger::log(&settings.data_dir, format!("api connection failed: {err}"));
+                eprintln!("bitty serve connection failed: {err}");
+            }
         }
     }
     Ok(())
