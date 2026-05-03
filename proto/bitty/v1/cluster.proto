@@ -19,6 +19,7 @@ message HardwareProfile {
   repeated GpuInfo gpus = 14;
   double os_reclaim_score = 15;
   string worker_endpoint = 16;
+  string model_path = 17;
 }
 
 message GpuInfo {

@@ -270,6 +270,11 @@ impl NetworkCoordinator {
                     profile.node_id.0
                 )));
             }
+            let worker_model_path = if profile.model_path.is_empty() {
+                model_path.to_string_lossy().into_owned()
+            } else {
+                profile.model_path.clone()
+            };
             let mut client = self.worker_client(&profile.worker_endpoint).await?;
             let manifest = ShardManifestMessage {
                 shard_id: format!(
@@ -282,7 +287,7 @@ impl NetworkCoordinator {
                 range: assignment.range.clone(),
                 byte_len: assignment.assigned_weight_bytes,
                 sha256_hex: String::new(),
-                path: model_path.to_string_lossy().into_owned(),
+                path: worker_model_path,
             };
             client
                 .load_shard(LoadShardRequest {

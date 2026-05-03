@@ -117,6 +117,7 @@ fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
                 gpus: Vec::new(),
                 os_reclaim_score: 0.0,
                 worker_endpoint: String::new(),
+                model_path: String::new(),
             }
         })
         .collect()

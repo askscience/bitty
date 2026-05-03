@@ -196,6 +196,7 @@ pub struct HardwareProfile {
     pub gpus: Vec<GpuInfo>,
     pub os_reclaim_score: f64,
     pub worker_endpoint: String,
+    pub model_path: String,
 }
 
 impl HardwareProfile {
@@ -421,6 +422,7 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             gpus: profile.gpus.iter().map(Into::into).collect(),
             os_reclaim_score: profile.os_reclaim_score,
             worker_endpoint: profile.worker_endpoint.clone(),
+            model_path: profile.model_path.clone(),
         }
     }
 }
@@ -475,6 +477,7 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             gpus: profile.gpus.into_iter().map(Into::into).collect(),
             os_reclaim_score: profile.os_reclaim_score,
             worker_endpoint: profile.worker_endpoint,
+            model_path: profile.model_path,
         })
     }
 }

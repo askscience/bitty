@@ -17,6 +17,7 @@ pub const WORKER_FINAL_LOGITS: u8 = 2;
 pub const WORKER_APPLY_TOPOLOGY: u8 = 3;
 pub const WORKER_LOAD_SHARD: u8 = 4;
 pub const WORKER_CLEANUP: u8 = 5;
+pub const ERROR_OP: u8 = 255;
 
 pub const DEFAULT_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -49,6 +50,11 @@ impl IrohFrame {
     where
         M: Message + Default,
     {
+        if self.op == ERROR_OP {
+            return Err(IrohTransportError::Remote(
+                String::from_utf8_lossy(&self.payload).into_owned(),
+            ));
+        }
         if self.op != expected_op {
             return Err(IrohTransportError::UnexpectedOp {
                 expected: expected_op,
@@ -56,6 +62,14 @@ impl IrohFrame {
             });
         }
         M::decode(self.payload.as_slice()).map_err(IrohTransportError::Decode)
+    }
+}
+
+pub fn error_frame(message: impl std::fmt::Display) -> IrohFrame {
+    IrohFrame {
+        op: ERROR_OP,
+        token: String::new(),
+        payload: message.to_string().into_bytes(),
     }
 }
 
@@ -87,6 +101,8 @@ pub enum IrohTransportError {
     UnexpectedOp { expected: u8, actual: u8 },
     #[error("cluster token was rejected")]
     Unauthorized,
+    #[error("remote iroh error: {0}")]
+    Remote(String),
 }
 
 pub async fn request(
@@ -111,7 +127,13 @@ pub async fn request_addr(
     write_frame(&mut send, &frame).await?;
     send.finish()?;
     send.stopped().await?;
-    read_frame(&mut recv, response_limit).await
+    let response = read_frame(&mut recv, response_limit).await?;
+    if response.op == ERROR_OP {
+        return Err(IrohTransportError::Remote(
+            String::from_utf8_lossy(&response.payload).into_owned(),
+        ));
+    }
+    Ok(response)
 }
 
 pub async fn write_frame(

@@ -47,6 +47,7 @@ impl HardwareProfiler {
             gpus: Vec::new(),
             os_reclaim_score: 0.0,
             worker_endpoint: std::env::var("BITTY_WORKER_ENDPOINT").unwrap_or_default(),
+            model_path: std::env::var("BITTY_MODEL_PATH").unwrap_or_default(),
         }
     }
 }

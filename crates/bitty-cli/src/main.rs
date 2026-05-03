@@ -692,6 +692,7 @@ async fn register_and_heartbeat(
     cluster_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
+    profile.model_path = config.model.clone();
     profile.worker_endpoint = if let Some(iroh_node) = iroh_node {
         iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), cluster_token)
     } else {
@@ -1480,6 +1481,23 @@ async fn handle_scheduler_connection(
     if frame.token != cluster_token {
         return Err("invalid cluster token".into());
     }
+    let response = match handle_scheduler_frame(frame, remote_id, coordinator, &cluster_token).await
+    {
+        Ok(response) => response,
+        Err(err) => iroh_transport::error_frame(err),
+    };
+    iroh_transport::write_frame(&mut send, &response).await?;
+    send.finish()?;
+    send.stopped().await?;
+    Ok(())
+}
+
+async fn handle_scheduler_frame(
+    frame: IrohFrame,
+    remote_id: EndpointId,
+    coordinator: NetworkCoordinator,
+    cluster_token: &str,
+) -> Result<IrohFrame, Box<dyn std::error::Error>> {
     let response = match frame.op {
         SCHEDULER_REGISTER_WORKER => {
             let mut request: RegisterWorkerRequest =
@@ -1518,10 +1536,7 @@ async fn handle_scheduler_connection(
         }
         _ => return Err(format!("unknown scheduler op {}", frame.op).into()),
     };
-    iroh_transport::write_frame(&mut send, &response).await?;
-    send.finish()?;
-    send.stopped().await?;
-    Ok(())
+    Ok(response)
 }
 
 async fn handle_worker_connection(
@@ -1534,6 +1549,20 @@ async fn handle_worker_connection(
     if frame.token != cluster_token {
         return Err("invalid cluster token".into());
     }
+    let response = match handle_worker_frame(frame, worker).await {
+        Ok(response) => response,
+        Err(err) => iroh_transport::error_frame(err),
+    };
+    iroh_transport::write_frame(&mut send, &response).await?;
+    send.finish()?;
+    send.stopped().await?;
+    Ok(())
+}
+
+async fn handle_worker_frame(
+    frame: IrohFrame,
+    worker: NetworkWorker<BitNetLayerExecutor>,
+) -> Result<IrohFrame, Box<dyn std::error::Error>> {
     let response = match frame.op {
         WORKER_FORWARD_ACTIVATION => {
             let request: ProtoActivationTensor = frame.decode_message(WORKER_FORWARD_ACTIVATION)?;
@@ -1564,10 +1593,7 @@ async fn handle_worker_connection(
         }
         _ => return Err(format!("unknown worker op {}", frame.op).into()),
     };
-    iroh_transport::write_frame(&mut send, &response).await?;
-    send.finish()?;
-    send.stopped().await?;
-    Ok(())
+    Ok(response)
 }
 
 struct IrohSchedulerClient {
