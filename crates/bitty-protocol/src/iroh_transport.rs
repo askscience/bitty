@@ -69,6 +69,8 @@ pub enum IrohTransportError {
     Write(#[from] iroh::endpoint::WriteError),
     #[error("iroh stream is closed: {0}")]
     ClosedStream(#[from] iroh::endpoint::ClosedStream),
+    #[error("iroh stream stopped: {0}")]
+    Stopped(#[from] iroh::endpoint::StoppedError),
     #[error("iroh read failed: {0}")]
     Read(#[from] iroh::endpoint::ReadToEndError),
     #[error("protobuf decode failed: {0}")]
@@ -108,6 +110,7 @@ pub async fn request_addr(
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(&mut send, &frame).await?;
     send.finish()?;
+    send.stopped().await?;
     read_frame(&mut recv, response_limit).await
 }
 

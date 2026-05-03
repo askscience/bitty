@@ -1520,6 +1520,7 @@ async fn handle_scheduler_connection(
     };
     iroh_transport::write_frame(&mut send, &response).await?;
     send.finish()?;
+    send.stopped().await?;
     Ok(())
 }
 
@@ -1565,6 +1566,7 @@ async fn handle_worker_connection(
     };
     iroh_transport::write_frame(&mut send, &response).await?;
     send.finish()?;
+    send.stopped().await?;
     Ok(())
 }
 
@@ -1789,6 +1791,15 @@ fn public_endpoint_from_listen(listen: &str) -> String {
 fn default_node_id() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|hostname| hostname.trim().to_string())
+                .filter(|hostname| !hostname.is_empty())
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .unwrap_or_else(|_| "bitty-node".into())
 }
 
