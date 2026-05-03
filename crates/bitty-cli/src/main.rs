@@ -32,6 +32,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout, Duration};
 
+const DEFAULT_TCP_CLUSTER: &str = "127.0.0.1:50051";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -113,20 +115,23 @@ struct GenerateConfig {
     prompt: String,
     max_tokens: u32,
     temperature: String,
+    data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatConfig {
     model: Option<String>,
-    node: String,
+    node: Option<String>,
     prompt: Option<String>,
     max_tokens: u32,
     temperature: String,
+    data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StatusConfig {
-    node: String,
+    node: Option<String>,
+    data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +143,7 @@ struct RunConfig {
     temperature: String,
     data_dir: Option<String>,
     auto_pull: bool,
+    local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,7 +211,7 @@ enum ClusterCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ClusterConfig {
-    node: String,
+    node: Option<String>,
     data_dir: Option<String>,
 }
 
@@ -263,6 +269,9 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         .clone()
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
+    if let Some(join) = &config.join {
+        remember_active_cluster(&data_dir, join)?;
+    }
 
     if !use_iroh {
         let worker_listen = config.worker_listen.clone().unwrap_or_else(|| {
@@ -317,6 +326,7 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         if config.join.is_none() {
             let invite =
                 iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), &cluster_token);
+            remember_active_cluster(&data_dir, &invite)?;
             println!("bitty join: {}", invite);
         }
     } else if config.join.is_none() {
@@ -348,12 +358,51 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
     }
     let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
     let prompt = config.prompt.unwrap_or_default();
-    if let Some(node) = config.node {
+    let cluster_node = if config.local {
+        None
+    } else {
+        config
+            .node
+            .clone()
+            .or_else(|| active_cluster_target(&settings))
+    };
+    if let Some(node) = cluster_node {
+        if config.node.is_none() {
+            println!("using cluster: {node}");
+        }
+        if prompt.is_empty() {
+            println!("Bitty cluster chat: {}. Type /exit to quit.", model.id());
+            loop {
+                print!("> ");
+                io::stdout().flush()?;
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line)? == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if line == "/exit" || line == "/quit" {
+                    break;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                run_generate(GenerateConfig {
+                    node: node.clone(),
+                    prompt: line.into(),
+                    max_tokens: config.max_tokens,
+                    temperature: config.temperature.clone(),
+                    data_dir: config.data_dir.clone(),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
         return run_generate(GenerateConfig {
             node,
             prompt,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            data_dir: config.data_dir,
         })
         .await;
     }
@@ -588,15 +637,18 @@ async fn run_logs(config: LogsConfig) -> Result<(), Box<dyn std::error::Error>> 
 async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::Error>> {
     match config {
         ClusterCommand::Status(config) => {
-            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            let status =
+                fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
             print_cluster_status(status, true);
         }
         ClusterCommand::Nodes(config) => {
-            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            let status =
+                fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
             print_cluster_nodes(status);
         }
         ClusterCommand::Check(config) => {
-            let status = fetch_cluster_status(&config.node, config.data_dir.as_deref()).await?;
+            let status =
+                fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
             print_cluster_check(&status);
             if status.active_workers == 0 || !status.model_ready {
                 return Err("cluster is not ready".into());
@@ -607,6 +659,7 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
             let iroh_node = start_iroh_node(&data_dir).await?;
             let token = load_or_create_cluster_token(&data_dir);
             let invite = iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), &token);
+            remember_active_cluster(&data_dir, &invite)?;
             println!("{invite}");
             println!("Share this invite with another Bitty node:");
             println!(
@@ -739,8 +792,9 @@ async fn register_and_heartbeat(
 }
 
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(target) = iroh_transport::parse_iroh_target(&config.node) {
-        let data_dir = bitty_data_dir(None);
+    let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
+    if let Some(target) = iroh_transport::parse_iroh_target(&node) {
+        let data_dir = bitty_data_dir(config.data_dir.as_deref());
         let iroh_node = start_iroh_node(&data_dir).await?;
         let client = IrohSchedulerClient {
             endpoint: iroh_node.endpoint,
@@ -768,7 +822,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&config.node)).await?;
+    let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&node)).await?;
     let mut stream = client
         .generate(GenerateRequest {
             request_id: request_id(),
@@ -794,21 +848,27 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
         return run_model(RunConfig {
             model,
             prompt: config.prompt,
-            node: Some(config.node).filter(|node| node != "127.0.0.1:50051"),
+            node: config.node,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
-            data_dir: None,
+            data_dir: config.data_dir,
             auto_pull: true,
+            local: false,
         })
         .await;
     }
 
+    let node = resolve_cluster_node(
+        config.node.as_deref().unwrap_or(""),
+        config.data_dir.as_deref(),
+    )?;
     if let Some(prompt) = config.prompt {
         return run_generate(GenerateConfig {
-            node: config.node,
+            node,
             prompt,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            data_dir: config.data_dir,
         })
         .await;
     }
@@ -829,10 +889,11 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
         run_generate(GenerateConfig {
-            node: config.node.clone(),
+            node: node.clone(),
             prompt: prompt.into(),
             max_tokens: config.max_tokens,
             temperature: config.temperature.clone(),
+            data_dir: config.data_dir.clone(),
         })
         .await?;
     }
@@ -840,16 +901,17 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let status = fetch_cluster_status(&config.node, None).await?;
+    let status = fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
     print_cluster_status(status, true);
     Ok(())
 }
 
 async fn fetch_cluster_status(
-    node: &str,
+    node: Option<&str>,
     data_dir: Option<&str>,
 ) -> Result<ClusterStatusResponse, Box<dyn std::error::Error>> {
-    let status = if let Some(target) = iroh_transport::parse_iroh_target(node) {
+    let node = resolve_cluster_node(node.unwrap_or(""), data_dir)?;
+    let status = if let Some(target) = iroh_transport::parse_iroh_target(&node) {
         let data_dir = bitty_data_dir(data_dir);
         let iroh_node = start_iroh_node(&data_dir).await?;
         let client = IrohSchedulerClient {
@@ -861,7 +923,7 @@ async fn fetch_cluster_status(
             .request::<_, ClusterStatusResponse>(SCHEDULER_CLUSTER_STATUS, &ClusterStatusRequest {})
             .await?
     } else {
-        let mut client = CoordinatorServiceClient::connect(normalize_endpoint(node)).await?;
+        let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&node)).await?;
         client
             .cluster_status(ClusterStatusRequest {})
             .await?
@@ -871,16 +933,22 @@ async fn fetch_cluster_status(
 }
 
 fn print_cluster_status(status: ClusterStatusResponse, include_assignments: bool) {
+    println!("Bitty cluster");
+    println!("-------------");
     println!("leader: {}", status.leader_id);
-    println!("topology_epoch: {}", status.topology_epoch);
-    println!("active_workers: {}", status.active_workers);
-    println!("model_ready: {}", status.model_ready);
+    println!("epoch: {}", status.topology_epoch);
+    println!("workers: {}", status.active_workers);
+    println!("model ready: {}", yes_no(status.model_ready));
     if !status.model_path.is_empty() {
         println!("model: {}", status.model_path);
     }
     println!("assignments: {}", status.assignments.len());
     if !include_assignments {
         return;
+    }
+    if !status.assignments.is_empty() {
+        println!();
+        println!("Assignments");
     }
     for assignment in status.assignments {
         let range = assignment.range;
@@ -898,6 +966,8 @@ fn print_cluster_status(status: ClusterStatusResponse, include_assignments: bool
 }
 
 fn print_cluster_nodes(status: ClusterStatusResponse) {
+    println!("Bitty nodes");
+    println!("-----------");
     println!("NODE\tLAYERS\tSTAGE\tNEXT");
     for assignment in status.assignments {
         if let Some(range) = assignment.range {
@@ -914,8 +984,10 @@ fn print_cluster_nodes(status: ClusterStatusResponse) {
 }
 
 fn print_cluster_check(status: &ClusterStatusResponse) {
+    println!("Bitty cluster check");
+    println!("-------------------");
     println!(
-        "cluster: {}",
+        "status: {}",
         if status.active_workers > 0 && status.model_ready {
             "ready"
         } else {
@@ -923,9 +995,17 @@ fn print_cluster_check(status: &ClusterStatusResponse) {
         }
     );
     println!("leader: {}", status.leader_id);
-    println!("active_workers: {}", status.active_workers);
-    println!("model_ready: {}", status.model_ready);
+    println!("workers: {}", status.active_workers);
+    println!("model ready: {}", yes_no(status.model_ready));
     println!("assignments: {}", status.assignments.len());
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, String> {
@@ -974,10 +1054,11 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
 
 fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateConfig, String> {
     let mut config = GenerateConfig {
-        node: "127.0.0.1:50051".into(),
+        node: String::new(),
         prompt: String::new(),
         max_tokens: 32,
         temperature: "0".into(),
+        data_dir: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -985,6 +1066,7 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
             "--prompt" => config.prompt = required_next(args, "--prompt")?,
             "--max-tokens" => config.max_tokens = parse_next(args, "--max-tokens")?,
             "--temperature" => config.temperature = required_next(args, "--temperature")?,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown generate argument: {other}")),
         }
     }
@@ -997,17 +1079,19 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
 fn parse_chat(args: &mut impl Iterator<Item = String>) -> Result<ChatConfig, String> {
     let mut config = ChatConfig {
         model: None,
-        node: "127.0.0.1:50051".into(),
+        node: None,
         prompt: None,
         max_tokens: 128,
         temperature: "0.7".into(),
+        data_dir: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--node" => config.node = required_next(args, "--node")?,
+            "--node" => config.node = Some(required_next(args, "--node")?),
             "--prompt" => config.prompt = Some(required_next(args, "--prompt")?),
             "--max-tokens" => config.max_tokens = parse_next(args, "--max-tokens")?,
             "--temperature" => config.temperature = required_next(args, "--temperature")?,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             value if config.model.is_none() => config.model = Some(value.into()),
             other => return Err(format!("unknown chat argument: {other}")),
         }
@@ -1017,11 +1101,13 @@ fn parse_chat(args: &mut impl Iterator<Item = String>) -> Result<ChatConfig, Str
 
 fn parse_status(args: &mut impl Iterator<Item = String>) -> Result<StatusConfig, String> {
     let mut config = StatusConfig {
-        node: "127.0.0.1:50051".into(),
+        node: None,
+        data_dir: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--node" => config.node = required_next(args, "--node")?,
+            "--node" => config.node = Some(required_next(args, "--node")?),
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown status argument: {other}")),
         }
     }
@@ -1037,6 +1123,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         temperature: "0.7".into(),
         data_dir: None,
         auto_pull: true,
+        local: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1048,9 +1135,10 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--temperature" => config.temperature = required_next(args, "--temperature")?,
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             "--no-auto-pull" => config.auto_pull = false,
+            "--local" => config.local = true,
             "--no-daemon" => {}
-            "--num-ctx" | "--seed" | "--top-k" | "--top-p" | "--system" | "--template"
-            | "--join" => {
+            "--join" => config.node = Some(required_next(args, "--join")?),
+            "--num-ctx" | "--seed" | "--top-k" | "--top-p" | "--system" | "--template" => {
                 let _ = required_next(args, arg.as_str()).ok();
             }
             value if config.model.is_empty() => config.model = value.into(),
@@ -1224,12 +1312,12 @@ fn parse_cluster(args: &mut impl Iterator<Item = String>) -> Result<ClusterComma
 
 fn parse_cluster_config(args: &mut impl Iterator<Item = String>) -> Result<ClusterConfig, String> {
     let mut config = ClusterConfig {
-        node: "127.0.0.1:50051".into(),
+        node: None,
         data_dir: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--node" => config.node = required_next(args, "--node")?,
+            "--node" => config.node = Some(required_next(args, "--node")?),
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown cluster argument: {other}")),
         }
@@ -1487,6 +1575,37 @@ fn token_from_join(join: Option<&str>) -> Option<String> {
         .and_then(|(_, token)| token.map(str::to_string))
 }
 
+fn active_cluster_target(settings: &BittySettings) -> Option<String> {
+    let target = settings.active_cluster.trim();
+    (!target.is_empty()).then(|| target.to_string())
+}
+
+fn resolve_cluster_node(
+    explicit: &str,
+    data_dir: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !explicit.trim().is_empty() {
+        return Ok(explicit.trim().to_string());
+    }
+    let settings = load_settings(data_dir);
+    active_cluster_target(&settings).ok_or_else(|| {
+        format!(
+            "no active Bitty cluster saved. Start one with `bitty node --model PATH`, join one with `bitty node --join INVITE --model PATH`, or pass `--node {DEFAULT_TCP_CLUSTER}`."
+        )
+        .into()
+    })
+}
+
+fn remember_active_cluster(
+    data_dir: &PathBuf,
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut settings = BittySettings::load(data_dir.clone());
+    settings.active_cluster = target.to_string();
+    settings.save()?;
+    Ok(())
+}
+
 fn bitty_data_dir(configured: Option<&str>) -> PathBuf {
     configured
         .map(PathBuf::from)
@@ -1639,7 +1758,7 @@ fn demo_layers(count: u32) -> Vec<LayerMetadata> {
 
 fn print_help() {
     println!("Usage:");
-    println!("  bitty run MODEL [PROMPT]");
+    println!("  bitty run MODEL [PROMPT] [--local|--node TARGET]");
     println!("  bitty pull MODEL");
     println!("  bitty ls | bitty list");
     println!("  bitty show MODEL");
@@ -1653,11 +1772,14 @@ fn print_help() {
     println!("  bitty logs [--lines N|--path|--clear]");
     println!("  bitty cluster status|nodes|check|invite [--node TARGET]");
     println!("  bitty node --model PATH");
-    println!("  bitty node --join 'iroh://LEADER_NODE_ID?token=TOKEN' --model PATH");
+    println!("  bitty node --join 'iroh://INVITE' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
-    println!("  bitty generate --node 'iroh://LEADER_NODE_ID?token=TOKEN' --prompt TEXT");
-    println!("  bitty chat --node 'iroh://LEADER_NODE_ID?token=TOKEN' [--prompt TEXT]");
-    println!("  bitty status --node 'iroh://LEADER_NODE_ID?token=TOKEN'");
+    println!("  bitty generate --prompt TEXT [--node TARGET]");
+    println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
+    println!("  bitty status [--node TARGET]");
+    println!();
+    println!("Bitty remembers the active cluster after `bitty node` or `bitty cluster invite`.");
+    println!("Use `--local` on `bitty run` to force local-only generation.");
 }
 
 #[cfg(test)]
@@ -1793,6 +1915,10 @@ mod tests {
             CliCommand::Run(RunConfig { max_tokens: 4, .. })
         ));
         assert!(matches!(
+            Cli::parse(vec!["run".into(), "bitnet-b1.58".into(), "--local".into()]).unwrap(),
+            CliCommand::Run(RunConfig { local: true, .. })
+        ));
+        assert!(matches!(
             Cli::parse(vec!["pull".into(), "bitnet-b1.58".into()]).unwrap(),
             CliCommand::Pull(ModelCommand { .. })
         ));
@@ -1862,7 +1988,7 @@ mod tests {
         let command =
             Cli::parse(vec!["status".into(), "--node".into(), "node:50051".into()]).unwrap();
         match command {
-            CliCommand::Status(config) => assert_eq!(config.node, "node:50051"),
+            CliCommand::Status(config) => assert_eq!(config.node.as_deref(), Some("node:50051")),
             other => panic!("unexpected command: {other:?}"),
         }
     }

@@ -11,12 +11,14 @@ The normal user experience is intentionally similar to Ollama:
 
 ```bash
 bitty pull bitnet-b1.58
+bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 bitty run bitnet-b1.58
 bitty serve
 ```
 
-Advanced users can still run low-level distributed nodes, inspect scheduling,
-and test Iroh peer-to-peer transport directly.
+`bitty node` starts the local peer runtime and remembers the active cluster.
+After that, `bitty run`, `bitty chat`, `bitty status`, and `bitty cluster`
+commands can use the cluster without repeating an `iroh://...` invite.
 
 ## What Bitty Does
 
@@ -37,7 +39,7 @@ What works today:
 
 - Install Bitty from source with one script.
 - Pull the known BitNet GGUF model into the local Bitty model cache.
-- Run local prompts with `bitty run MODEL`.
+- Run prompts with `bitty run MODEL`; if a cluster is active, Bitty uses it by default.
 - Start an API server with `bitty serve`.
 - Manage local settings, model profiles, and aliases.
 - Inspect local logs and cluster/node health from the `bitty` CLI.
@@ -117,7 +119,15 @@ Pull the default BitNet model:
 bitty pull bitnet-b1.58
 ```
 
-Run a prompt:
+Start the local Bitty node. This is the process that shares your machine with
+the cluster and coordinates with other peers:
+
+```bash
+bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
+```
+
+Run a prompt. If a Bitty node is active or this machine has joined a cluster,
+`bitty run` uses that cluster automatically:
 
 ```bash
 bitty run bitnet-b1.58 "Explain 1-bit inference in simple words"
@@ -168,11 +178,15 @@ bitty pull bitnet-b1.58
 
 `bitty run MODEL [PROMPT]`
 
-Runs a model. If no prompt is provided, Bitty opens an interactive chat loop.
+Runs a model. If an active cluster is saved, Bitty sends the request to that
+cluster. Use `--local` to force local-only generation, or `--node TARGET` to use
+a specific cluster for one command. If no prompt is provided, Bitty opens an
+interactive chat loop.
 
 ```bash
 bitty run bitnet-b1.58 "Hello"
 bitty run bitnet-b1.58
+bitty run bitnet-b1.58 "Hello" --local
 ```
 
 `bitty chat MODEL`
@@ -269,9 +283,9 @@ up to three rotated files: `bitty.log.1`, `bitty.log.2`, and `bitty.log.3`.
 Checks and inspects the distributed Bitty cluster.
 
 ```bash
-bitty cluster status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
-bitty cluster nodes --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
-bitty cluster check --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty cluster status
+bitty cluster nodes
+bitty cluster check
 bitty cluster invite
 ```
 
@@ -279,6 +293,8 @@ bitty cluster invite
 layer assignments. `cluster nodes` focuses on node/layer placement. `cluster
 check` exits with an error when the cluster is not ready. `cluster invite`
 prints the local Iroh invite string for sharing with another Bitty node.
+Pass `--node TARGET` only when you want to inspect a cluster that is not saved
+as the active cluster.
 
 ## Generation Options
 
@@ -301,6 +317,8 @@ Supported user-facing flags include:
 - `--data-dir`
 - `--no-auto-pull`
 - `--no-daemon`
+- `--local`
+- `--node`
 - `--join`
 
 Some advanced flags are accepted for compatibility and future use even when the
@@ -372,7 +390,12 @@ Set a value:
 bitty settings set default_model bitnet-b1.58
 bitty settings set default_temperature 0.2
 bitty settings set api_host 127.0.0.1:11435
+bitty settings get active_cluster
 ```
+
+`active_cluster` is usually managed automatically by `bitty node` and
+`bitty cluster invite`. Set it manually only when you want this machine to use a
+specific cluster target by default.
 
 Current settings include:
 
@@ -470,8 +493,9 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 ## Distributed Mode
 
-The easy commands hide distributed internals. For experiments, Bitty can also run
-explicit nodes.
+Bitty is designed around shared resources. The normal distributed flow is:
+start or join a node once, then use `bitty run` and `bitty cluster` without
+copying the invite into every command.
 
 The first node becomes the scheduler leader and also starts a local worker
 runtime. Iroh is enabled by default and stores a stable peer key under
@@ -483,8 +507,9 @@ Start the first node:
 bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf --layers 30
 ```
 
-The node prints an `iroh://...` join value containing the peer identity and
-cluster token.
+The node prints an `iroh://...` join value containing the peer identity, cluster
+token, and Iroh addressing information. Bitty also saves this as the active
+cluster in `~/.bitty/config.toml`.
 
 You can also print the current local Iroh invite:
 
@@ -496,28 +521,32 @@ Join another machine:
 
 ```bash
 bitty node \
-  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
+  --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE' \
   --node-id worker-a \
   --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 ```
 
-Send a request to the leader:
+After joining, the invite is saved on that machine too. Use the cluster normally:
 
 ```bash
-bitty generate \
-  --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
-  --prompt "Hello" \
-  --max-tokens 32 \
-  --temperature 0
+bitty run bitnet-b1.58 "Hello"
+bitty chat bitnet-b1.58
 ```
 
 Check cluster state:
 
 ```bash
-bitty status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
-bitty cluster status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
-bitty cluster nodes --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
-bitty cluster check --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty status
+bitty cluster status
+bitty cluster nodes
+bitty cluster check
+```
+
+You can still override the saved target for one command:
+
+```bash
+bitty run bitnet-b1.58 "Hello" --node 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE'
+bitty status --node 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE'
 ```
 
 Iroh first attempts direct peer-to-peer QUIC and can use relays for NAT
@@ -596,15 +625,12 @@ bitty node --data-dir /tmp/bitty-a \
   --layers 30
 
 bitty node --data-dir /tmp/bitty-b \
-  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
+  --join 'iroh://INVITE_PRINTED_BY_FIRST_NODE' \
   --node-id worker-b \
   --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 
-bitty generate \
-  --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
-  --prompt "Hello" \
-  --max-tokens 8 \
-  --temperature 0
+bitty run bitnet-b1.58 "Hello"
+bitty cluster check
 ```
 
 ## Workspace Layout

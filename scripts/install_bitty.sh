@@ -27,10 +27,11 @@ Usage:
 Common:
   scripts/install_bitty.sh
   bitty pull bitnet-b1.58
+  bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
   bitty run bitnet-b1.58
   scripts/install_bitty.sh --role node --model bitnet-b1.58
-  scripts/install_bitty.sh --role join --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' --model /models/ggml-model-i2_s.gguf
-  scripts/install_bitty.sh --role client --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+  scripts/install_bitty.sh --role join --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE' --model /models/ggml-model-i2_s.gguf
+  scripts/install_bitty.sh --role client --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE'
 
 Options:
   --role node|join|client   Which command to print after install. Default: node
@@ -305,41 +306,52 @@ EOF
 case "$ROLE" in
   node)
     if [ -z "$MODEL_PATH" ]; then
-      MODEL_PATH="/path/to/ggml-model-i2_s.gguf"
+      MODEL_PATH="$HOME/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf"
     fi
     if [ -z "$WORKER_LISTEN" ]; then
       WORKER_LISTEN="0.0.0.0:50061"
     fi
     cat <<EOF
-Start the first Bitty node:
+Start Bitty:
   $BIN_DIR/bitty pull bitnet-b1.58
-  $BIN_DIR/bitty run bitnet-b1.58
-
-Advanced distributed runtime:
   $BIN_DIR/bitty node --model "$MODEL_PATH" --layers "$LAYERS"
 
-The node stores a stable Iroh identity in ~/.bitty and prints an iroh:// join invite.
+In another terminal, use the cluster:
+  $BIN_DIR/bitty run bitnet-b1.58
+  $BIN_DIR/bitty cluster status
+
+The node stores a stable Iroh identity and active cluster in ~/.bitty.
+It prints an iroh:// invite for other PCs. You can print it again with:
+  $BIN_DIR/bitty cluster invite
 EOF
     ;;
   join)
     if [ -z "$MODEL_PATH" ]; then
-      MODEL_PATH="/path/to/ggml-model-i2_s.gguf"
+      MODEL_PATH="$HOME/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf"
     fi
     if [ -z "$JOIN" ]; then
-      JOIN="iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN"
+      JOIN="iroh://INVITE_FROM_BITTY_CLUSTER_INVITE"
     fi
     cat <<EOF
 Join an existing Bitty node:
   $BIN_DIR/bitty node --join "$JOIN" --node-id "$NODE_ID" --model "$MODEL_PATH"
+
+Then use Bitty without repeating the invite:
+  $BIN_DIR/bitty run bitnet-b1.58
+  $BIN_DIR/bitty cluster check
 EOF
     ;;
   client)
     if [ -z "$JOIN" ]; then
-      JOIN="iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN"
+      JOIN="iroh://INVITE_FROM_BITTY_CLUSTER_INVITE"
     fi
     cat <<EOF
-Send a request:
-  $BIN_DIR/bitty generate --node "$JOIN" --prompt "Hello" --max-tokens 32 --temperature 0
+Save the cluster target:
+  $BIN_DIR/bitty settings set active_cluster "$JOIN"
+
+Send requests:
+  $BIN_DIR/bitty run bitnet-b1.58 "Hello"
+  $BIN_DIR/bitty cluster status
 EOF
     ;;
 esac
