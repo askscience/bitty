@@ -7,6 +7,12 @@ This project is **in development**. It is useful for testing, research, and
 iterating on distributed BitNet runtime ideas. It is not yet a polished
 production inference server, and APIs or commands may still change.
 
+Install from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/askscience/bitty/main/scripts/install_bitty.sh | bash
+```
+
 The normal user experience is intentionally similar to Ollama:
 
 ```bash
@@ -70,14 +76,6 @@ The installer can:
 - Build the `bitty` binary.
 - Link `bitty` into `~/.local/bin` by default.
 - Optionally run tests after building.
-
-Install from GitHub:
-
-```bash
-git clone git@github.com:askscience/bitty.git
-cd bitty
-scripts/install_bitty.sh
-```
 
 If `~/.local/bin` is not in your shell path, add it:
 
