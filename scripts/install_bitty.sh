@@ -238,12 +238,21 @@ if ! has_cmd cargo; then
     exit 1
   fi
   echo "Installing Rust with rustup..."
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
 fi
 
 if [ -f "$HOME/.cargo/env" ]; then
   # shellcheck source=/dev/null
   source "$HOME/.cargo/env"
+fi
+
+if ! has_cmd cargo; then
+  cat >&2 <<'EOF'
+Rust was installed, but cargo is still not available in this shell.
+Try rerunning this installer after opening a new terminal, or run:
+  source "$HOME/.cargo/env"
+EOF
+  exit 1
 fi
 
 if [ -d "$INSTALL_DIR/.git" ]; then
