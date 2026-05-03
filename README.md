@@ -28,7 +28,7 @@ Bitty provides:
 - A Rust BitNet runtime path for Microsoft's `BitNet-b1.58-2B-4T` GGUF model.
 - An Iroh-based peer transport for encrypted peer-to-peer node communication.
 - Experimental scheduler/worker internals for distributed layer execution.
-- A simple HTTP API on `127.0.0.1:11434` for Ollama-style and OpenAI-compatible clients.
+- A simple HTTP API on `127.0.0.1:11435` for Ollama-style and OpenAI-compatible clients.
 
 ## Current Status
 
@@ -151,7 +151,8 @@ Start the local API server:
 bitty serve
 ```
 
-The server listens on `127.0.0.1:11434` by default.
+The server listens on `127.0.0.1:11435` by default, so it does not conflict
+with Ollama's default `127.0.0.1:11434` port.
 
 ## Common Commands
 
@@ -219,7 +220,7 @@ Starts the local HTTP API server.
 
 ```bash
 bitty serve
-bitty serve --host 127.0.0.1:11434
+bitty serve --host 127.0.0.1:11435
 ```
 
 `bitty rm MODEL`
@@ -338,7 +339,7 @@ Set a value:
 ```bash
 bitty settings set default_model bitnet-b1.58
 bitty settings set default_temperature 0.2
-bitty settings set api_host 127.0.0.1:11434
+bitty settings set api_host 127.0.0.1:11435
 ```
 
 Current settings include:
@@ -396,7 +397,7 @@ bitty serve
 Default address:
 
 ```text
-http://127.0.0.1:11434
+http://127.0.0.1:11435
 ```
 
 Ollama-style endpoints:
@@ -416,13 +417,13 @@ OpenAI-compatible endpoints:
 List models:
 
 ```bash
-curl http://127.0.0.1:11434/v1/models
+curl http://127.0.0.1:11435/v1/models
 ```
 
 Generate text:
 
 ```bash
-curl http://127.0.0.1:11434/api/generate \
+curl http://127.0.0.1:11435/api/generate \
   -H 'content-type: application/json' \
   -d '{"model":"bitnet-b1.58","prompt":"Hello"}'
 ```
@@ -430,7 +431,7 @@ curl http://127.0.0.1:11434/api/generate \
 OpenAI-compatible chat:
 
 ```bash
-curl http://127.0.0.1:11434/v1/chat/completions \
+curl http://127.0.0.1:11435/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"bitnet-b1.58","messages":[{"role":"user","content":"Hello"}]}'
 ```

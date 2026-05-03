@@ -36,7 +36,7 @@ impl BittySettings {
             data_dir,
             models_dir,
             default_model: "bitnet-b1.58".into(),
-            api_host: "127.0.0.1:11434".into(),
+            api_host: "127.0.0.1:11435".into(),
             auto_pull: true,
             auto_start_node: true,
             default_temperature: 0.7,

@@ -1442,7 +1442,7 @@ fn print_help() {
     println!("  bitty show MODEL");
     println!("  bitty ps");
     println!("  bitty stop MODEL");
-    println!("  bitty serve [--host 127.0.0.1:11434]");
+    println!("  bitty serve [--host 127.0.0.1:11435]");
     println!("  bitty create NAME -f Modelfile");
     println!("  bitty rm MODEL");
     println!("  bitty cp SOURCE DEST");
@@ -1599,7 +1599,7 @@ mod tests {
             Cli::parse(vec![
                 "serve".into(),
                 "--host".into(),
-                "127.0.0.1:11434".into()
+                "127.0.0.1:11435".into()
             ])
             .unwrap(),
             CliCommand::Serve(ServeConfig { .. })
