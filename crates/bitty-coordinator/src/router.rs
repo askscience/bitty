@@ -74,6 +74,8 @@ impl RequestRouter {
             token_id,
             text: format!("<tok:{token_id}>"),
             finished,
+            log_prob: 0.0,
+            gen_latency_us: 0,
         }
     }
 }

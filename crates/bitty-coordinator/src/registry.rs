@@ -61,6 +61,18 @@ impl Registry {
             .collect()
     }
 
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn profile(&self, node_id: &NodeId) -> Option<HardwareProfile> {
+        self.nodes.get(node_id).map(|node| node.profile.clone())
+    }
+
     pub fn evict_missing(&mut self, timeout: Duration) -> Vec<NodeId> {
         let now = Instant::now();
         let missing = self

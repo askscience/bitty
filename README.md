@@ -1,34 +1,73 @@
 # Bitty
 
-Bitty is a Rust workspace for experimenting with distributed LLM inference over
-heterogeneous peer networks. The initial implementation focuses on scheduler
-correctness, deterministic simulation, and protocol boundaries before adding
-production model kernels.
+Bitty is a Rust workspace for experimenting with distributed BitNet inference
+over heterogeneous peer networks. The user-facing command is `bitty`: every
+machine runs a node, Bitty creates an Iroh peer identity by default, and the
+internal scheduler/worker split is hidden behind leader and join behavior.
 
 ## Crates
 
 - `bitty-protocol`: shared cluster messages and domain types.
 - `bitty-coordinator`: worker registry, Halda scheduling, topology, routing, and snapshots.
 - `bitty-worker`: profiling, shard lifecycle, ring execution, keepalive, and worker metrics.
+- `bitty-bitnet-runtime`: Rust BitNet split runtime for model loading, embedding, layer ranges, KV cache, logits, and sampling.
 - `bitty-model`: low-bit shard and activation codec primitives.
 - `bitty-inference`: executor traits and request lifecycle orchestration.
 - `bitty-sim`: deterministic in-process cluster simulation.
 - `bitty-observability`: metrics and tracing helpers.
 
-## Local Testing
+## Install Bitty
 
-Install Bitty from GitHub on another machine:
+Bitty has one installer: [`scripts/install_bitty.sh`](scripts/install_bitty.sh).
+Run it on every PC/server. It can install Rust with `rustup`, build release
+binaries, link the `bitty` command into `~/.local/bin`, and print the exact node
+command for the role you choose.
+
+First machine:
 
 ```bash
 git clone git@github.com:askscience/bitty.git
 cd bitty
-scripts/install_bitty.sh "$PWD"
+scripts/install_bitty.sh \
+  --role node \
+  --model /models/ggml-model-i2_s.gguf \
+  --layers 30
 ```
 
-Install Bitty and the local BitNet runtime/model:
+Additional machines:
 
 ```bash
-INSTALL_BITNET=1 scripts/install_bitty.sh "$PWD"
+git clone git@github.com:askscience/bitty.git
+cd bitty
+scripts/install_bitty.sh \
+  --role join \
+  --node-id worker-a \
+  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
+  --model /models/ggml-model-i2_s.gguf
+```
+
+Client-only machine:
+
+```bash
+git clone git@github.com:askscience/bitty.git
+cd bitty
+scripts/install_bitty.sh \
+  --role client \
+  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+```
+
+The installer links binaries into `~/.local/bin` by default. You can override
+paths with `INSTALL_DIR`, `BIN_DIR`, `REPO_URL`, or command-line flags. The
+model file must exist locally on every node that will execute BitNet layers.
+
+## Local Testing
+
+Install Bitty from GitHub on another machine for development:
+
+```bash
+git clone git@github.com:askscience/bitty.git
+cd bitty
+scripts/install_bitty.sh --install-dir "$PWD" --debug --run-tests
 ```
 
 Run the full verification suite:
@@ -77,22 +116,29 @@ BitNet, or distributed shard executor.
 ## BitNet b1.58 Testing
 
 The smallest official practical BitNet target is Microsoft's
-`BitNet-b1.58-2B-4T` GGUF model. Bitty delegates real BitNet execution to the
-official `bitnet.cpp` runtime because BitNet requires specialized kernels.
+`BitNet-b1.58-2B-4T` GGUF model. The distributed path uses the Rust
+`bitty-bitnet-runtime` split runtime and does not call `bitnet.cpp`.
 
-Install the runtime and model:
-
-```bash
-scripts/setup_bitnet.sh
-```
-
-Run inference:
+Run the legacy local `bitnet.cpp` wrapper only if you have installed
+`bitnet.cpp` separately:
 
 ```bash
 cargo run -p bitty-inference --bin bitty-bitnet -- \
   --prompt "Explain BitNet in one paragraph" \
   --n-predict 80
 ```
+
+Run the Rust split runtime locally:
+
+```bash
+cargo run -p bitty-inference --bin bitty-rust-bitnet -- \
+  --model /path/to/ggml-model-i2_s.gguf \
+  --prompt "Explain BitNet in one paragraph" \
+  --max-tokens 80
+```
+
+The same runtime is used by `BitNetLayerExecutor` inside workers for distributed
+layer-range execution.
 
 The default model path is:
 
@@ -109,49 +155,134 @@ cargo run -p bitty-inference --bin bitty-bitnet -- \
   --prompt "What is 1-bit inference?"
 ```
 
-## License
+## Distributed BitNet Smoke
 
-Bitty is licensed under the GNU General Public License v3.0. See
-[`LICENSE`](LICENSE) for details.
+Start the first node. It becomes the scheduler leader and also starts a local
+worker runtime. Iroh is enabled by default, stores a stable node key under
+`~/.bitty`, and prints a secure join value containing the cluster token:
 
-## Two-PC Status
+```bash
+cargo run -p bitty-cli --bin bitty -- node \
+  --model /path/to/ggml-model-i2_s.gguf \
+  --layers 30
+```
 
-The real BitNet model currently runs on one machine through the official
-`bitnet.cpp` runtime. Cross-machine registration and heartbeat are implemented;
-cross-machine sharing of one BitNet model is not implemented yet.
+Run more nodes with the printed `iroh://...` join value. Scheduler RPCs,
+heartbeats, worker activation forwarding, logits, shard load, cleanup, status,
+and generation all run over Iroh's encrypted QUIC streams:
+
+```bash
+cargo run -p bitty-cli --bin bitty -- node \
+  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
+  --node-id worker-a \
+  --model /path/to/ggml-model-i2_s.gguf
+```
+
+Send a generation request to the leader:
+
+```bash
+cargo run -p bitty-cli --bin bitty -- generate \
+  --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
+  --prompt "Hello" \
+  --max-tokens 32 \
+  --temperature 0
+```
+
+Check cluster state:
+
+```bash
+cargo run -p bitty-cli --bin bitty -- status --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+```
+
+Interactive chat:
+
+```bash
+cargo run -p bitty-cli --bin bitty -- chat --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+```
+
+Correctness gates to run before changing performance code:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Manual gates for a downloaded Microsoft GGUF:
+
+```bash
+# full local Rust gate
+cargo run -p bitty-inference --bin bitty-rust-bitnet -- \
+  --model /path/to/ggml-model-i2_s.gguf \
+  --prompt "Hello" \
+  --max-tokens 8 \
+  --temperature 0
+
+# split local Rust gate
+BITTY_GGUF_MODEL=/path/to/ggml-model-i2_s.gguf \
+  cargo test -p bitty-bitnet-runtime \
+  split_local_logits_match_full_local_logits_for_temperature_zero -- --ignored
+
+# same-machine Iroh gate
+cargo run -p bitty-cli --bin bitty -- node --data-dir /tmp/bitty-a --model /path/to/ggml-model-i2_s.gguf --layers 30
+cargo run -p bitty-cli --bin bitty -- node --data-dir /tmp/bitty-b --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' --node-id worker-b --model /path/to/ggml-model-i2_s.gguf
+cargo run -p bitty-cli --bin bitty -- generate --node 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' --prompt "Hello" --max-tokens 8 --temperature 0
+```
+
+## Multi-PC Usage
+
+The normal runtime is `bitty node`. The first node is the leader; joined nodes
+contribute worker runtime capacity. Users do not need to start separate
+coordinator and worker binaries.
+
+Iroh is enabled by default for node identity, leader lookup, scheduler RPCs, and
+worker activation traffic. Iroh first attempts direct peer-to-peer QUIC and uses
+relays for NAT traversal or encrypted fallback, so nodes can communicate across
+the internet without manual worker IPs. Public Iroh relays are useful for
+development and testing; production deployments should configure dedicated relays.
+Use `--no-iroh` only when you want a fully local/offline TCP-only run.
 
 What works today:
 
 - Install and run the project on two PCs independently.
-- Run PC 1 as a gRPC coordinator and PC 2 as a worker that registers with it.
+- Run PC 1 as a Bitty leader node and PC 2 as a joined Bitty node.
 - Run the in-process simulator with many virtual nodes.
-- Run the real `BitNet-b1.58-2B-4T` model locally on either PC.
+- Run the real `BitNet-b1.58-2B-4T` model locally through the Rust split runtime.
 - Exercise the scheduler, topology, worker profile, activation codec, and
   simulated ring tests.
 
-Two-PC control-plane test:
+Two-PC distributed smoke test:
 
 On PC 1:
 
 ```bash
-cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --layers 30
+cargo run -p bitty-cli --bin bitty -- node \
+  --model /path/to/ggml-model-i2_s.gguf \
+  --layers 30
 ```
 
-On PC 2, replacing the IP address with PC 1's LAN IP:
+On PC 2, use the `iroh://...` join value printed by PC 1:
 
 ```bash
-cargo run -p bitty-worker -- \
+cargo run -p bitty-cli --bin bitty -- node \
+  --join 'iroh://PC1_IROH_NODE_ID?token=CLUSTER_TOKEN' \
   --node-id pc2 \
-  --coordinator 192.168.1.10:50051 \
-  --heartbeat-count 5
+  --model /path/to/ggml-model-i2_s.gguf
 ```
 
-What is still missing for real two-PC sharing:
+The two-machine gate is deterministic when `--temperature 0` is used.
 
-- Real activation transfer over gRPC between machines.
-- Model layer/shard loading per worker.
-- Distributed BitNet execution across those shards.
+## Advanced Debug Binaries
 
-The next milestone is to turn the existing coordinator and worker libraries
-into an activation ring so registered workers can execute assigned layer ranges
-instead of only reporting profile and heartbeat data.
+The role-specific binaries still exist for debugging lower-level pieces:
+
+```bash
+cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /path/to/model.gguf --layers 30
+cargo run -p bitty-worker -- --node-id worker-a --listen 0.0.0.0:50061 --coordinator 127.0.0.1:50051 --model /path/to/model.gguf
+cargo run -p bitty-inference --bin bitty-client -- --coordinator 127.0.0.1:50051 --prompt "Hello"
+```
+
+## License
+
+Bitty is licensed under the GNU General Public License v3.0. See
+[`LICENSE`](LICENSE) for details.

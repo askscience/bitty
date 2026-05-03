@@ -1,20 +1,62 @@
-use bitty_inference::FakeLayerExecutor;
+use bitty_inference::{BitNetLayerExecutor, FakeLayerExecutor};
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
 use bitty_protocol::pb::{HeartbeatRequest, RegisterWorkerRequest};
-use bitty_protocol::{AssignedLayerRange, LayerAssignment, NodeId, Quantization};
-use bitty_worker::{keepalive, HardwareProfiler};
+use bitty_protocol::{AssignedLayerRange, LayerAssignment, ModelStage, NodeId, Quantization};
+use bitty_worker::{keepalive, network::NetworkWorker, HardwareProfiler};
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = WorkerConfig::from_env();
-    let profile = HardwareProfiler::new(config.node_id.clone()).profile();
+    let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
+    if let Some(endpoint) = config
+        .public_endpoint
+        .clone()
+        .or_else(|| config.listen.clone())
+    {
+        profile.worker_endpoint = endpoint;
+    }
 
     println!("bitty-worker: node={}", profile.node_id);
     println!(
         "profile tier={:?} cpu_tflops={:.2} memory_gb={:.1} os={}",
         profile.tier, profile.cpu_tflops, profile.memory_gb, profile.os
     );
+
+    if let Some(listen_addr) = &config.listen {
+        if let Some(model_path) = &config.model {
+            let executor = Arc::new(BitNetLayerExecutor::load(model_path).await?);
+            let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor);
+            if let Some(coordinator) = &config.coordinator {
+                let server = worker.clone();
+                let listen_addr = listen_addr.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = server.serve(&listen_addr).await {
+                        eprintln!("worker server stopped: {err}");
+                    }
+                });
+                run_network_worker(coordinator, &config, profile).await?;
+            } else {
+                worker.serve(listen_addr).await?;
+            }
+        } else {
+            let worker = NetworkWorker::with_fake_executor(config.node_id.clone());
+            if let Some(coordinator) = &config.coordinator {
+                let server = worker.clone();
+                let listen_addr = listen_addr.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = server.serve(&listen_addr).await {
+                        eprintln!("worker server stopped: {err}");
+                    }
+                });
+                run_network_worker(coordinator, &config, profile).await?;
+            } else {
+                worker.serve(listen_addr).await?;
+            }
+        }
+        return Ok(());
+    }
 
     if let Some(coordinator) = &config.coordinator {
         run_network_worker(coordinator, &config, profile).await?;
@@ -32,6 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             assigned_weight_bytes: 128,
             expected_latency_ms: 1.0,
             next_node_id: None,
+            disk_offload_fraction: 0.0,
+            model_stage: ModelStage::LayerRange,
         };
         keepalive::touch_weights(&FakeLayerExecutor, &assignment).await?;
         println!(
@@ -114,6 +158,9 @@ struct WorkerConfig {
     coordinator: Option<String>,
     heartbeat_count: u32,
     heartbeat_interval_ms: u64,
+    listen: Option<String>,
+    public_endpoint: Option<String>,
+    model: Option<String>,
 }
 
 impl WorkerConfig {
@@ -122,8 +169,11 @@ impl WorkerConfig {
             node_id: "local-worker-0".into(),
             keepalive: false,
             coordinator: None,
-            heartbeat_count: 3,
+            heartbeat_count: u32::MAX,
             heartbeat_interval_ms: 1000,
+            listen: None,
+            public_endpoint: None,
+            model: None,
         };
         let mut args = std::env::args().skip(1);
 
@@ -147,6 +197,24 @@ impl WorkerConfig {
                 }
                 "--heartbeat-interval-ms" => {
                     config.heartbeat_interval_ms = parse_next(&mut args, "--heartbeat-interval-ms")
+                }
+                "--listen" => {
+                    config.listen = Some(args.next().unwrap_or_else(|| {
+                        eprintln!("missing value for --listen");
+                        std::process::exit(2);
+                    }))
+                }
+                "--public-endpoint" => {
+                    config.public_endpoint = Some(args.next().unwrap_or_else(|| {
+                        eprintln!("missing value for --public-endpoint");
+                        std::process::exit(2);
+                    }))
+                }
+                "--model" => {
+                    config.model = Some(args.next().unwrap_or_else(|| {
+                        eprintln!("missing value for --model");
+                        std::process::exit(2);
+                    }))
                 }
                 "--help" | "-h" => {
                     print_help();
@@ -189,7 +257,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: cargo run -p bitty-worker -- [--node-id ID] [--keepalive] [--coordinator HOST:PORT]"
+        "Usage: cargo run -p bitty-worker -- [--node-id ID] [--keepalive] [--coordinator HOST:PORT] [--listen ADDR] [--public-endpoint HOST:PORT] [--model PATH]"
     );
     println!(
         "Example: cargo run -p bitty-worker -- --node-id pc2 --coordinator 192.168.1.10:50051"

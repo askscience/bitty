@@ -9,11 +9,20 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 bitty-model.workspace = true
+bitty-bitnet-runtime.workspace = true
 bitty-protocol.workspace = true
+futures = { workspace = true, optional = true }
+metrics.workspace = true
+oxbitnet = { workspace = true, optional = true }
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+
+[features]
+default = []
+oxbitnet-backend = ["dep:futures", "dep:oxbitnet"]
 
 [[bin]]
 name = "bitty-tiny-lm"
@@ -22,3 +31,11 @@ path = "src/bin/tiny_lm.rs"
 [[bin]]
 name = "bitty-bitnet"
 path = "src/bin/bitnet.rs"
+
+[[bin]]
+name = "bitty-rust-bitnet"
+path = "src/bin/rust_bitnet.rs"
+
+[[bin]]
+name = "bitty-client"
+path = "src/bin/client.rs"

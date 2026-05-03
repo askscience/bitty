@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange};
+use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, BitNetLogits};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,6 +17,29 @@ pub trait LayerExecutor: Send + Sync {
         range: &AssignedLayerRange,
         activation: ActivationTensor,
     ) -> Result<ActivationTensor, ExecutorError>;
+
+    async fn final_logits(
+        &self,
+        activation: ActivationTensor,
+    ) -> Result<BitNetLogits, ExecutorError> {
+        if !activation.verify_checksum() {
+            return Err(ExecutorError::ChecksumFailed);
+        }
+        let token = activation
+            .payload
+            .chunks_exact(4)
+            .last()
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .unwrap_or_default();
+        let mut logits = vec![f32::NEG_INFINITY; 32_000];
+        let index = (token as usize + 1) % logits.len();
+        logits[index] = 0.0;
+        Ok(BitNetLogits::new(
+            activation.request_id,
+            activation.token_position,
+            logits,
+        ))
+    }
 }
 
 #[async_trait]

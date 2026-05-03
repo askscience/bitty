@@ -38,7 +38,7 @@ impl PrefixCacheKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RequestLifecycle {
     pub request_id: String,
     pub prompt_tokens: Vec<u32>,

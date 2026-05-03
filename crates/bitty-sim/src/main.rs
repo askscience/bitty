@@ -24,15 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster.topology().assignments.len()
     );
 
-    for token in 0..config.tokens {
-        let report = cluster.run_token(&format!("local-{token}")).await?;
+    let stream = cluster.stream_tokens("local", config.tokens).await?;
+    for (token, report) in stream.tokens.iter().zip(stream.reports.iter()) {
         let total_latency_us = report
             .hops
             .iter()
             .map(|hop| hop.simulated_micros)
             .sum::<u64>();
         println!(
-            "token={token} hops={} simulated_latency_us={} checksum_ok={}",
+            "token={} text={} hops={} simulated_latency_us={} checksum_ok={}",
+            token.token_position,
+            token.text,
             report.hops.len(),
             total_latency_us,
             report.final_activation.verify_checksum()

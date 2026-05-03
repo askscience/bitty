@@ -1,6 +1,6 @@
 use bitty_protocol::{
-    AssignedLayerRange, HardwareProfile, LayerAssignment, LayerMetadata, NodeId, NodeTier,
-    Quantization,
+    AssignedLayerRange, HardwareProfile, LayerAssignment, LayerMetadata, ModelStage, NodeId,
+    NodeTier, Quantization,
 };
 use std::collections::HashSet;
 use thiserror::Error;
@@ -104,6 +104,8 @@ impl Halda {
                 assigned_weight_bytes,
                 expected_latency_ms: estimate_latency_ms(node, cursor, cursor + len, layers),
                 next_node_id: None,
+                disk_offload_fraction: disk_offload_fraction(node, assigned_weight_bytes),
+                model_stage: ModelStage::LayerRange,
             });
             cursor += len;
         }
@@ -147,6 +149,8 @@ impl Halda {
             assigned_weight_bytes,
             expected_latency_ms: estimate_latency_ms(node, cursor, end, layers),
             next_node_id: None,
+            disk_offload_fraction: disk_offload_fraction(node, assigned_weight_bytes),
+            model_stage: ModelStage::LayerRange,
         });
         Ok(())
     }
@@ -160,6 +164,12 @@ impl Halda {
         let len = assignments.len();
         for (index, assignment) in assignments.iter_mut().enumerate() {
             assignment.next_node_id = Some(node_ids[(index + 1) % len].clone());
+        }
+        if let Some(first) = assignments.first_mut() {
+            first.model_stage = ModelStage::EmbeddingAndLayers;
+        }
+        if let Some(last) = assignments.last_mut() {
+            last.model_stage = ModelStage::FinalLayersAndLmHead;
         }
     }
 
@@ -285,6 +295,15 @@ fn estimate_latency_ms(
     (flops / (tflops * 1e12)) * 1000.0 + node.network_rtt_ms
 }
 
+fn disk_offload_fraction(node: &HardwareProfile, assigned_weight_bytes: u64) -> f32 {
+    let budget = available_memory_bytes(node, 0.15);
+    if assigned_weight_bytes <= budget {
+        0.0
+    } else {
+        1.0 - (budget as f32 / assigned_weight_bytes as f32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +327,12 @@ mod tests {
             uplink_mbps: 100.0,
             os: "linux".into(),
             tier,
+            ram_mb: (memory_gb * 1024.0) as u64,
+            vram_mb: 0,
+            architecture: "x86_64".into(),
+            gpus: Vec::new(),
+            os_reclaim_score: 0.0,
+            worker_endpoint: String::new(),
         }
     }
 

@@ -5,9 +5,13 @@ use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, NodeTier};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = CoordinatorConfig::from_env();
     if let Some(listen_addr) = &config.listen {
-        NetworkCoordinator::new(demo_layers(config.layers))
-            .serve(listen_addr)
-            .await?;
+        let coordinator = NetworkCoordinator::new(demo_layers(config.layers));
+        let coordinator = if let Some(model_path) = &config.model {
+            coordinator.with_model_path(model_path)
+        } else {
+            coordinator
+        };
+        coordinator.serve(listen_addr).await?;
         return Ok(());
     }
 
@@ -47,6 +51,7 @@ struct CoordinatorConfig {
     nodes: usize,
     layers: u32,
     listen: Option<String>,
+    model: Option<String>,
 }
 
 impl CoordinatorConfig {
@@ -55,6 +60,7 @@ impl CoordinatorConfig {
             nodes: 8,
             layers: 16,
             listen: None,
+            model: None,
         };
         let mut args = std::env::args().skip(1);
 
@@ -63,6 +69,7 @@ impl CoordinatorConfig {
                 "--nodes" => config.nodes = parse_next(&mut args, "--nodes"),
                 "--layers" => config.layers = parse_next(&mut args, "--layers"),
                 "--listen" => config.listen = Some(required_next(&mut args, "--listen")),
+                "--model" => config.model = Some(required_next(&mut args, "--model")),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -104,6 +111,12 @@ fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
                 uplink_mbps: 100.0,
                 os: "local".into(),
                 tier,
+                ram_mb: 4096,
+                vram_mb: 0,
+                architecture: std::env::consts::ARCH.into(),
+                gpus: Vec::new(),
+                os_reclaim_score: 0.0,
+                worker_endpoint: String::new(),
             }
         })
         .collect()
@@ -141,6 +154,6 @@ fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> String 
 }
 
 fn print_help() {
-    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR]");
-    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --layers 30");
+    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR] [--model PATH]");
+    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /models/ggml-model-i2_s.gguf --layers 30");
 }

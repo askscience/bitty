@@ -1,5 +1,6 @@
 pub mod keepalive;
 pub mod metrics;
+pub mod network;
 pub mod profiler;
 pub mod ring;
 pub mod shard;

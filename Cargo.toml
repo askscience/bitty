@@ -3,6 +3,8 @@ members = [
     "crates/bitty-protocol",
     "crates/bitty-model",
     "crates/bitty-inference",
+    "crates/bitty-cli",
+    "crates/bitty-bitnet-runtime",
     "crates/bitty-coordinator",
     "crates/bitty-worker",
     "crates/bitty-sim",
@@ -24,8 +26,11 @@ bytes = "1"
 crc32fast = "1"
 futures = "0.3"
 governor = "0.6"
+iroh = "0.98.2"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+memmap2 = "0.9"
+oxbitnet = "0.5.2"
 prost = "0.13"
 proptest = "1"
 rand = "0.8"
@@ -41,6 +46,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 bitty-protocol = { path = "crates/bitty-protocol" }
 bitty-model = { path = "crates/bitty-model" }
+bitty-bitnet-runtime = { path = "crates/bitty-bitnet-runtime" }
 bitty-inference = { path = "crates/bitty-inference" }
 bitty-coordinator = { path = "crates/bitty-coordinator" }
 bitty-worker = { path = "crates/bitty-worker" }

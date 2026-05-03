@@ -1,5 +1,5 @@
 [package]
-name = "bitty-coordinator"
+name = "bitty-cli"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,21 +7,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-bincode.workspace = true
+bitty-coordinator.workspace = true
 bitty-inference.workspace = true
-bitty-observability.workspace = true
 bitty-protocol.workspace = true
+bitty-worker.workspace = true
 futures.workspace = true
-governor.workspace = true
 iroh.workspace = true
 prost.workspace = true
-serde.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
-tracing.workspace = true
-uuid.workspace = true
 
-[dev-dependencies]
-proptest.workspace = true
+[[bin]]
+name = "bitty"
+path = "src/main.rs"

@@ -13,6 +13,18 @@ message HardwareProfile {
   double uplink_mbps = 8;
   string os = 9;
   string tier = 10;
+  uint64 ram_mb = 11;
+  uint64 vram_mb = 12;
+  string architecture = 13;
+  repeated GpuInfo gpus = 14;
+  double os_reclaim_score = 15;
+  string worker_endpoint = 16;
+}
+
+message GpuInfo {
+  string name = 1;
+  uint64 vram_mb = 2;
+  uint64 compute_capability = 3;
 }
 
 message LayerMetadata {
@@ -35,6 +47,8 @@ message LayerAssignment {
   uint64 assigned_weight_bytes = 3;
   double expected_latency_ms = 4;
   string next_node_id = 5;
+  float disk_offload_fraction = 6;
+  string model_stage = 7;
 }
 
 message ActivationTensor {
@@ -46,6 +60,7 @@ message ActivationTensor {
   string dtype = 6;
   bytes payload = 7;
   uint32 crc32 = 8;
+  string compression = 9;
 }
 
 message TokenOutput {
@@ -54,6 +69,27 @@ message TokenOutput {
   uint32 token_id = 3;
   string text = 4;
   bool finished = 5;
+  float log_prob = 6;
+  uint64 gen_latency_us = 7;
+}
+
+message BitNetLogits {
+  string request_id = 1;
+  uint32 token_position = 2;
+  repeated float logits = 3;
+  uint32 crc32 = 4;
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  repeated uint32 prompt_tokens = 2;
+  string prompt = 3;
+  uint32 max_new_tokens = 4;
+  float temperature = 5;
+}
+
+message GenerateResponse {
+  repeated TokenOutput tokens = 1;
 }
 
 message RegisterWorkerRequest {
@@ -80,13 +116,55 @@ message TopologyUpdate {
   repeated LayerAssignment assignments = 2;
 }
 
+message ShardManifest {
+  string shard_id = 1;
+  string node_id = 2;
+  AssignedLayerRange range = 3;
+  uint64 byte_len = 4;
+  string sha256_hex = 5;
+  string path = 6;
+}
+
+message LoadShardRequest {
+  ShardManifest manifest = 1;
+}
+
+message LoadShardResponse {
+  bool loaded = 1;
+  string message = 2;
+}
+
+message CleanupRequest {
+  string request_id = 1;
+}
+
+message CleanupResponse {
+  bool cleaned = 1;
+}
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  string leader_id = 1;
+  string topology_epoch = 2;
+  uint32 active_workers = 3;
+  repeated LayerAssignment assignments = 4;
+  string model_path = 5;
+  bool model_ready = 6;
+}
+
 service CoordinatorService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Generate(GenerateRequest) returns (stream TokenOutput);
   rpc StreamTokens(ActivationTensor) returns (stream TokenOutput);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
 }
 
 service WorkerService {
   rpc ForwardActivation(ActivationTensor) returns (ActivationTensor);
+  rpc FinalLogits(ActivationTensor) returns (BitNetLogits);
   rpc ApplyTopology(TopologyUpdate) returns (HeartbeatResponse);
+  rpc LoadShard(LoadShardRequest) returns (LoadShardResponse);
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
 }

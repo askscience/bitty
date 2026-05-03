@@ -9,6 +9,8 @@ pub mod pb {
     tonic::include_proto!("bitty.v1");
 }
 
+pub mod iroh_transport;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct NodeId(pub String);
 
@@ -106,6 +108,76 @@ impl TryFrom<&str> for Quantization {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionKind {
+    None,
+    Fp8,
+    TopK,
+    Delta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelStage {
+    LayerRange,
+    EmbeddingAndLayers,
+    FinalLayersAndLmHead,
+}
+
+impl ModelStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LayerRange => "layer_range",
+            Self::EmbeddingAndLayers => "embedding_and_layers",
+            Self::FinalLayersAndLmHead => "final_layers_and_lm_head",
+        }
+    }
+}
+
+impl TryFrom<&str> for ModelStage {
+    type Error = ProtocolConversionError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "" | "layer_range" => Ok(Self::LayerRange),
+            "embedding_and_layers" => Ok(Self::EmbeddingAndLayers),
+            "final_layers_and_lm_head" => Ok(Self::FinalLayersAndLmHead),
+            other => Err(ProtocolConversionError::UnknownModelStage(other.into())),
+        }
+    }
+}
+
+impl CompressionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fp8 => "fp8",
+            Self::TopK => "topk",
+            Self::Delta => "delta",
+        }
+    }
+}
+
+impl TryFrom<&str> for CompressionKind {
+    type Error = ProtocolConversionError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "" | "none" => Ok(Self::None),
+            "fp8" => Ok(Self::Fp8),
+            "topk" => Ok(Self::TopK),
+            "delta" => Ok(Self::Delta),
+            other => Err(ProtocolConversionError::UnknownCompression(other.into())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vram_mb: u64,
+    pub compute_capability: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HardwareProfile {
     pub node_id: NodeId,
@@ -118,11 +190,22 @@ pub struct HardwareProfile {
     pub uplink_mbps: f64,
     pub os: String,
     pub tier: NodeTier,
+    pub ram_mb: u64,
+    pub vram_mb: u64,
+    pub architecture: String,
+    pub gpus: Vec<GpuInfo>,
+    pub os_reclaim_score: f64,
+    pub worker_endpoint: String,
 }
 
 impl HardwareProfile {
     pub fn memory_bytes(&self) -> u64 {
-        (self.memory_gb * 1024.0 * 1024.0 * 1024.0).max(0.0) as u64
+        let reported = self.ram_mb.saturating_mul(1024 * 1024);
+        if reported > 0 {
+            reported
+        } else {
+            (self.memory_gb * 1024.0 * 1024.0 * 1024.0).max(0.0) as u64
+        }
     }
 
     pub fn effective_compute_score(&self) -> f64 {
@@ -170,6 +253,8 @@ pub struct LayerAssignment {
     pub assigned_weight_bytes: u64,
     pub expected_latency_ms: f64,
     pub next_node_id: Option<NodeId>,
+    pub disk_offload_fraction: f32,
+    pub model_stage: ModelStage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +274,7 @@ pub struct ActivationTensor {
     pub dtype: ActivationDType,
     pub payload: Vec<u8>,
     pub crc32: u32,
+    pub compression: CompressionKind,
 }
 
 impl ActivationTensor {
@@ -211,7 +297,13 @@ impl ActivationTensor {
             dtype,
             payload,
             crc32,
+            compression: CompressionKind::None,
         }
+    }
+
+    pub fn with_compression(mut self, compression: CompressionKind) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub fn verify_checksum(&self) -> bool {
@@ -219,19 +311,72 @@ impl ActivationTensor {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenOutput {
     pub request_id: String,
     pub token_position: u32,
     pub token_id: u32,
     pub text: String,
     pub finished: bool,
+    pub log_prob: f32,
+    pub gen_latency_us: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenerateRequest {
+    pub request_id: String,
+    pub prompt_tokens: Vec<u32>,
+    pub prompt: String,
+    pub max_new_tokens: u32,
+    pub temperature: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BitNetLogits {
+    pub request_id: String,
+    pub token_position: u32,
+    pub logits: Vec<f32>,
+    pub crc32: u32,
+}
+
+impl BitNetLogits {
+    pub fn new(request_id: impl Into<String>, token_position: u32, logits: Vec<f32>) -> Self {
+        let payload = logits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        Self {
+            request_id: request_id.into(),
+            token_position,
+            logits,
+            crc32: checksum(&payload),
+        }
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        let payload = self
+            .logits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        checksum(&payload) == self.crc32
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TopologyUpdate {
     pub topology_epoch: String,
     pub assignments: Vec<LayerAssignment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardManifestMessage {
+    pub shard_id: String,
+    pub node_id: NodeId,
+    pub range: AssignedLayerRange,
+    pub byte_len: u64,
+    pub sha256_hex: String,
+    pub path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,6 +396,10 @@ pub enum ProtocolConversionError {
     UnknownNodeTier(String),
     #[error("unknown quantization: {0}")]
     UnknownQuantization(String),
+    #[error("unknown compression: {0}")]
+    UnknownCompression(String),
+    #[error("unknown model stage: {0}")]
+    UnknownModelStage(String),
 }
 
 impl From<&HardwareProfile> for pb::HardwareProfile {
@@ -266,6 +415,32 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             uplink_mbps: profile.uplink_mbps,
             os: profile.os.clone(),
             tier: profile.tier.as_str().into(),
+            ram_mb: profile.ram_mb,
+            vram_mb: profile.vram_mb,
+            architecture: profile.architecture.clone(),
+            gpus: profile.gpus.iter().map(Into::into).collect(),
+            os_reclaim_score: profile.os_reclaim_score,
+            worker_endpoint: profile.worker_endpoint.clone(),
+        }
+    }
+}
+
+impl From<&GpuInfo> for pb::GpuInfo {
+    fn from(gpu: &GpuInfo) -> Self {
+        Self {
+            name: gpu.name.clone(),
+            vram_mb: gpu.vram_mb,
+            compute_capability: gpu.compute_capability,
+        }
+    }
+}
+
+impl From<pb::GpuInfo> for GpuInfo {
+    fn from(gpu: pb::GpuInfo) -> Self {
+        Self {
+            name: gpu.name,
+            vram_mb: gpu.vram_mb,
+            compute_capability: gpu.compute_capability,
         }
     }
 }
@@ -274,6 +449,11 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
     type Error = ProtocolConversionError;
 
     fn try_from(profile: pb::HardwareProfile) -> Result<Self, Self::Error> {
+        let ram_mb = if profile.ram_mb > 0 {
+            profile.ram_mb
+        } else {
+            (profile.memory_gb * 1024.0).max(0.0) as u64
+        };
         Ok(Self {
             node_id: NodeId::new(profile.node_id),
             cpu_tflops: profile.cpu_tflops,
@@ -285,6 +465,16 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             uplink_mbps: profile.uplink_mbps,
             os: profile.os,
             tier: NodeTier::try_from(profile.tier.as_str())?,
+            ram_mb,
+            vram_mb: profile.vram_mb,
+            architecture: if profile.architecture.is_empty() {
+                "unknown".into()
+            } else {
+                profile.architecture
+            },
+            gpus: profile.gpus.into_iter().map(Into::into).collect(),
+            os_reclaim_score: profile.os_reclaim_score,
+            worker_endpoint: profile.worker_endpoint,
         })
     }
 }
@@ -323,6 +513,8 @@ impl From<&LayerAssignment> for pb::LayerAssignment {
                 .as_ref()
                 .map(|node_id| node_id.0.clone())
                 .unwrap_or_default(),
+            disk_offload_fraction: assignment.disk_offload_fraction,
+            model_stage: assignment.model_stage.as_str().into(),
         }
     }
 }
@@ -343,6 +535,132 @@ impl TryFrom<pb::LayerAssignment> for LayerAssignment {
             expected_latency_ms: assignment.expected_latency_ms,
             next_node_id: (!assignment.next_node_id.is_empty())
                 .then(|| NodeId::new(assignment.next_node_id)),
+            disk_offload_fraction: assignment.disk_offload_fraction,
+            model_stage: ModelStage::try_from(assignment.model_stage.as_str())?,
+        })
+    }
+}
+
+impl From<&ActivationTensor> for pb::ActivationTensor {
+    fn from(activation: &ActivationTensor) -> Self {
+        Self {
+            request_id: activation.request_id.clone(),
+            token_position: activation.token_position,
+            source_layer: activation.source_layer,
+            target_layer: activation.target_layer,
+            shape: activation.shape.clone(),
+            dtype: match activation.dtype {
+                ActivationDType::Fp16 => "fp16",
+                ActivationDType::Fp8 => "fp8",
+                ActivationDType::I8 => "i8",
+            }
+            .into(),
+            payload: activation.payload.clone(),
+            crc32: activation.crc32,
+            compression: activation.compression.as_str().into(),
+        }
+    }
+}
+
+impl TryFrom<pb::ActivationTensor> for ActivationTensor {
+    type Error = ProtocolConversionError;
+
+    fn try_from(activation: pb::ActivationTensor) -> Result<Self, Self::Error> {
+        let dtype = match activation.dtype.as_str() {
+            "" | "fp16" => ActivationDType::Fp16,
+            "fp8" => ActivationDType::Fp8,
+            "i8" => ActivationDType::I8,
+            other => return Err(ProtocolConversionError::UnknownCompression(other.into())),
+        };
+        Ok(Self {
+            request_id: activation.request_id,
+            token_position: activation.token_position,
+            source_layer: activation.source_layer,
+            target_layer: activation.target_layer,
+            shape: activation.shape,
+            dtype,
+            payload: activation.payload,
+            crc32: activation.crc32,
+            compression: CompressionKind::try_from(activation.compression.as_str())?,
+        })
+    }
+}
+
+impl From<&TokenOutput> for pb::TokenOutput {
+    fn from(token: &TokenOutput) -> Self {
+        Self {
+            request_id: token.request_id.clone(),
+            token_position: token.token_position,
+            token_id: token.token_id,
+            text: token.text.clone(),
+            finished: token.finished,
+            log_prob: token.log_prob,
+            gen_latency_us: token.gen_latency_us,
+        }
+    }
+}
+
+impl From<pb::GenerateRequest> for GenerateRequest {
+    fn from(request: pb::GenerateRequest) -> Self {
+        Self {
+            request_id: request.request_id,
+            prompt_tokens: request.prompt_tokens,
+            prompt: request.prompt,
+            max_new_tokens: request.max_new_tokens,
+            temperature: request.temperature,
+        }
+    }
+}
+
+impl From<&BitNetLogits> for pb::BitNetLogits {
+    fn from(logits: &BitNetLogits) -> Self {
+        Self {
+            request_id: logits.request_id.clone(),
+            token_position: logits.token_position,
+            logits: logits.logits.clone(),
+            crc32: logits.crc32,
+        }
+    }
+}
+
+impl From<pb::BitNetLogits> for BitNetLogits {
+    fn from(logits: pb::BitNetLogits) -> Self {
+        Self {
+            request_id: logits.request_id,
+            token_position: logits.token_position,
+            logits: logits.logits,
+            crc32: logits.crc32,
+        }
+    }
+}
+
+impl From<&ShardManifestMessage> for pb::ShardManifest {
+    fn from(manifest: &ShardManifestMessage) -> Self {
+        Self {
+            shard_id: manifest.shard_id.clone(),
+            node_id: manifest.node_id.0.clone(),
+            range: Some((&manifest.range).into()),
+            byte_len: manifest.byte_len,
+            sha256_hex: manifest.sha256_hex.clone(),
+            path: manifest.path.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb::ShardManifest> for ShardManifestMessage {
+    type Error = ProtocolConversionError;
+
+    fn try_from(manifest: pb::ShardManifest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            shard_id: manifest.shard_id,
+            node_id: NodeId::new(manifest.node_id),
+            range: manifest
+                .range
+                .ok_or(ProtocolConversionError::MissingField("ShardManifest.range"))?
+                .try_into()?,
+            byte_len: manifest.byte_len,
+            sha256_hex: manifest.sha256_hex,
+            path: manifest.path,
         })
     }
 }
@@ -403,11 +721,34 @@ mod tests {
             assigned_weight_bytes: 42,
             expected_latency_ms: 1.5,
             next_node_id: Some(NodeId::new("node-b")),
+            disk_offload_fraction: 0.0,
+            model_stage: ModelStage::EmbeddingAndLayers,
         };
 
         let proto = pb::LayerAssignment::from(&assignment);
         let decoded = LayerAssignment::try_from(proto).unwrap();
 
         assert_eq!(decoded, assignment);
+    }
+
+    #[test]
+    fn shard_manifest_round_trips_through_proto() {
+        let manifest = ShardManifestMessage {
+            shard_id: "shard-a".into(),
+            node_id: NodeId::new("node-a"),
+            range: AssignedLayerRange {
+                start_layer: 0,
+                end_layer_exclusive: 2,
+                quantization: Quantization::Bit1,
+            },
+            byte_len: 128,
+            sha256_hex: "abc123".into(),
+            path: "/tmp/shard.bin".into(),
+        };
+
+        let proto = pb::ShardManifest::from(&manifest);
+        let decoded = ShardManifestMessage::try_from(proto).unwrap();
+
+        assert_eq!(decoded, manifest);
     }
 }

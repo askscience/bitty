@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !script.exists() {
         return Err(format!(
-            "BitNet runtime not found at {}. Run scripts/setup_bitnet.sh first, or pass --runtime-dir.",
+            "BitNet runtime not found at {}. Install bitnet.cpp separately, or pass --runtime-dir.",
             script.display()
         )
         .into());
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !model.exists() {
         return Err(format!(
-            "BitNet model not found at {}. Run scripts/setup_bitnet.sh first, or pass --model.",
+            "BitNet model not found at {}. Download the GGUF model separately, or pass --model.",
             model.display()
         )
         .into());
@@ -145,5 +145,7 @@ fn print_help() {
     println!("  runtime: {DEFAULT_RUNTIME_DIR}");
     println!("  model:   {DEFAULT_MODEL_PATH}");
     println!();
-    println!("Run scripts/setup_bitnet.sh first to install the official bitnet.cpp runtime and GGUF model.");
+    println!(
+        "Install bitnet.cpp and the GGUF model separately, or pass --runtime-dir and --model."
+    );
 }

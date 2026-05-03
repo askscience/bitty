@@ -2,6 +2,7 @@ use bitty_coordinator::{Halda, RingTopology, SchedulerConfig};
 use bitty_inference::FakeLayerExecutor;
 use bitty_protocol::{
     ActivationDType, ActivationTensor, HardwareProfile, LayerMetadata, NodeId, NodeTier,
+    TokenOutput,
 };
 use bitty_worker::{RingWorker, RingWorkerError};
 use std::sync::Arc;
@@ -23,6 +24,12 @@ pub struct HopLatency {
 pub struct SimulationReport {
     pub final_activation: ActivationTensor,
     pub hops: Vec<HopLatency>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamedSimulation {
+    pub tokens: Vec<TokenOutput>,
+    pub reports: Vec<SimulationReport>,
 }
 
 pub struct SimulatedCluster {
@@ -59,14 +66,23 @@ impl SimulatedCluster {
     }
 
     pub async fn run_token(&self, request_id: &str) -> Result<SimulationReport, SimulationError> {
+        self.run_token_at(request_id, 0, vec![1, 2, 3, 4]).await
+    }
+
+    pub async fn run_token_at(
+        &self,
+        request_id: &str,
+        token_position: u32,
+        payload: Vec<u8>,
+    ) -> Result<SimulationReport, SimulationError> {
         let mut activation = ActivationTensor::new(
             request_id,
+            token_position,
             0,
             0,
-            0,
-            vec![4],
+            vec![payload.len() as u32],
             ActivationDType::Fp16,
-            vec![1, 2, 3, 4],
+            payload,
         );
         let mut hops = Vec::new();
 
@@ -91,6 +107,56 @@ impl SimulatedCluster {
             final_activation: activation,
             hops,
         })
+    }
+
+    pub async fn stream_tokens(
+        &self,
+        request_id: &str,
+        token_count: u32,
+    ) -> Result<StreamedSimulation, SimulationError> {
+        let mut reports = Vec::new();
+        let mut tokens = Vec::new();
+
+        for position in 0..token_count {
+            let seed = position.to_le_bytes().to_vec();
+            let report = self.run_token_at(request_id, position, seed).await?;
+            let token_id = report
+                .final_activation
+                .payload
+                .chunks_exact(4)
+                .last()
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .unwrap_or(position);
+            let gen_latency_us = report
+                .hops
+                .iter()
+                .map(|hop| hop.simulated_micros)
+                .sum::<u64>();
+            tokens.push(TokenOutput {
+                request_id: request_id.into(),
+                token_position: position,
+                token_id,
+                text: format!("<tok:{token_id}>"),
+                finished: position + 1 == token_count,
+                log_prob: 0.0,
+                gen_latency_us,
+            });
+            reports.push(report);
+        }
+
+        Ok(StreamedSimulation { tokens, reports })
+    }
+
+    pub async fn run_batch(
+        &self,
+        request_ids: &[String],
+        token_count: u32,
+    ) -> Result<Vec<StreamedSimulation>, SimulationError> {
+        let mut outputs = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            outputs.push(self.stream_tokens(request_id, token_count).await?);
+        }
+        Ok(outputs)
     }
 
     pub fn topology(&self) -> &RingTopology {
@@ -121,6 +187,12 @@ pub fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
             uplink_mbps: 100.0,
             os: "linux".into(),
             tier: if index == 0 { NodeTier::S } else { NodeTier::D },
+            ram_mb: 4096,
+            vram_mb: if index == 0 { 8192 } else { 0 },
+            architecture: "x86_64".into(),
+            gpus: Vec::new(),
+            os_reclaim_score: 0.0,
+            worker_endpoint: String::new(),
         })
         .collect()
 }
@@ -163,5 +235,15 @@ mod tests {
             cluster.run_token("req").await,
             Err(SimulationError::DroppedNode(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn simulated_cluster_streams_tokens() {
+        let cluster = SimulatedCluster::build(demo_profiles(4), demo_layers(8)).unwrap();
+        let output = cluster.stream_tokens("req", 3).await.unwrap();
+
+        assert_eq!(output.tokens.len(), 3);
+        assert!(output.tokens.last().unwrap().finished);
+        assert_eq!(output.reports.len(), 3);
     }
 }
