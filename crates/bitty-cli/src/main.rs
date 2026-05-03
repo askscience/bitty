@@ -12,7 +12,7 @@ use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
     SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_REGISTER_WORKER,
     WORKER_APPLY_TOPOLOGY, WORKER_CLEANUP, WORKER_FINAL_LOGITS, WORKER_FORWARD_ACTIVATION,
-    WORKER_LOAD_SHARD,
+    WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
 };
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
 use bitty_protocol::pb::coordinator_service_server::CoordinatorService;
@@ -20,10 +20,14 @@ use bitty_protocol::pb::worker_service_server::WorkerService;
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, CleanupRequest, ClusterStatusRequest,
     ClusterStatusResponse, GenerateRequest, GenerateResponse, HeartbeatRequest, HeartbeatResponse,
-    LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, TopologyUpdate,
+    LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
+    TopologyUpdate,
 };
-use bitty_protocol::{LayerMetadata, NodeId};
-use bitty_worker::{network::NetworkWorker, HardwareProfiler};
+use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId};
+use bitty_worker::{
+    network::{NetworkWorker, RuntimeStats},
+    HardwareProfiler,
+};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
 use settings::BittySettings;
@@ -245,6 +249,7 @@ enum ClusterCommand {
     Status(ClusterConfig),
     Nodes(ClusterConfig),
     Check(ClusterConfig),
+    Benchmark(ClusterConfig),
     Invite(DataDirConfig),
 }
 
@@ -332,6 +337,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     ));
     let executor = Arc::new(BitNetLayerExecutor::load(&config.model).await?);
     let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor);
+    let worker_stats = worker.runtime_stats();
 
     let use_iroh = config.iroh || config.join.as_deref().is_some_and(is_iroh_join_target);
     let data_dir = bitty_data_dir(config.data_dir.as_deref());
@@ -428,6 +434,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         iroh_node.as_ref(),
         local_worker_endpoint.as_deref(),
         &cluster_token,
+        worker_stats,
     )
     .await
 }
@@ -796,6 +803,11 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
                 return Err("cluster is not ready".into());
             }
         }
+        ClusterCommand::Benchmark(config) => {
+            let status =
+                fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
+            print_cluster_benchmark(&status);
+        }
         ClusterCommand::Invite(config) => {
             run_invite(InviteConfig {
                 name: None,
@@ -918,8 +930,10 @@ async fn register_and_heartbeat(
     iroh_node: Option<&IrohNode>,
     local_worker_endpoint: Option<&str>,
     cluster_token: &str,
+    worker_stats: RuntimeStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
+    profile.network_rtt_ms = estimate_scheduler_rtt_ms(target).await;
     profile.model_path = config.model.clone();
     profile.worker_endpoint = match target {
         SchedulerTarget::Local(_) => local_worker_endpoint
@@ -960,10 +974,17 @@ async fn register_and_heartbeat(
             );
             loop {
                 sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
+                let snapshot = worker_stats.snapshot().await;
                 let response = coordinator
                     .heartbeat(tonic::Request::new(HeartbeatRequest {
                         node_id: profile.node_id.0.clone(),
-                        observed_tokens_per_second: profile.effective_compute_score(),
+                        observed_tokens_per_second: observed_tokens_per_second(
+                            &profile,
+                            snapshot.observed_tokens_per_second,
+                        ),
+                        avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                        activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                        backend_type: profile.backend_type.clone(),
                     }))
                     .await;
                 match response {
@@ -995,10 +1016,17 @@ async fn register_and_heartbeat(
             );
             loop {
                 sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
+                let snapshot = worker_stats.snapshot().await;
                 let response = client
                     .heartbeat(HeartbeatRequest {
                         node_id: profile.node_id.0.clone(),
-                        observed_tokens_per_second: profile.effective_compute_score(),
+                        observed_tokens_per_second: observed_tokens_per_second(
+                            &profile,
+                            snapshot.observed_tokens_per_second,
+                        ),
+                        avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                        activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                        backend_type: profile.backend_type.clone(),
                     })
                     .await;
                 match response {
@@ -1040,12 +1068,19 @@ async fn register_and_heartbeat(
             );
             loop {
                 sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
+                let snapshot = worker_stats.snapshot().await;
                 let response = client
                     .request::<_, HeartbeatResponse>(
                         SCHEDULER_HEARTBEAT,
                         &HeartbeatRequest {
                             node_id: profile.node_id.0.clone(),
-                            observed_tokens_per_second: profile.effective_compute_score(),
+                            observed_tokens_per_second: observed_tokens_per_second(
+                                &profile,
+                                snapshot.observed_tokens_per_second,
+                            ),
+                            avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                            activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                            backend_type: profile.backend_type.clone(),
                         },
                     )
                     .await;
@@ -1062,6 +1097,48 @@ async fn register_and_heartbeat(
                 }
             }
         }
+    }
+}
+
+async fn estimate_scheduler_rtt_ms(target: &SchedulerTarget) -> f64 {
+    match target {
+        SchedulerTarget::Local(_) => 0.5,
+        SchedulerTarget::Iroh { .. } => std::env::var("BITTY_NETWORK_RTT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(25.0),
+        SchedulerTarget::Tcp(endpoint) => {
+            let endpoint = endpoint
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            let started = std::time::Instant::now();
+            let address = endpoint.to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                let Ok(socket) = address.parse::<std::net::SocketAddr>() else {
+                    return false;
+                };
+                std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_millis(750))
+                    .is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if result {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                std::env::var("BITTY_NETWORK_RTT_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(50.0)
+            }
+        }
+    }
+}
+
+fn observed_tokens_per_second(profile: &HardwareProfile, measured: f64) -> f64 {
+    if measured > 0.0 {
+        measured
+    } else {
+        profile.effective_compute_score()
     }
 }
 
@@ -1276,6 +1353,38 @@ fn print_cluster_check(status: &ClusterStatusResponse) {
     println!("workers: {}", status.active_workers);
     println!("model ready: {}", yes_no(status.model_ready));
     println!("assignments: {}", status.assignments.len());
+    if !status.profiles.is_empty() {
+        println!();
+        print_cluster_benchmark(status);
+    }
+}
+
+fn print_cluster_benchmark(status: &ClusterStatusResponse) {
+    println!("Hardware profile");
+    println!("----------------");
+    println!("NODE\tBACKEND\tELIGIBLE\tRAM\tVRAM\tCPU TFLOPS\tGPU TFLOPS\tRTT\tUPLINK");
+    for profile in &status.profiles {
+        println!(
+            "{}\t{}\t{}\t{} MB\t{} MB\t{:.2}\t{:.2}\t{:.1} ms\t{:.0} Mbps",
+            profile.node_id,
+            if profile.backend_type.is_empty() {
+                if profile.gpu_tflops > 0.0 {
+                    "gpu"
+                } else {
+                    "cpu"
+                }
+            } else {
+                profile.backend_type.as_str()
+            },
+            yes_no(profile.layer_eligible),
+            profile.ram_mb,
+            profile.vram_mb,
+            profile.cpu_tflops,
+            profile.gpu_tflops,
+            profile.network_rtt_ms,
+            profile.uplink_mbps
+        );
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1615,6 +1724,7 @@ fn parse_cluster(args: &mut impl Iterator<Item = String>) -> Result<ClusterComma
         "status" => parse_cluster_config(args).map(ClusterCommand::Status),
         "nodes" => parse_cluster_config(args).map(ClusterCommand::Nodes),
         "check" => parse_cluster_config(args).map(ClusterCommand::Check),
+        "benchmark" | "bench" => parse_cluster_config(args).map(ClusterCommand::Benchmark),
         "invite" => parse_data_dir(args).map(ClusterCommand::Invite),
         other => Err(format!("unknown cluster command: {other}")),
     }
@@ -1930,6 +2040,11 @@ async fn handle_worker_frame(
             let request: ProtoActivationTensor = frame.decode_message(WORKER_FINAL_LOGITS)?;
             let response = worker.final_logits(tonic::Request::new(request)).await?;
             IrohFrame::message(WORKER_FINAL_LOGITS, "", &response.into_inner())
+        }
+        WORKER_SAMPLE_TOKEN => {
+            let request: SampleTokenRequest = frame.decode_message(WORKER_SAMPLE_TOKEN)?;
+            let response = worker.sample_token(tonic::Request::new(request)).await?;
+            IrohFrame::message(WORKER_SAMPLE_TOKEN, "", &response.into_inner())
         }
         WORKER_APPLY_TOPOLOGY => {
             let request: TopologyUpdate = frame.decode_message(WORKER_APPLY_TOPOLOGY)?;
@@ -2494,7 +2609,7 @@ fn print_help() {
     println!("  bitty join INVITE_OR_NAME [--name NAME] [--model PATH]");
     println!("  bitty use NAME_OR_INVITE [--name NAME]");
     println!("  bitty clusters");
-    println!("  bitty cluster status|nodes|check|invite [--node TARGET]");
+    println!("  bitty cluster status|nodes|check|benchmark|invite [--node TARGET]");
     println!("  bitty node --model PATH");
     println!("  bitty node --join 'iroh://INVITE' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");

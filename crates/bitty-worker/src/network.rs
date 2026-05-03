@@ -3,10 +3,12 @@ use bitty_inference::{FakeLayerExecutor, LayerExecutor};
 use bitty_protocol::pb::worker_service_server::{WorkerService, WorkerServiceServer};
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, BitNetLogits as ProtoBitNetLogits, CleanupRequest,
-    CleanupResponse, HeartbeatResponse, LoadShardRequest, LoadShardResponse, TopologyUpdate,
+    CleanupResponse, HeartbeatResponse, LoadShardRequest, LoadShardResponse, SampleTokenRequest,
+    TokenOutput as ProtoTokenOutput, TopologyUpdate,
 };
 use bitty_protocol::{ActivationTensor, LayerAssignment, ModelStage, NodeId, ShardManifestMessage};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -18,6 +20,65 @@ pub struct NetworkWorker<E = FakeLayerExecutor> {
     executor: Arc<E>,
     topology_epoch: Arc<Mutex<String>>,
     loaded_shard: Arc<Mutex<Option<ShardManifestMessage>>>,
+    stats: RuntimeStats,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeStats {
+    inner: Arc<Mutex<RuntimeStatsInner>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeStatsInner {
+    forward_count: u64,
+    generated_tokens: u64,
+    activation_bytes: u64,
+    forward_latency_us: u128,
+    started: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeStatsSnapshot {
+    pub observed_tokens_per_second: f64,
+    pub avg_forward_latency_ms: f64,
+    pub activation_bytes_per_second: u64,
+}
+
+impl RuntimeStats {
+    async fn record_forward(&self, latency_us: u128, rx_bytes: u64, tx_bytes: u64) {
+        let mut inner = self.inner.lock().await;
+        if inner.started.is_none() {
+            inner.started = Some(Instant::now());
+        }
+        inner.forward_count += 1;
+        inner.activation_bytes = inner.activation_bytes.saturating_add(rx_bytes + tx_bytes);
+        inner.forward_latency_us = inner.forward_latency_us.saturating_add(latency_us);
+    }
+
+    async fn record_token(&self) {
+        let mut inner = self.inner.lock().await;
+        if inner.started.is_none() {
+            inner.started = Some(Instant::now());
+        }
+        inner.generated_tokens += 1;
+    }
+
+    pub async fn snapshot(&self) -> RuntimeStatsSnapshot {
+        let inner = self.inner.lock().await;
+        let elapsed = inner
+            .started
+            .map(|started| started.elapsed().as_secs_f64().max(0.001))
+            .unwrap_or(0.001);
+        RuntimeStatsSnapshot {
+            observed_tokens_per_second: inner.generated_tokens as f64 / elapsed,
+            avg_forward_latency_ms: if inner.forward_count == 0 {
+                0.0
+            } else {
+                inner.forward_latency_us as f64 / inner.forward_count as f64 / 1000.0
+            },
+            activation_bytes_per_second: (inner.activation_bytes as f64 / elapsed) as u64,
+        }
+    }
 }
 
 impl NetworkWorker<FakeLayerExecutor> {
@@ -37,7 +98,12 @@ where
             executor,
             topology_epoch: Arc::new(Mutex::new("worker-epoch-0".into())),
             loaded_shard: Arc::new(Mutex::new(None)),
+            stats: RuntimeStats::default(),
         }
+    }
+
+    pub fn runtime_stats(&self) -> RuntimeStats {
+        self.stats.clone()
     }
 
     pub async fn serve(self, listen_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -79,6 +145,7 @@ where
         }
 
         let worker = RingWorker::new(self.node_id.clone(), assignment, self.executor.clone());
+        let started = Instant::now();
         let payload_len = activation.payload.len() as u64;
         let output = worker
             .forward(activation)
@@ -86,6 +153,13 @@ where
             .map_err(|err| Status::internal(err.to_string()))?;
         metrics::record_activation_bytes("rx", payload_len);
         metrics::record_activation_bytes("tx", output.payload.len() as u64);
+        self.stats
+            .record_forward(
+                started.elapsed().as_micros(),
+                payload_len,
+                output.payload.len() as u64,
+            )
+            .await;
         Ok(Response::new((&output).into()))
     }
 
@@ -109,6 +183,52 @@ where
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new((&logits).into()))
+    }
+
+    async fn sample_token(
+        &self,
+        request: Request<SampleTokenRequest>,
+    ) -> Result<Response<ProtoTokenOutput>, Status> {
+        let request = request.into_inner();
+        let activation = request
+            .activation
+            .ok_or_else(|| Status::invalid_argument("missing activation"))?;
+        let activation = ActivationTensor::try_from(activation)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if !activation.verify_checksum() {
+            return Err(Status::invalid_argument("activation checksum failed"));
+        }
+        self.loaded_shard
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("worker shard is not loaded"))?;
+        let logits = self
+            .executor
+            .final_logits(activation.clone())
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        if !logits.verify_checksum() {
+            return Err(Status::internal("worker returned invalid logits checksum"));
+        }
+        let token_id = logits
+            .logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index as u32)
+            .unwrap_or_default();
+        self.stats.record_token().await;
+        metrics::record_generated_token(&self.node_id);
+        Ok(Response::new(ProtoTokenOutput {
+            request_id: activation.request_id,
+            token_position: activation.token_position,
+            token_id,
+            text: format!("<bitnet-rs:{token_id}>"),
+            finished: request.finished,
+            log_prob: 0.0,
+            gen_latency_us: 0,
+        }))
     }
 
     async fn apply_topology(
@@ -154,6 +274,12 @@ where
                 "shard path does not exist: {}",
                 manifest.path
             )));
+        }
+        if self.loaded_shard.lock().await.as_ref() == Some(&manifest) {
+            return Ok(Response::new(LoadShardResponse {
+                loaded: true,
+                message: "shard manifest already loaded".into(),
+            }));
         }
 
         let assignment = LayerAssignment {

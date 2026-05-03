@@ -137,6 +137,9 @@ async fn run_network_worker(
             .heartbeat(HeartbeatRequest {
                 node_id: profile.node_id.0.clone(),
                 observed_tokens_per_second: profile.effective_compute_score(),
+                avg_forward_latency_ms: 0.0,
+                activation_bytes_per_second: 0,
+                backend_type: profile.backend_type.clone(),
             })
             .await?
             .into_inner();

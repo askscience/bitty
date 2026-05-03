@@ -42,13 +42,29 @@ impl Halda {
             return Ok(Vec::new());
         }
 
-        let mut ranked = nodes.to_vec();
+        let mut ranked = nodes
+            .iter()
+            .filter(|node| node.layer_eligible && node.max_layers != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        if ranked.is_empty() {
+            ranked = nodes.to_vec();
+        }
         ranked.sort_by(|a, b| {
             b.effective_compute_score()
                 .partial_cmp(&a.effective_compute_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.node_id.0.cmp(&b.node_id.0))
         });
+        if ranked.len() > 1 {
+            let strongest = ranked[0].effective_compute_score().max(0.001);
+            ranked.retain(|node| {
+                node.gpu_tflops > 0.0 || node.effective_compute_score() >= strongest * 0.15
+            });
+        }
+        if ranked.is_empty() {
+            ranked = nodes.to_vec();
+        }
 
         let total_score = ranked
             .iter()
@@ -69,7 +85,10 @@ impl Halda {
             let remaining_layers = total_layers - cursor;
             let score_share = node.effective_compute_score() / total_score;
             let target_len = ((layers.len() as f64) * score_share).round() as u32;
-            let mut len = target_len.max(1).min(remaining_layers);
+            let mut len = target_len
+                .max(1)
+                .min(node.max_layers.max(1))
+                .min(remaining_layers);
 
             if remaining_layers > remaining_nodes as u32 {
                 len = len.min(remaining_layers.saturating_sub((remaining_nodes - 1) as u32));
@@ -278,7 +297,12 @@ fn assigned_weight_bytes_for_len(
 }
 
 fn available_memory_bytes(node: &HardwareProfile, reserve_fraction: f64) -> u64 {
-    (node.memory_bytes() as f64 * (1.0 - reserve_fraction)).max(0.0) as u64
+    let memory_bytes = if node.gpu_tflops > 0.0 && node.vram_mb > 0 {
+        node.vram_mb.saturating_mul(1024 * 1024)
+    } else {
+        node.memory_bytes()
+    };
+    (memory_bytes as f64 * (1.0 - reserve_fraction)).max(0.0) as u64
 }
 
 fn estimate_latency_ms(
@@ -334,6 +358,13 @@ mod tests {
             os_reclaim_score: 0.0,
             worker_endpoint: String::new(),
             model_path: String::new(),
+            backend_type: if tier == NodeTier::D {
+                "cpu".into()
+            } else {
+                "gpu".into()
+            },
+            layer_eligible: true,
+            max_layers: u32::MAX,
         }
     }
 
@@ -381,5 +412,33 @@ mod tests {
             .iter()
             .filter(|assignment| assignment.range.contains(0) || assignment.range.contains(3))
             .all(|assignment| assignment.range.quantization == Quantization::Fp16));
+    }
+
+    #[test]
+    fn halda_skips_weak_cpu_node_when_stronger_node_is_available() {
+        let mut weak = node(0, NodeTier::D, 8.0);
+        weak.cpu_tflops = 0.25;
+        weak.gpu_tflops = 0.0;
+        weak.backend_type = "cpu".into();
+
+        let mut strong = node(1, NodeTier::A, 32.0);
+        strong.gpu_tflops = 12.0;
+        strong.vram_mb = 16_384;
+        strong.backend_type = "gpu".into();
+
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&[weak.clone(), strong.clone()], &layers(30))
+            .unwrap();
+
+        assert!(assignments
+            .iter()
+            .all(|assignment| assignment.node_id != weak.node_id));
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|assignment| assignment.range.len())
+                .sum::<u32>(),
+            30
+        );
     }
 }

@@ -4,8 +4,8 @@ use crate::{Halda, Registry, SchedulerConfig};
 use bitty_inference::{LayerExecutor, LowBitReferenceExecutor};
 use bitty_observability::record_halda_run;
 use bitty_protocol::iroh_transport::{
-    self, IrohFrame, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT, WORKER_CLEANUP, WORKER_FINAL_LOGITS,
-    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD,
+    self, IrohFrame, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT, WORKER_CLEANUP,
+    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
 };
 use bitty_protocol::pb::coordinator_service_server::{
     CoordinatorService, CoordinatorServiceServer,
@@ -14,8 +14,8 @@ use bitty_protocol::pb::worker_service_client::WorkerServiceClient;
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, ClusterStatusRequest, ClusterStatusResponse,
     GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
-    RegisterWorkerRequest, RegisterWorkerResponse, ShardManifest as ProtoShardManifest,
-    TokenOutput as ProtoTokenOutput,
+    RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
+    ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
 };
 use bitty_protocol::{
     ActivationDType, ActivationTensor, HardwareProfile, Heartbeat, LayerMetadata,
@@ -23,12 +23,14 @@ use bitty_protocol::{
 };
 use futures::stream;
 use iroh::{Endpoint, EndpointAddr};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tonic::transport::Server;
@@ -44,6 +46,7 @@ pub struct NetworkCoordinator {
     model_path: Option<PathBuf>,
     iroh_endpoint: Option<Endpoint>,
     cluster_token: Option<String>,
+    shard_cache: Arc<Mutex<HashMap<String, ShardManifestMessage>>>,
 }
 
 impl NetworkCoordinator {
@@ -57,6 +60,7 @@ impl NetworkCoordinator {
             model_path: None,
             iroh_endpoint: None,
             cluster_token: None,
+            shard_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -230,6 +234,7 @@ impl NetworkCoordinator {
     async fn remote_generate_tokens(
         &self,
         request: ProtoGenerateRequest,
+        sender: Option<mpsc::Sender<Result<ProtoTokenOutput, Status>>>,
     ) -> Result<Vec<ProtoTokenOutput>, Status> {
         let assignments = self.current_assignments().await?;
         if assignments.is_empty() {
@@ -289,12 +294,23 @@ impl NetworkCoordinator {
                 sha256_hex: String::new(),
                 path: worker_model_path,
             };
-            client
-                .load_shard(LoadShardRequest {
-                    manifest: Some(ProtoShardManifest::from(&manifest)),
-                })
+            let cache_key = format!("{}@{}", manifest.node_id.0, profile.worker_endpoint);
+            let needs_load = self
+                .shard_cache
+                .lock()
                 .await
-                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+                .get(&cache_key)
+                .map(|cached| cached != &manifest)
+                .unwrap_or(true);
+            if needs_load {
+                client
+                    .load_shard(LoadShardRequest {
+                        manifest: Some(ProtoShardManifest::from(&manifest)),
+                    })
+                    .await
+                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
+                self.shard_cache.lock().await.insert(cache_key, manifest);
+            }
             worker_clients.push(client);
         }
 
@@ -322,29 +338,22 @@ impl NetworkCoordinator {
             let last = worker_clients
                 .last_mut()
                 .ok_or_else(|| Status::failed_precondition("no last worker"))?;
-            let logits = bitty_protocol::BitNetLogits::from(last.final_logits(&activation).await?);
-            if !logits.verify_checksum() {
-                return Err(Status::internal("worker returned invalid logits checksum"));
-            }
-            let token_id = logits
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index as u32)
-                .unwrap_or_default();
-            let text = format!("<bitnet-rs:{token_id}>");
+            let mut token = last
+                .sample_token(SampleTokenRequest {
+                    activation: Some((&activation).into()),
+                    temperature: request.temperature,
+                    finished: token_position + 1 == max_new_tokens,
+                })
+                .await?;
+            token.gen_latency_us = started.elapsed().as_micros() as u64;
             current_input.clear();
-            current_input.push(token_id);
-            outputs.push(ProtoTokenOutput {
-                request_id: request_id.clone(),
-                token_position,
-                token_id,
-                text,
-                finished: token_position + 1 == max_new_tokens,
-                log_prob: 0.0,
-                gen_latency_us: started.elapsed().as_micros() as u64,
-            });
+            current_input.push(token.token_id);
+            if let Some(sender) = &sender {
+                if sender.send(Ok(token.clone())).await.is_err() {
+                    break;
+                }
+            }
+            outputs.push(token);
         }
 
         for client in &mut worker_clients {
@@ -431,21 +440,18 @@ impl WorkerRpcClient {
         }
     }
 
-    async fn final_logits(
+    async fn sample_token(
         &mut self,
-        activation: &ActivationTensor,
-    ) -> Result<bitty_protocol::pb::BitNetLogits, Status> {
+        request: SampleTokenRequest,
+    ) -> Result<ProtoTokenOutput, Status> {
         match self {
             Self::Tcp(client) => Ok(client
-                .final_logits(ProtoActivationTensor::from(activation))
+                .sample_token(request)
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?
                 .into_inner()),
             Self::Iroh(client) => client
-                .request(
-                    WORKER_FINAL_LOGITS,
-                    &ProtoActivationTensor::from(activation),
-                )
+                .request(WORKER_SAMPLE_TOKEN, &request)
                 .await
                 .map_err(|err| Status::internal(err.to_string())),
         }
@@ -565,13 +571,26 @@ impl CoordinatorService for NetworkCoordinator {
             return Err(status);
         }
         let request = request.into_inner();
-        let tokens = self
-            .remote_generate_tokens(request)
-            .await?
-            .into_iter()
-            .map(Ok);
+        let coordinator = self.clone();
+        let (sender, receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            match coordinator
+                .remote_generate_tokens(request, Some(sender.clone()))
+                .await
+            {
+                Ok(tokens) => {
+                    let _ = tokens;
+                }
+                Err(err) => {
+                    let _ = sender.send(Err(err)).await;
+                }
+            }
+        });
+        let tokens = stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
 
-        Ok(Response::new(Box::pin(stream::iter(tokens))))
+        Ok(Response::new(Box::pin(tokens)))
     }
 
     async fn stream_tokens(
@@ -603,7 +622,8 @@ impl CoordinatorService for NetworkCoordinator {
             return Err(status);
         }
         let assignments = self.current_assignments().await?;
-        let active_workers = self.registry.lock().await.len() as u32;
+        let profiles = self.registry.lock().await.profiles();
+        let active_workers = profiles.len() as u32;
         let model_path = self
             .model_path
             .as_ref()
@@ -616,6 +636,7 @@ impl CoordinatorService for NetworkCoordinator {
             assignments: assignments.iter().map(Into::into).collect(),
             model_ready: !model_path.is_empty(),
             model_path,
+            profiles: profiles.iter().map(Into::into).collect(),
         }))
     }
 }

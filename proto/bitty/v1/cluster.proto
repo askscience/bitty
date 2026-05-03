@@ -20,6 +20,9 @@ message HardwareProfile {
   double os_reclaim_score = 15;
   string worker_endpoint = 16;
   string model_path = 17;
+  string backend_type = 18;
+  bool layer_eligible = 19;
+  uint32 max_layers = 20;
 }
 
 message GpuInfo {
@@ -105,6 +108,9 @@ message RegisterWorkerResponse {
 message HeartbeatRequest {
   string node_id = 1;
   double observed_tokens_per_second = 2;
+  double avg_forward_latency_ms = 3;
+  uint64 activation_bytes_per_second = 4;
+  string backend_type = 5;
 }
 
 message HeartbeatResponse {
@@ -152,6 +158,13 @@ message ClusterStatusResponse {
   repeated LayerAssignment assignments = 4;
   string model_path = 5;
   bool model_ready = 6;
+  repeated HardwareProfile profiles = 7;
+}
+
+message SampleTokenRequest {
+  ActivationTensor activation = 1;
+  float temperature = 2;
+  bool finished = 3;
 }
 
 service CoordinatorService {
@@ -165,6 +178,7 @@ service CoordinatorService {
 service WorkerService {
   rpc ForwardActivation(ActivationTensor) returns (ActivationTensor);
   rpc FinalLogits(ActivationTensor) returns (BitNetLogits);
+  rpc SampleToken(SampleTokenRequest) returns (TokenOutput);
   rpc ApplyTopology(TopologyUpdate) returns (HeartbeatResponse);
   rpc LoadShard(LoadShardRequest) returns (LoadShardResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);

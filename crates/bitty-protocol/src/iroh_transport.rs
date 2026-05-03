@@ -17,6 +17,7 @@ pub const WORKER_FINAL_LOGITS: u8 = 2;
 pub const WORKER_APPLY_TOPOLOGY: u8 = 3;
 pub const WORKER_LOAD_SHARD: u8 = 4;
 pub const WORKER_CLEANUP: u8 = 5;
+pub const WORKER_SAMPLE_TOKEN: u8 = 6;
 pub const ERROR_OP: u8 = 255;
 
 pub const DEFAULT_FRAME_LIMIT: usize = 64 * 1024 * 1024;

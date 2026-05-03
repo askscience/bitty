@@ -197,6 +197,9 @@ pub struct HardwareProfile {
     pub os_reclaim_score: f64,
     pub worker_endpoint: String,
     pub model_path: String,
+    pub backend_type: String,
+    pub layer_eligible: bool,
+    pub max_layers: u32,
 }
 
 impl HardwareProfile {
@@ -210,10 +213,30 @@ impl HardwareProfile {
     }
 
     pub fn effective_compute_score(&self) -> f64 {
-        let compute = self.gpu_tflops.max(self.cpu_tflops * 0.35);
+        if !self.layer_eligible || self.max_layers == 0 {
+            return 0.0;
+        }
+        let compute = if self.gpu_tflops > 0.0 {
+            self.gpu_tflops
+        } else {
+            self.cpu_tflops * 0.20
+        };
         let memory = self.memory_bandwidth_gbps.max(1.0).sqrt();
-        let network_penalty = 1.0 + (self.network_rtt_ms / 100.0).clamp(0.0, 10.0);
-        (compute * memory) / network_penalty
+        let rtt_penalty = 1.0 + (self.network_rtt_ms / 50.0).clamp(0.0, 20.0);
+        let uplink_penalty = (100.0 / self.uplink_mbps.max(5.0)).sqrt().max(1.0);
+        (compute * memory) / (rtt_penalty * uplink_penalty)
+    }
+
+    pub fn backend_type(&self) -> &str {
+        if self.backend_type.is_empty() {
+            if self.gpu_tflops > 0.0 {
+                "gpu"
+            } else {
+                "cpu"
+            }
+        } else {
+            &self.backend_type
+        }
     }
 }
 
@@ -384,6 +407,9 @@ pub struct ShardManifestMessage {
 pub struct Heartbeat {
     pub node_id: NodeId,
     pub observed_tokens_per_second: f64,
+    pub avg_forward_latency_ms: f64,
+    pub activation_bytes_per_second: u64,
+    pub backend_type: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +449,9 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             os_reclaim_score: profile.os_reclaim_score,
             worker_endpoint: profile.worker_endpoint.clone(),
             model_path: profile.model_path.clone(),
+            backend_type: profile.backend_type().into(),
+            layer_eligible: profile.layer_eligible,
+            max_layers: profile.max_layers,
         }
     }
 }
@@ -478,6 +507,17 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             os_reclaim_score: profile.os_reclaim_score,
             worker_endpoint: profile.worker_endpoint,
             model_path: profile.model_path,
+            backend_type: profile.backend_type,
+            layer_eligible: if profile.max_layers == 0 {
+                false
+            } else {
+                profile.layer_eligible
+            },
+            max_layers: if profile.max_layers == 0 {
+                u32::MAX
+            } else {
+                profile.max_layers
+            },
         })
     }
 }
@@ -673,6 +713,9 @@ impl From<&Heartbeat> for pb::HeartbeatRequest {
         Self {
             node_id: heartbeat.node_id.0.clone(),
             observed_tokens_per_second: heartbeat.observed_tokens_per_second,
+            avg_forward_latency_ms: heartbeat.avg_forward_latency_ms,
+            activation_bytes_per_second: heartbeat.activation_bytes_per_second,
+            backend_type: heartbeat.backend_type.clone(),
         }
     }
 }
@@ -682,6 +725,9 @@ impl From<pb::HeartbeatRequest> for Heartbeat {
         Self {
             node_id: NodeId::new(heartbeat.node_id),
             observed_tokens_per_second: heartbeat.observed_tokens_per_second,
+            avg_forward_latency_ms: heartbeat.avg_forward_latency_ms,
+            activation_bytes_per_second: heartbeat.activation_bytes_per_second,
+            backend_type: heartbeat.backend_type,
         }
     }
 }

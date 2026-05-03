@@ -194,6 +194,9 @@ pub fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
             os_reclaim_score: 0.0,
             worker_endpoint: String::new(),
             model_path: String::new(),
+            backend_type: if index == 0 { "gpu" } else { "cpu" }.into(),
+            layer_eligible: true,
+            max_layers: u32::MAX,
         })
         .collect()
 }

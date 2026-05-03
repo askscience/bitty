@@ -55,6 +55,12 @@ Environment variables with the same uppercase names are also supported:
   REPO_URL, INSTALL_DIR, BIN_DIR, ROLE, MODEL_PATH, JOIN, NODE_ID, LISTEN,
   WORKER_LISTEN, PUBLIC_ENDPOINT, LAYERS, RUN_TESTS, BUILD_PROFILE,
   INSTALL_RUST, INSTALL_SYSTEM_DEPS.
+
+Performance controls for heterogeneous clusters:
+  BITTY_NODE_ROLE=coordinator|worker|client
+  BITTY_DISABLE_MODEL_LAYERS=1
+  BITTY_MAX_LAYERS=N
+  BITTY_RAM_MB, BITTY_VRAM_MB, BITTY_GPU_NAME, BITTY_GPU_TFLOPS
 EOF
 }
 
@@ -326,6 +332,11 @@ Start Bitty:
 Then use the cluster:
   $BIN_DIR/bitty run bitnet-b1.58
   $BIN_DIR/bitty cluster status
+  $BIN_DIR/bitty cluster benchmark
+
+On small CPU-only servers, keep orchestration cheap with:
+  export BITTY_NODE_ROLE=coordinator
+  export BITTY_DISABLE_MODEL_LAYERS=1
 
 Bitty runs in the background. Use "$BIN_DIR/bitty stop" to stop it.
 EOF
@@ -345,6 +356,10 @@ Join an existing Bitty node:
 Then use Bitty without repeating the invite:
   $BIN_DIR/bitty run bitnet-b1.58
   $BIN_DIR/bitty cluster check
+  $BIN_DIR/bitty cluster benchmark
+
+To join as a coordinator/client helper without taking model layers:
+  BITTY_DISABLE_MODEL_LAYERS=1 $BIN_DIR/bitty connect "$JOIN" --name home --model "$MODEL_PATH"
 EOF
     ;;
   client)
@@ -358,6 +373,7 @@ Save the cluster target:
 Send requests:
   $BIN_DIR/bitty run bitnet-b1.58 "Hello"
   $BIN_DIR/bitty cluster status
+  $BIN_DIR/bitty cluster benchmark
 EOF
     ;;
 esac
