@@ -329,6 +329,7 @@ dependencies = [
 name = "bitty-cli"
 version = "0.1.0"
 dependencies = [
+ "bitty-bitnet-runtime",
  "bitty-coordinator",
  "bitty-inference",
  "bitty-protocol",
@@ -336,6 +337,8 @@ dependencies = [
  "futures",
  "iroh",
  "prost",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
 ]

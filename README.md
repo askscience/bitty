@@ -28,42 +28,41 @@ distributions it can install the required compiler tools, `pkg-config`, OpenSSL
 development headers, and `protoc` automatically with the system package manager.
 Use `--no-system-deps` if you prefer to install OS packages yourself.
 
-First machine:
+Quick start:
 
 ```bash
 git clone git@github.com:askscience/bitty.git
 cd bitty
-scripts/install_bitty.sh \
-  --role node \
-  --model /models/ggml-model-i2_s.gguf \
-  --layers 30
+scripts/install_bitty.sh
+bitty pull bitnet-b1.58
+bitty run bitnet-b1.58
 ```
 
-Additional machines:
+Common commands:
 
 ```bash
-git clone git@github.com:askscience/bitty.git
-cd bitty
-scripts/install_bitty.sh \
-  --role join \
-  --node-id worker-a \
-  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' \
-  --model /models/ggml-model-i2_s.gguf
+bitty pull bitnet-b1.58
+bitty run bitnet-b1.58 "Explain 1-bit inference"
+bitty chat bitnet-b1.58
+bitty ls
+bitty show bitnet-b1.58
+bitty serve
 ```
 
-Client-only machine:
+Additional machines can still join a distributed Bitty cluster with the Iroh
+invite printed by the first `bitty node`, but normal single-machine usage starts
+with model names instead of raw GGUF paths.
+
+Advanced distributed node:
 
 ```bash
-git clone git@github.com:askscience/bitty.git
-cd bitty
-scripts/install_bitty.sh \
-  --role client \
-  --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
+bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 ```
 
 The installer links binaries into `~/.local/bin` by default. You can override
 paths with `INSTALL_DIR`, `BIN_DIR`, `REPO_URL`, or command-line flags. The
 model file must exist locally on every node that will execute BitNet layers.
+`bitty pull` stores models under `~/.bitty/models` by default.
 
 ## Local Testing
 

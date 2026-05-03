@@ -1,3 +1,9 @@
+mod model_store;
+mod modelfile;
+mod server;
+mod settings;
+
+use bitty_bitnet_runtime::BitNetRuntime;
 use bitty_coordinator::network::NetworkCoordinator;
 use bitty_inference::BitNetLayerExecutor;
 use bitty_protocol::iroh_transport::{
@@ -17,6 +23,8 @@ use bitty_protocol::pb::{
 use bitty_protocol::{LayerMetadata, NodeId};
 use bitty_worker::{network::NetworkWorker, HardwareProfiler};
 use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
+use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
+use settings::BittySettings;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +35,17 @@ use tokio::time::{sleep, Duration};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse(std::env::args().skip(1).collect()) {
         Ok(CliCommand::Node(config)) => run_node(config).await,
+        Ok(CliCommand::Run(config)) => run_model(config).await,
+        Ok(CliCommand::Pull(config)) => run_pull(config).await,
+        Ok(CliCommand::List(config)) => run_list(config).await,
+        Ok(CliCommand::Show(config)) => run_show(config).await,
+        Ok(CliCommand::Ps(config)) => run_ps(config).await,
+        Ok(CliCommand::Stop(config)) => run_stop(config).await,
+        Ok(CliCommand::Serve(config)) => run_serve(config).await,
+        Ok(CliCommand::Create(config)) => run_create(config).await,
+        Ok(CliCommand::Rm(config)) => run_rm(config).await,
+        Ok(CliCommand::Cp(config)) => run_cp(config).await,
+        Ok(CliCommand::Settings(config)) => run_settings(config).await,
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
@@ -45,6 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CliCommand {
     Node(NodeConfig),
+    Run(RunConfig),
+    Pull(ModelCommand),
+    List(DataDirConfig),
+    Show(ModelCommand),
+    Ps(DataDirConfig),
+    Stop(ModelCommand),
+    Serve(ServeConfig),
+    Create(CreateConfig),
+    Rm(ModelCommand),
+    Cp(CpConfig),
+    Settings(SettingsCommand),
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
@@ -76,6 +106,7 @@ struct GenerateConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatConfig {
+    model: Option<String>,
     node: String,
     prompt: Option<String>,
     max_tokens: u32,
@@ -85,6 +116,64 @@ struct ChatConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StatusConfig {
     node: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunConfig {
+    model: String,
+    prompt: Option<String>,
+    node: Option<String>,
+    max_tokens: u32,
+    temperature: String,
+    data_dir: Option<String>,
+    auto_pull: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelCommand {
+    model: String,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DataDirConfig {
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServeConfig {
+    data_dir: Option<String>,
+    host: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CreateConfig {
+    name: String,
+    file: String,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CpConfig {
+    source: String,
+    dest: String,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SettingsCommand {
+    Get {
+        key: Option<String>,
+        data_dir: Option<String>,
+    },
+    Set {
+        key: String,
+        value: String,
+        data_dir: Option<String>,
+    },
+    Path {
+        data_dir: Option<String>,
+    },
 }
 
 struct Cli;
@@ -97,6 +186,17 @@ impl Cli {
         let mut args = args.into_iter().skip(1);
         match command.as_str() {
             "node" => parse_node(&mut args).map(CliCommand::Node),
+            "run" => parse_run(&mut args).map(CliCommand::Run),
+            "pull" => parse_model_command(&mut args, "pull").map(CliCommand::Pull),
+            "ls" | "list" => parse_data_dir(&mut args).map(CliCommand::List),
+            "show" => parse_model_command(&mut args, "show").map(CliCommand::Show),
+            "ps" => parse_data_dir(&mut args).map(CliCommand::Ps),
+            "stop" => parse_model_command(&mut args, "stop").map(CliCommand::Stop),
+            "serve" => parse_serve(&mut args).map(CliCommand::Serve),
+            "create" => parse_create(&mut args).map(CliCommand::Create),
+            "rm" => parse_model_command(&mut args, "rm").map(CliCommand::Rm),
+            "cp" => parse_cp(&mut args).map(CliCommand::Cp),
+            "settings" => parse_settings(&mut args).map(CliCommand::Settings),
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
@@ -194,6 +294,217 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         &cluster_token,
     )
     .await
+}
+
+async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let mut model = resolve_model(&settings, &config.model);
+    if model.is_none() && config.auto_pull && settings.auto_pull {
+        model = Some(pull_model(&settings, &config.model)?);
+    }
+    let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
+    let prompt = config.prompt.unwrap_or_default();
+    if let Some(node) = config.node {
+        return run_generate(GenerateConfig {
+            node,
+            prompt,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+        })
+        .await;
+    }
+    if prompt.is_empty() {
+        println!("Bitty chat: {}. Type /exit to quit.", model.id());
+        loop {
+            print!("> ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.trim();
+            if line == "/exit" || line == "/quit" {
+                break;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            run_local_model(
+                &settings,
+                &model,
+                line,
+                config.max_tokens,
+                &config.temperature,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    run_local_model(
+        &settings,
+        &model,
+        &prompt,
+        config.max_tokens,
+        &config.temperature,
+    )
+    .await
+}
+
+async fn run_local_model(
+    settings: &BittySettings,
+    model: &model_store::ModelSpec,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = model.model_path(settings);
+    if !path.exists() {
+        return Err(format!(
+            "model file is missing: {}. Run `bitty pull {}` first.",
+            path.display(),
+            model.id()
+        )
+        .into());
+    }
+    record_running_model(settings, &model.id())?;
+    let runtime = BitNetRuntime::load(&path).await?;
+    let text = runtime
+        .generate_full(
+            prompt,
+            max_tokens as usize,
+            temperature.parse().unwrap_or(model.temperature),
+        )
+        .await?;
+    println!("{text}");
+    Ok(())
+}
+
+async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let model = pull_model(&settings, &config.model)?;
+    println!(
+        "pulled {} to {}",
+        model.id(),
+        model.model_path(&settings).display()
+    );
+    Ok(())
+}
+
+async fn run_list(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    println!("NAME\tBACKEND\tQUANTIZATION\tPATH");
+    for model in installed_models(&settings) {
+        println!(
+            "{}\t{}\t{}\t{}",
+            model.id(),
+            model.backend,
+            model.quantization,
+            model.model_path(&settings).display()
+        );
+    }
+    Ok(())
+}
+
+async fn run_show(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let model = resolve_model(&settings, &config.model)
+        .ok_or_else(|| format!("model not found: {}", config.model))?;
+    println!("name: {}", model.id());
+    println!("display_name: {}", model.display_name);
+    println!("backend: {}", model.backend);
+    println!("quantization: {}", model.quantization);
+    println!("layers: {}", model.layers);
+    println!("path: {}", model.model_path(&settings).display());
+    println!("source: {}", model.source);
+    println!("temperature: {}", model.temperature);
+    println!("num_predict: {}", model.num_predict);
+    println!("num_ctx: {}", model.num_ctx);
+    Ok(())
+}
+
+async fn run_ps(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let path = running_models_path(&settings);
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    println!("NAME\tSTATUS");
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        println!("{line}\tloaded");
+    }
+    Ok(())
+}
+
+async fn run_stop(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let path = running_models_path(&settings);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let next = contents
+        .lines()
+        .filter(|line| *line != config.model)
+        .collect::<Vec<_>>()
+        .join("\n");
+    settings::ensure_parent(&path)?;
+    std::fs::write(path, next)?;
+    println!("stopped {}", config.model);
+    Ok(())
+}
+
+async fn run_serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut settings = load_settings(config.data_dir.as_deref());
+    if let Some(host) = config.host {
+        settings.api_host = host;
+    }
+    server::serve(settings)
+}
+
+async fn run_create(config: CreateConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let model = modelfile::create_profile(&settings, &config.name, &PathBuf::from(config.file))?;
+    println!("created {}", model.id());
+    Ok(())
+}
+
+async fn run_rm(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    remove_model(&settings, &config.model)?;
+    println!("removed {}", config.model);
+    Ok(())
+}
+
+async fn run_cp(config: CpConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    copy_model(&settings, &config.source, &config.dest)?;
+    println!("copied {} to {}", config.source, config.dest);
+    Ok(())
+}
+
+async fn run_settings(config: SettingsCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match config {
+        SettingsCommand::Get { key, data_dir } => {
+            let settings = load_settings(data_dir.as_deref());
+            if let Some(key) = key {
+                println!("{}", settings.get(&key).unwrap_or_default());
+            } else {
+                print!("{}", settings.to_toml());
+            }
+        }
+        SettingsCommand::Set {
+            key,
+            value,
+            data_dir,
+        } => {
+            let mut settings = load_settings(data_dir.as_deref());
+            if !settings.set_value(&key, &value) {
+                return Err(format!("unknown setting: {key}").into());
+            }
+            settings.save()?;
+            println!("{key} = {value}");
+        }
+        SettingsCommand::Path { data_dir } => {
+            let settings = load_settings(data_dir.as_deref());
+            println!("{}", settings.path().display());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -368,6 +679,19 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
 }
 
 async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(model) = config.model {
+        return run_model(RunConfig {
+            model,
+            prompt: config.prompt,
+            node: Some(config.node).filter(|node| node != "127.0.0.1:50051"),
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            data_dir: None,
+            auto_pull: true,
+        })
+        .await;
+    }
+
     if let Some(prompt) = config.prompt {
         return run_generate(GenerateConfig {
             node: config.node,
@@ -516,6 +840,7 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
 
 fn parse_chat(args: &mut impl Iterator<Item = String>) -> Result<ChatConfig, String> {
     let mut config = ChatConfig {
+        model: None,
         node: "127.0.0.1:50051".into(),
         prompt: None,
         max_tokens: 128,
@@ -527,6 +852,7 @@ fn parse_chat(args: &mut impl Iterator<Item = String>) -> Result<ChatConfig, Str
             "--prompt" => config.prompt = Some(required_next(args, "--prompt")?),
             "--max-tokens" => config.max_tokens = parse_next(args, "--max-tokens")?,
             "--temperature" => config.temperature = required_next(args, "--temperature")?,
+            value if config.model.is_none() => config.model = Some(value.into()),
             other => return Err(format!("unknown chat argument: {other}")),
         }
     }
@@ -544,6 +870,170 @@ fn parse_status(args: &mut impl Iterator<Item = String>) -> Result<StatusConfig,
         }
     }
     Ok(config)
+}
+
+fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, String> {
+    let mut config = RunConfig {
+        model: String::new(),
+        prompt: None,
+        node: None,
+        max_tokens: 128,
+        temperature: "0.7".into(),
+        data_dir: None,
+        auto_pull: true,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--node" => config.node = Some(required_next(args, "--node")?),
+            "--prompt" => config.prompt = Some(required_next(args, "--prompt")?),
+            "--max-tokens" | "--num-predict" => {
+                config.max_tokens = parse_next(args, "--max-tokens")?
+            }
+            "--temperature" => config.temperature = required_next(args, "--temperature")?,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            "--no-auto-pull" => config.auto_pull = false,
+            "--no-daemon" => {}
+            "--num-ctx" | "--seed" | "--top-k" | "--top-p" | "--system" | "--template"
+            | "--join" => {
+                let _ = required_next(args, arg.as_str()).ok();
+            }
+            value if config.model.is_empty() => config.model = value.into(),
+            value => config.prompt = Some(value.into()),
+        }
+    }
+    if config.model.is_empty() {
+        return Err("bitty run requires MODEL".into());
+    }
+    Ok(config)
+}
+
+fn parse_model_command(
+    args: &mut impl Iterator<Item = String>,
+    command: &str,
+) -> Result<ModelCommand, String> {
+    let mut config = ModelCommand {
+        model: String::new(),
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.model.is_empty() => config.model = value.into(),
+            other => return Err(format!("unknown {command} argument: {other}")),
+        }
+    }
+    if config.model.is_empty() {
+        return Err(format!("bitty {command} requires MODEL"));
+    }
+    Ok(config)
+}
+
+fn parse_data_dir(args: &mut impl Iterator<Item = String>) -> Result<DataDirConfig, String> {
+    let mut config = DataDirConfig { data_dir: None };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_serve(args: &mut impl Iterator<Item = String>) -> Result<ServeConfig, String> {
+    let mut config = ServeConfig {
+        data_dir: None,
+        host: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            "--host" | "--api-host" => config.host = Some(required_next(args, "--host")?),
+            other => return Err(format!("unknown serve argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_create(args: &mut impl Iterator<Item = String>) -> Result<CreateConfig, String> {
+    let mut config = CreateConfig {
+        name: String::new(),
+        file: "Modelfile".into(),
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-f" | "--file" => config.file = required_next(args, "--file")?,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.name.is_empty() => config.name = value.into(),
+            other => return Err(format!("unknown create argument: {other}")),
+        }
+    }
+    if config.name.is_empty() {
+        return Err("bitty create requires NAME".into());
+    }
+    Ok(config)
+}
+
+fn parse_cp(args: &mut impl Iterator<Item = String>) -> Result<CpConfig, String> {
+    let mut config = CpConfig {
+        source: String::new(),
+        dest: String::new(),
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.source.is_empty() => config.source = value.into(),
+            value if config.dest.is_empty() => config.dest = value.into(),
+            other => return Err(format!("unknown cp argument: {other}")),
+        }
+    }
+    if config.source.is_empty() || config.dest.is_empty() {
+        return Err("bitty cp requires SOURCE DEST".into());
+    }
+    Ok(config)
+}
+
+fn parse_settings(args: &mut impl Iterator<Item = String>) -> Result<SettingsCommand, String> {
+    let action = args.next().unwrap_or_else(|| "get".into());
+    let mut data_dir = None;
+    match action.as_str() {
+        "get" => {
+            let mut key = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--data-dir" => data_dir = Some(required_next(args, "--data-dir")?),
+                    value => key = Some(value.into()),
+                }
+            }
+            Ok(SettingsCommand::Get { key, data_dir })
+        }
+        "set" => {
+            let key = required_next(args, "key")?;
+            let value = required_next(args, "value")?;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--data-dir" => data_dir = Some(required_next(args, "--data-dir")?),
+                    other => return Err(format!("unknown settings set argument: {other}")),
+                }
+            }
+            Ok(SettingsCommand::Set {
+                key,
+                value,
+                data_dir,
+            })
+        }
+        "path" => {
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--data-dir" => data_dir = Some(required_next(args, "--data-dir")?),
+                    other => return Err(format!("unknown settings path argument: {other}")),
+                }
+            }
+            Ok(SettingsCommand::Path { data_dir })
+        }
+        other => Err(format!("unknown settings command: {other}")),
+    }
 }
 
 fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
@@ -833,6 +1323,33 @@ fn load_or_create_cluster_token(data_dir: &PathBuf) -> String {
     token
 }
 
+fn load_settings(configured_data_dir: Option<&str>) -> BittySettings {
+    let data_dir = bitty_data_dir(configured_data_dir);
+    let settings = BittySettings::load(data_dir);
+    let _ = settings.save();
+    settings
+}
+
+fn running_models_path(settings: &BittySettings) -> PathBuf {
+    settings.data_dir.join("state").join("running-models")
+}
+
+fn record_running_model(settings: &BittySettings, model: &str) -> std::io::Result<()> {
+    let path = running_models_path(settings);
+    settings::ensure_parent(&path)?;
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    if contents.lines().any(|line| line == model) {
+        return Ok(());
+    }
+    let mut next = contents;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(model);
+    next.push('\n');
+    std::fs::write(path, next)
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -919,6 +1436,17 @@ fn demo_layers(count: u32) -> Vec<LayerMetadata> {
 
 fn print_help() {
     println!("Usage:");
+    println!("  bitty run MODEL [PROMPT]");
+    println!("  bitty pull MODEL");
+    println!("  bitty ls | bitty list");
+    println!("  bitty show MODEL");
+    println!("  bitty ps");
+    println!("  bitty stop MODEL");
+    println!("  bitty serve [--host 127.0.0.1:11434]");
+    println!("  bitty create NAME -f Modelfile");
+    println!("  bitty rm MODEL");
+    println!("  bitty cp SOURCE DEST");
+    println!("  bitty settings get|set|path");
     println!("  bitty node --model PATH");
     println!("  bitty node --join 'iroh://LEADER_NODE_ID?token=TOKEN' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
@@ -1044,6 +1572,62 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ollama_style_commands() {
+        assert!(matches!(
+            Cli::parse(vec![
+                "run".into(),
+                "bitnet-b1.58".into(),
+                "hello".into(),
+                "--num-predict".into(),
+                "4".into()
+            ])
+            .unwrap(),
+            CliCommand::Run(RunConfig { max_tokens: 4, .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["pull".into(), "bitnet-b1.58".into()]).unwrap(),
+            CliCommand::Pull(ModelCommand { .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["ls".into()]).unwrap(),
+            CliCommand::List(DataDirConfig { .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "serve".into(),
+                "--host".into(),
+                "127.0.0.1:11434".into()
+            ])
+            .unwrap(),
+            CliCommand::Serve(ServeConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_settings_and_create_commands() {
+        assert!(matches!(
+            Cli::parse(vec![
+                "settings".into(),
+                "set".into(),
+                "default_model".into(),
+                "bitnet-b1.58".into()
+            ])
+            .unwrap(),
+            CliCommand::Settings(SettingsCommand::Set { .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "create".into(),
+                "my-model".into(),
+                "-f".into(),
+                "Modelfile".into()
+            ])
+            .unwrap(),
+            CliCommand::Create(CreateConfig { .. })
+        ));
     }
 
     #[test]

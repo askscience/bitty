@@ -25,7 +25,10 @@ Usage:
   scripts/install_bitty.sh [options]
 
 Common:
-  scripts/install_bitty.sh --role node --model /models/ggml-model-i2_s.gguf
+  scripts/install_bitty.sh
+  bitty pull bitnet-b1.58
+  bitty run bitnet-b1.58
+  scripts/install_bitty.sh --role node --model bitnet-b1.58
   scripts/install_bitty.sh --role join --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN' --model /models/ggml-model-i2_s.gguf
   scripts/install_bitty.sh --role client --join 'iroh://LEADER_IROH_NODE_ID?token=CLUSTER_TOKEN'
 
@@ -300,6 +303,10 @@ case "$ROLE" in
     fi
     cat <<EOF
 Start the first Bitty node:
+  $BIN_DIR/bitty pull bitnet-b1.58
+  $BIN_DIR/bitty run bitnet-b1.58
+
+Advanced distributed runtime:
   $BIN_DIR/bitty node --model "$MODEL_PATH" --layers "$LAYERS"
 
 The node stores a stable Iroh identity in ~/.bitty and prints an iroh:// join invite.

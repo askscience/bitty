@@ -1,0 +1,15 @@
+# Built-in Bitty model registry.
+
+[[model]]
+name = "bitnet-b1.58"
+tag = "latest"
+display_name = "Microsoft BitNet b1.58 2B 4T"
+backend = "bitnet-i2s"
+quantization = "i2_s"
+filename = "ggml-model-i2_s.gguf"
+layers = 30
+url = "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf"
+source = "microsoft/bitnet-b1.58-2B-4T-gguf"
+temperature = 0.7
+num_predict = 128
+num_ctx = 2048

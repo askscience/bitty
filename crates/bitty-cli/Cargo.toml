@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bitty-bitnet-runtime.workspace = true
 bitty-coordinator.workspace = true
 bitty-inference.workspace = true
 bitty-protocol.workspace = true
@@ -14,6 +15,8 @@ bitty-worker.workspace = true
 futures.workspace = true
 iroh.workspace = true
 prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 
