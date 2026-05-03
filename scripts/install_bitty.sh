@@ -301,6 +301,13 @@ Binaries linked in:
 Add this to your shell profile if needed:
   export PATH="$BIN_DIR:\$PATH"
 
+Check the installed version:
+  $BIN_DIR/bitty version
+
+Update an existing install later with:
+  git -C "$INSTALL_DIR" pull
+  "$INSTALL_DIR/scripts/install_bitty.sh"
+
 EOF
 
 case "$ROLE" in
@@ -313,18 +320,14 @@ case "$ROLE" in
     fi
     cat <<EOF
 Start Bitty:
-  $BIN_DIR/bitty pull bitnet-b1.58
-  $BIN_DIR/bitty node --model "$MODEL_PATH" --layers "$LAYERS"
+  $BIN_DIR/bitty setup
+  $BIN_DIR/bitty share home
 
-In another terminal, use the cluster:
+Then use the cluster:
   $BIN_DIR/bitty run bitnet-b1.58
   $BIN_DIR/bitty cluster status
 
-The node stores a stable Iroh identity and active cluster in ~/.bitty.
-It prints an iroh:// invite for other PCs. You can print it again with:
-  $BIN_DIR/bitty invite --name home
-
-Keep bitty node running while other machines join and run requests.
+Bitty runs in the background. Use "$BIN_DIR/bitty stop" to stop it.
 EOF
     ;;
   join)
@@ -336,7 +339,8 @@ EOF
     fi
     cat <<EOF
 Join an existing Bitty node:
-  $BIN_DIR/bitty join "$JOIN" --name home --model "$MODEL_PATH"
+  $BIN_DIR/bitty setup
+  $BIN_DIR/bitty connect "$JOIN" --name home --model "$MODEL_PATH"
 
 Then use Bitty without repeating the invite:
   $BIN_DIR/bitty run bitnet-b1.58

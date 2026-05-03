@@ -27,8 +27,10 @@ use bitty_worker::{network::NetworkWorker, HardwareProfiler};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
 use settings::BittySettings;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout, Duration};
@@ -47,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Show(config)) => run_show(config).await,
         Ok(CliCommand::Ps(config)) => run_ps(config).await,
         Ok(CliCommand::Stop(config)) => run_stop(config).await,
+        Ok(CliCommand::Start(config)) => run_start(config).await,
+        Ok(CliCommand::Restart(config)) => run_restart(config).await,
         Ok(CliCommand::Serve(config)) => run_serve(config).await,
+        Ok(CliCommand::Setup(config)) => run_setup(config).await,
         Ok(CliCommand::Create(config)) => run_create(config).await,
         Ok(CliCommand::Rm(config)) => run_rm(config).await,
         Ok(CliCommand::Cp(config)) => run_cp(config).await,
@@ -55,7 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Logs(config)) => run_logs(config).await,
         Ok(CliCommand::Cluster(config)) => run_cluster(config).await,
         Ok(CliCommand::Invite(config)) => run_invite(config).await,
+        Ok(CliCommand::Share(config)) => run_share(config).await,
         Ok(CliCommand::Join(config)) => run_join(config).await,
+        Ok(CliCommand::Connect(config)) => run_connect(config).await,
         Ok(CliCommand::Use(config)) => run_use(config).await,
         Ok(CliCommand::Clusters(config)) => run_clusters(config).await,
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
@@ -63,6 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Status(config)) => run_status(config).await,
         Ok(CliCommand::Help) => {
             print_help();
+            Ok(())
+        }
+        Ok(CliCommand::Version) => {
+            print_version();
             Ok(())
         }
         Err(err) => {
@@ -85,8 +96,11 @@ enum CliCommand {
     List(DataDirConfig),
     Show(ModelCommand),
     Ps(DataDirConfig),
-    Stop(ModelCommand),
+    Stop(StopConfig),
+    Start(StartConfig),
+    Restart(StartConfig),
     Serve(ServeConfig),
+    Setup(DataDirConfig),
     Create(CreateConfig),
     Rm(ModelCommand),
     Cp(CpConfig),
@@ -94,13 +108,16 @@ enum CliCommand {
     Logs(LogsConfig),
     Cluster(ClusterCommand),
     Invite(InviteConfig),
+    Share(InviteConfig),
     Join(JoinConfig),
+    Connect(JoinConfig),
     Use(UseConfig),
     Clusters(DataDirConfig),
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
     Help,
+    Version,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +180,19 @@ struct ModelCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DataDirConfig {
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StopConfig {
+    model: Option<String>,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartConfig {
+    model: Option<String>,
+    join: Option<String>,
     data_dir: Option<String>,
 }
 
@@ -263,8 +293,11 @@ impl Cli {
             "ls" | "list" => parse_data_dir(&mut args).map(CliCommand::List),
             "show" => parse_model_command(&mut args, "show").map(CliCommand::Show),
             "ps" => parse_data_dir(&mut args).map(CliCommand::Ps),
-            "stop" => parse_model_command(&mut args, "stop").map(CliCommand::Stop),
+            "stop" => parse_stop(&mut args).map(CliCommand::Stop),
+            "start" => parse_start(&mut args).map(CliCommand::Start),
+            "restart" => parse_start(&mut args).map(CliCommand::Restart),
             "serve" => parse_serve(&mut args).map(CliCommand::Serve),
+            "setup" => parse_data_dir(&mut args).map(CliCommand::Setup),
             "create" => parse_create(&mut args).map(CliCommand::Create),
             "rm" => parse_model_command(&mut args, "rm").map(CliCommand::Rm),
             "cp" => parse_cp(&mut args).map(CliCommand::Cp),
@@ -272,13 +305,16 @@ impl Cli {
             "logs" => parse_logs(&mut args).map(CliCommand::Logs),
             "cluster" => parse_cluster(&mut args).map(CliCommand::Cluster),
             "invite" => parse_invite(&mut args).map(CliCommand::Invite),
+            "share" => parse_share(&mut args).map(CliCommand::Share),
             "join" => parse_join(&mut args).map(CliCommand::Join),
+            "connect" => parse_join(&mut args).map(CliCommand::Connect),
             "use" => parse_use(&mut args).map(CliCommand::Use),
             "clusters" => parse_data_dir(&mut args).map(CliCommand::Clusters),
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
             "-h" | "--help" | "help" => Ok(CliCommand::Help),
+            "-V" | "--version" | "version" => Ok(CliCommand::Version),
             other => Err(format!("unknown command: {other}")),
         }
     }
@@ -397,7 +433,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
 }
 
 async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let settings = load_settings(config.data_dir.as_deref());
+    let mut settings = load_settings(config.data_dir.as_deref());
     logger::log(
         &settings.data_dir,
         format!("running model {}", config.model),
@@ -407,6 +443,14 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
         model = Some(pull_model(&settings, &config.model)?);
     }
     let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
+    if !config.local && config.node.is_none() && settings.auto_start_node {
+        let model_path = model.model_path(&settings);
+        if !model_path.exists() && settings.auto_pull {
+            pull_model(&settings, &model.id())?;
+        }
+        ensure_background_runtime(&settings, Some(model_path.display().to_string()), None).await?;
+        settings = BittySettings::load(settings.data_dir.clone());
+    }
     let prompt = config.prompt.unwrap_or_default();
     let cluster_node = if config.local {
         None
@@ -571,6 +615,7 @@ async fn run_show(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
 
 async fn run_ps(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    print_runtime_summary(&settings);
     let path = running_models_path(&settings);
     let contents = std::fs::read_to_string(path).unwrap_or_default();
     println!("NAME\tSTATUS");
@@ -580,18 +625,37 @@ async fn run_ps(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-async fn run_stop(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_stop(config: StopConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    let Some(model) = config.model else {
+        stop_background_runtime(&settings)?;
+        return Ok(());
+    };
     let path = running_models_path(&settings);
     let contents = std::fs::read_to_string(&path).unwrap_or_default();
     let next = contents
         .lines()
-        .filter(|line| *line != config.model)
+        .filter(|line| *line != model)
         .collect::<Vec<_>>()
         .join("\n");
     settings::ensure_parent(&path)?;
     std::fs::write(path, next)?;
-    println!("stopped {}", config.model);
+    println!("stopped {model}");
+    Ok(())
+}
+
+async fn run_start(config: StartConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    ensure_background_runtime(&settings, config.model, config.join).await?;
+    print_runtime_summary(&settings);
+    Ok(())
+}
+
+async fn run_restart(config: StartConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    let _ = stop_background_runtime(&settings);
+    ensure_background_runtime(&settings, config.model, config.join).await?;
+    print_runtime_summary(&settings);
     Ok(())
 }
 
@@ -605,6 +669,34 @@ async fn run_serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
         format!("starting api server on {}", settings.api_host),
     )?;
     server::serve(settings)
+}
+
+async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    println!("Bitty {}", bitty_version());
+    println!("data dir: {}", settings.data_dir.display());
+    let model = resolve_model(&settings, &settings.default_model)
+        .unwrap_or_else(|| model_store::find_registry_model(&settings.default_model).unwrap());
+    let path = model.model_path(&settings);
+    if path.exists() {
+        println!("model ready: {} ({})", model.id(), path.display());
+    } else if settings.auto_pull {
+        println!("pulling default model: {}", settings.default_model);
+        let model = pull_model(&settings, &settings.default_model)?;
+        println!(
+            "model ready: {} ({})",
+            model.id(),
+            model.model_path(&settings).display()
+        );
+    } else {
+        println!(
+            "model missing: {}. Run `bitty pull {}`.",
+            path.display(),
+            settings.default_model
+        );
+    }
+    println!("next: `bitty share home` or `bitty connect INVITE --name home`");
+    Ok(())
 }
 
 async fn run_create(config: CreateConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -718,14 +810,14 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
 
 async fn run_invite(config: InviteConfig) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = bitty_data_dir(config.data_dir.as_deref());
-    let token = load_or_create_cluster_token(&data_dir);
     let settings = BittySettings::load(data_dir.clone());
-    let invite = if let Some(saved) = active_cluster_target(&settings) {
-        relay_only_invite(&saved).unwrap_or(saved)
-    } else {
-        let iroh_node = start_iroh_node(&data_dir).await?;
-        iroh_transport::iroh_uri_for_relay_addr(&iroh_node.endpoint.addr(), &token)
-    };
+    ensure_background_runtime(&settings, None, None).await?;
+    let invite = wait_for_active_cluster(&data_dir, Duration::from_secs(5))
+        .await?
+        .ok_or(
+            "Bitty started, but no invite was published yet. Try `bitty invite` again in a moment.",
+        )?;
+    let invite = relay_only_invite(&invite).unwrap_or(invite);
     let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
     remember_active_cluster(&data_dir, &invite)?;
     println!("Invite name: {name}");
@@ -733,12 +825,13 @@ async fn run_invite(config: InviteConfig) -> Result<(), Box<dyn std::error::Erro
     println!("  {invite}");
     println!();
     println!("On another machine:");
-    println!(
-        "  bitty join '{}' --name {name} --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
-        invite
-    );
-    println!("Keep `bitty node` running while other machines join.");
+    println!("  bitty connect '{}' --name {name}", invite);
+    println!("Bitty is running in the background. Use `bitty stop` to stop it.");
     Ok(())
+}
+
+async fn run_share(config: InviteConfig) -> Result<(), Box<dyn std::error::Error>> {
+    run_invite(config).await
 }
 
 async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -763,6 +856,18 @@ async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> 
         cluster_token: None,
     })
     .await
+}
+
+async fn run_connect(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let invite = resolve_cluster_alias_or_invite(&data_dir, &config.target)?;
+    let settings = BittySettings::load(data_dir.clone());
+    let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
+    remember_active_cluster(&data_dir, &invite)?;
+    ensure_background_runtime(&settings, config.model, Some(invite)).await?;
+    println!("connected to cluster `{name}`");
+    println!("You can now run: bitty run bitnet-b1.58 \"hello\"");
+    Ok(())
 }
 
 async fn run_use(config: UseConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1069,6 +1174,12 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut settings = load_settings(config.data_dir.as_deref());
+    if config.node.is_none() && settings.auto_start_node {
+        let _ = ensure_background_runtime(&settings, None, None).await;
+        settings = BittySettings::load(settings.data_dir.clone());
+    }
+    print_runtime_summary(&settings);
     let status = fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
     print_cluster_status(status, true);
     Ok(())
@@ -1339,6 +1450,38 @@ fn parse_model_command(
     Ok(config)
 }
 
+fn parse_stop(args: &mut impl Iterator<Item = String>) -> Result<StopConfig, String> {
+    let mut config = StopConfig {
+        model: None,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.model.is_none() => config.model = Some(value.into()),
+            other => return Err(format!("unknown stop argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_start(args: &mut impl Iterator<Item = String>) -> Result<StartConfig, String> {
+    let mut config = StartConfig {
+        model: None,
+        join: None,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model" => config.model = Some(required_next(args, "--model")?),
+            "--join" => config.join = Some(required_next(args, "--join")?),
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            other => return Err(format!("unknown start argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
 fn parse_data_dir(args: &mut impl Iterator<Item = String>) -> Result<DataDirConfig, String> {
     let mut config = DataDirConfig { data_dir: None };
     while let Some(arg) = args.next() {
@@ -1489,6 +1632,24 @@ fn parse_invite(args: &mut impl Iterator<Item = String>) -> Result<InviteConfig,
             "--replace" => config.replace = true,
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown invite argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_share(args: &mut impl Iterator<Item = String>) -> Result<InviteConfig, String> {
+    let mut config = InviteConfig {
+        name: None,
+        replace: false,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" | "-n" => config.name = Some(required_next(args, "--name")?),
+            "--replace" => config.replace = true,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.name.is_none() => config.name = Some(value.into()),
+            other => return Err(format!("unknown share argument: {other}")),
         }
     }
     Ok(config)
@@ -1892,6 +2053,219 @@ fn resolve_cluster_alias_or_invite(
     Err(format!("unknown cluster `{value}`. Use `bitty clusters` to list saved names.").into())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RuntimeState {
+    pid: u32,
+    mode: String,
+    model: String,
+    target: String,
+}
+
+async fn ensure_background_runtime(
+    settings: &BittySettings,
+    model_override: Option<String>,
+    join_override: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(state) = read_runtime_state(&settings.data_dir) {
+        if is_pid_running(state.pid) {
+            return Ok(());
+        }
+    }
+
+    let saved = read_runtime_state(&settings.data_dir);
+    let join = join_override.or_else(|| {
+        saved.as_ref().and_then(|state| {
+            if state.mode == "worker" && !state.target.is_empty() {
+                Some(state.target.clone())
+            } else {
+                None
+            }
+        })
+    });
+    let model = model_override
+        .or_else(|| {
+            saved
+                .as_ref()
+                .map(|state| state.model.clone())
+                .filter(|model| !model.is_empty())
+        })
+        .unwrap_or_else(|| settings.default_model.clone());
+    let model_path = model_path_for_runtime(settings, &model)?;
+    spawn_background_node(settings, &model_path, join).await
+}
+
+async fn spawn_background_node(
+    settings: &BittySettings,
+    model_path: &str,
+    join: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    settings::ensure_parent(&runtime_state_path(&settings.data_dir))?;
+    settings::ensure_parent(&logger::log_path(&settings.data_dir))?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logger::log_path(&settings.data_dir))?;
+    let err_log = log.try_clone()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("node")
+        .arg("--model")
+        .arg(model_path)
+        .arg("--data-dir")
+        .arg(settings.data_dir.display().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err_log));
+    if let Some(join) = &join {
+        command.arg("--join").arg(join);
+    }
+    let mode = if join.is_some() { "worker" } else { "leader" };
+    let child = command.spawn()?;
+    let state = RuntimeState {
+        pid: child.id(),
+        mode: mode.into(),
+        model: model_path.into(),
+        target: join.unwrap_or_default(),
+    };
+    write_runtime_state(&settings.data_dir, &state)?;
+    logger::log(
+        &settings.data_dir,
+        format!("started background runtime pid={}", state.pid),
+    )?;
+    sleep(Duration::from_millis(800)).await;
+    if mode == "leader" {
+        let _ = wait_for_active_cluster(&settings.data_dir, Duration::from_secs(5)).await?;
+    }
+    println!("Bitty is running in the background (pid {}).", state.pid);
+    Ok(())
+}
+
+fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(state) = read_runtime_state(&settings.data_dir) else {
+        println!("Bitty is not running.");
+        return Ok(());
+    };
+    if is_pid_running(state.pid) {
+        let status = Command::new("kill").arg(state.pid.to_string()).status()?;
+        if !status.success() {
+            return Err(format!("failed to stop Bitty runtime pid {}", state.pid).into());
+        }
+        println!("stopped Bitty runtime pid {}", state.pid);
+    } else {
+        println!("Bitty runtime pid {} was not running.", state.pid);
+    }
+    let _ = std::fs::remove_file(runtime_state_path(&settings.data_dir));
+    Ok(())
+}
+
+fn print_runtime_summary(settings: &BittySettings) {
+    if let Some(state) = read_runtime_state(&settings.data_dir) {
+        let status = if is_pid_running(state.pid) {
+            "running"
+        } else {
+            "stopped"
+        };
+        println!(
+            "Bitty runtime: {status} (pid {}, mode {})",
+            state.pid, state.mode
+        );
+        if !state.target.is_empty() {
+            println!("Runtime cluster: {}", compact_invite(&state.target));
+        }
+    } else {
+        println!("Bitty runtime: stopped");
+    }
+    if let Some(active) = active_cluster_target(settings) {
+        println!("Active cluster: {}", compact_invite(&active));
+    }
+}
+
+async fn wait_for_active_cluster(
+    data_dir: &PathBuf,
+    wait: Duration,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    loop {
+        let settings = BittySettings::load(data_dir.clone());
+        if let Some(target) = active_cluster_target(&settings) {
+            return Ok(Some(target));
+        }
+        if started.elapsed() >= wait {
+            return Ok(None);
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn model_path_for_runtime(
+    settings: &BittySettings,
+    model: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut spec = resolve_model(settings, model);
+    if let Some(candidate) = spec.clone() {
+        if !candidate.model_path(settings).exists() && settings.auto_pull {
+            spec = Some(pull_model(settings, &candidate.id())?);
+        }
+    }
+    let spec = spec.ok_or_else(|| format!("model not found: {model}"))?;
+    let path = spec.model_path(settings);
+    if !path.exists() {
+        return Err(format!(
+            "model file is missing: {}. Run `bitty pull {}` or `bitty setup` first.",
+            path.display(),
+            spec.id()
+        )
+        .into());
+    }
+    Ok(path.display().to_string())
+}
+
+fn read_runtime_state(data_dir: &PathBuf) -> Option<RuntimeState> {
+    let contents = std::fs::read_to_string(runtime_state_path(data_dir)).ok()?;
+    let mut state = RuntimeState::default();
+    for line in contents.lines() {
+        let Some((key, value)) = settings::parse_assignment(line) else {
+            continue;
+        };
+        match key {
+            "pid" => state.pid = value.parse().unwrap_or_default(),
+            "mode" => state.mode = value.into(),
+            "model" => state.model = value.into(),
+            "target" => state.target = value.into(),
+            _ => {}
+        }
+    }
+    (state.pid > 0).then_some(state)
+}
+
+fn write_runtime_state(data_dir: &PathBuf, state: &RuntimeState) -> std::io::Result<()> {
+    let contents = format!(
+        "pid = {}\nmode = \"{}\"\nmodel = \"{}\"\ntarget = \"{}\"\n",
+        state.pid,
+        escape_toml(&state.mode),
+        escape_toml(&state.model),
+        escape_toml(&state.target)
+    );
+    std::fs::write(runtime_state_path(data_dir), contents)
+}
+
+fn runtime_state_path(data_dir: &PathBuf) -> PathBuf {
+    data_dir.join("runtime").join("runtime.toml")
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn escape_toml(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn remember_cluster_alias(
     data_dir: &PathBuf,
     name: Option<&str>,
@@ -2086,14 +2460,30 @@ fn demo_layers(count: u32) -> Vec<LayerMetadata> {
         .collect()
 }
 
+fn bitty_version() -> String {
+    option_env!("BITTY_GIT_SHA")
+        .map(|sha| format!("{} ({sha})", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn print_version() {
+    println!("bitty {}", bitty_version());
+    println!("repository: {}", env!("CARGO_PKG_REPOSITORY"));
+}
+
 fn print_help() {
     println!("Usage:");
+    println!("  bitty setup");
+    println!("  bitty share NAME");
+    println!("  bitty connect INVITE_OR_NAME [--name NAME]");
+    println!("  bitty start [--model MODEL_OR_PATH]");
+    println!("  bitty stop [MODEL]");
+    println!("  bitty restart");
     println!("  bitty run MODEL [PROMPT] [--local|--node TARGET]");
     println!("  bitty pull MODEL");
     println!("  bitty ls | bitty list");
     println!("  bitty show MODEL");
     println!("  bitty ps");
-    println!("  bitty stop MODEL");
     println!("  bitty serve [--host 127.0.0.1:11435]");
     println!("  bitty create NAME -f Modelfile");
     println!("  bitty rm MODEL");
@@ -2111,10 +2501,10 @@ fn print_help() {
     println!("  bitty generate --prompt TEXT [--node TARGET]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
+    println!("  bitty version");
     println!();
-    println!(
-        "Bitty remembers the active cluster after `bitty node`, `bitty join`, or `bitty invite`."
-    );
+    println!("Simple flow: `bitty setup`, then `bitty share home` or `bitty connect INVITE --name home`.");
+    println!("Bitty starts the node runtime in the background for simple commands.");
     println!("Cluster names are local aliases. A reused name must match the same invite unless --replace is set.");
     println!("Use `--local` on `bitty run` to force local-only generation.");
 }
@@ -2323,6 +2713,27 @@ mod tests {
     #[test]
     fn parses_simple_cluster_alias_commands() {
         assert!(matches!(
+            Cli::parse(vec!["setup".into()]).unwrap(),
+            CliCommand::Setup(DataDirConfig { .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["version".into()]).unwrap(),
+            CliCommand::Version
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "start".into(),
+                "--model".into(),
+                "bitnet-b1.58".into()
+            ])
+            .unwrap(),
+            CliCommand::Start(StartConfig { model: Some(_), .. })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["stop".into()]).unwrap(),
+            CliCommand::Stop(StopConfig { model: None, .. })
+        ));
+        assert!(matches!(
             Cli::parse(vec![
                 "invite".into(),
                 "--name".into(),
@@ -2335,6 +2746,10 @@ mod tests {
                 replace: true,
                 ..
             })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["share".into(), "Home".into()]).unwrap(),
+            CliCommand::Share(InviteConfig { name: Some(_), .. })
         ));
         assert!(matches!(
             Cli::parse(vec![
@@ -2351,6 +2766,16 @@ mod tests {
                 model: Some(_),
                 ..
             })
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "connect".into(),
+                "iroh://abc?token=secret".into(),
+                "--name".into(),
+                "home".into()
+            ])
+            .unwrap(),
+            CliCommand::Connect(JoinConfig { name: Some(_), .. })
         ));
         assert!(matches!(
             Cli::parse(vec!["use".into(), "home".into()]).unwrap(),
