@@ -23,6 +23,11 @@ Run it on every PC/server. It can install Rust with `rustup`, build release
 binaries, link the `bitty` command into `~/.local/bin`, and print the exact node
 command for the role you choose.
 
+The installer also checks native build dependencies. On common Linux
+distributions it can install the required compiler tools, `pkg-config`, OpenSSL
+development headers, and `protoc` automatically with the system package manager.
+Use `--no-system-deps` if you prefer to install OS packages yourself.
+
 First machine:
 
 ```bash
