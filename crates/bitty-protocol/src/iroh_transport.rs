@@ -1,6 +1,7 @@
 use iroh::endpoint::{RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use prost::Message;
+use std::net::SocketAddr;
 use thiserror::Error;
 
 pub const BITTY_SCHEDULER_ALPN: &[u8] = b"bitty/scheduler/0";
@@ -24,6 +25,12 @@ pub struct IrohFrame {
     pub op: u8,
     pub token: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrohTarget {
+    pub endpoint_addr: EndpointAddr,
+    pub token: Option<String>,
 }
 
 impl IrohFrame {
@@ -83,6 +90,16 @@ pub enum IrohTransportError {
 pub async fn request(
     endpoint: &Endpoint,
     remote: EndpointId,
+    alpn: &[u8],
+    frame: IrohFrame,
+    response_limit: usize,
+) -> Result<IrohFrame, IrohTransportError> {
+    request_addr(endpoint, remote.into(), alpn, frame, response_limit).await
+}
+
+pub async fn request_addr(
+    endpoint: &Endpoint,
+    remote: EndpointAddr,
     alpn: &[u8],
     frame: IrohFrame,
     response_limit: usize,
@@ -163,6 +180,26 @@ pub fn iroh_uri(endpoint_id: impl std::fmt::Display, token: &str) -> String {
     }
 }
 
+pub fn iroh_uri_for_addr(endpoint_addr: &EndpointAddr, token: &str) -> String {
+    let mut params = Vec::new();
+    if !token.is_empty() {
+        params.push(format!("token={token}"));
+    }
+    for relay in endpoint_addr.relay_urls() {
+        params.push(format!("relay={relay}"));
+    }
+    for addr in endpoint_addr.ip_addrs() {
+        if !addr.ip().is_unspecified() {
+            params.push(format!("addr={addr}"));
+        }
+    }
+    if params.is_empty() {
+        format!("iroh://{}", endpoint_addr.id)
+    } else {
+        format!("iroh://{}?{}", endpoint_addr.id, params.join("&"))
+    }
+}
+
 pub fn parse_iroh_uri(value: &str) -> Option<(&str, Option<&str>)> {
     let rest = value.strip_prefix("iroh://")?;
     let (endpoint_id, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -171,6 +208,35 @@ pub fn parse_iroh_uri(value: &str) -> Option<(&str, Option<&str>)> {
         (key == "token").then_some(value)
     });
     Some((endpoint_id, token))
+}
+
+pub fn parse_iroh_target(value: &str) -> Option<IrohTarget> {
+    let rest = value.strip_prefix("iroh://")?;
+    let (endpoint_id, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let endpoint_id: EndpointId = endpoint_id.parse().ok()?;
+    let mut token = None;
+    let mut addrs = Vec::new();
+    for part in query.split('&').filter(|part| !part.is_empty()) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "token" => token = Some(value.to_string()),
+            "relay" => {
+                let relay: RelayUrl = value.parse().ok()?;
+                addrs.push(TransportAddr::Relay(relay));
+            }
+            "addr" => {
+                let addr: SocketAddr = value.parse().ok()?;
+                addrs.push(TransportAddr::Ip(addr));
+            }
+            _ => {}
+        }
+    }
+    Some(IrohTarget {
+        endpoint_addr: EndpointAddr::from_parts(endpoint_id, addrs),
+        token,
+    })
 }
 
 #[cfg(test)]
@@ -195,5 +261,14 @@ mod tests {
             parse_iroh_uri("iroh://abc?token=secret"),
             Some(("abc", Some("secret")))
         );
+    }
+
+    #[test]
+    fn parses_iroh_target_addresses() {
+        let value = "iroh://1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18?token=secret&relay=https://euw1-1.relay.iroh.network./&addr=127.0.0.1:1234";
+        let target = parse_iroh_target(value).unwrap();
+        assert_eq!(target.token.as_deref(), Some("secret"));
+        assert_eq!(target.endpoint_addr.relay_urls().count(), 1);
+        assert_eq!(target.endpoint_addr.ip_addrs().count(), 1);
     }
 }

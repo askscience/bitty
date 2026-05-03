@@ -22,7 +22,7 @@ use bitty_protocol::{
     ShardManifestMessage,
 };
 use futures::stream;
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointAddr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -354,20 +354,16 @@ impl NetworkCoordinator {
     }
 
     async fn worker_client(&self, endpoint: &str) -> Result<WorkerRpcClient, Status> {
-        if let Some((endpoint_id, token)) = bitty_protocol::iroh_transport::parse_iroh_uri(endpoint)
-        {
-            let endpoint_id: EndpointId = endpoint_id
-                .parse()
-                .map_err(|err| Status::invalid_argument(format!("invalid iroh endpoint: {err}")))?;
+        if let Some(target) = bitty_protocol::iroh_transport::parse_iroh_target(endpoint) {
             let iroh_endpoint = self
                 .iroh_endpoint
                 .clone()
                 .ok_or_else(|| Status::failed_precondition("coordinator has no iroh endpoint"))?;
             return Ok(WorkerRpcClient::Iroh(IrohWorkerClient {
                 endpoint: iroh_endpoint,
-                endpoint_id,
-                token: token
-                    .map(str::to_string)
+                endpoint_addr: target.endpoint_addr,
+                token: target
+                    .token
                     .or_else(|| self.cluster_token.clone())
                     .unwrap_or_default(),
             }));
@@ -467,7 +463,7 @@ impl WorkerRpcClient {
 
 struct IrohWorkerClient {
     endpoint: Endpoint,
-    endpoint_id: EndpointId,
+    endpoint_addr: EndpointAddr,
     token: String,
 }
 
@@ -482,9 +478,9 @@ impl IrohWorkerClient {
         R: prost::Message + Default,
     {
         let frame = IrohFrame::message(op, self.token.clone(), message);
-        let response = iroh_transport::request(
+        let response = iroh_transport::request_addr(
             &self.endpoint,
-            self.endpoint_id,
+            self.endpoint_addr.clone(),
             BITTY_WORKER_ALPN,
             frame,
             DEFAULT_FRAME_LIMIT,

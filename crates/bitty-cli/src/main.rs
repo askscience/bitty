@@ -23,14 +23,14 @@ use bitty_protocol::pb::{
 };
 use bitty_protocol::{LayerMetadata, NodeId};
 use bitty_worker::{network::NetworkWorker, HardwareProfiler};
-use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
 use settings::BittySettings;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -303,7 +303,7 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         match &iroh_node {
             Some(iroh_node) => SchedulerTarget::Iroh {
                 endpoint: iroh_node.endpoint.clone(),
-                remote: iroh_node.endpoint.id(),
+                remote: iroh_node.endpoint.addr(),
                 token: cluster_token.clone(),
             },
             None => SchedulerTarget::Tcp(leader),
@@ -315,10 +315,9 @@ async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         println!("iroh node id: {}", iroh_node.node_id);
         println!("iroh bound sockets: {}", iroh_node.bound_sockets.join(", "));
         if config.join.is_none() {
-            println!(
-                "bitty join: {}",
-                iroh_transport::iroh_uri(&iroh_node.node_id, &cluster_token)
-            );
+            let invite =
+                iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), &cluster_token);
+            println!("bitty join: {}", invite);
         }
     } else if config.join.is_none() {
         println!(
@@ -607,11 +606,12 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
             let data_dir = bitty_data_dir(config.data_dir.as_deref());
             let iroh_node = start_iroh_node(&data_dir).await?;
             let token = load_or_create_cluster_token(&data_dir);
-            println!("{}", iroh_transport::iroh_uri(&iroh_node.node_id, &token));
+            let invite = iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), &token);
+            println!("{invite}");
             println!("Share this invite with another Bitty node:");
             println!(
                 "bitty node --join '{}' --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
-                iroh_transport::iroh_uri(&iroh_node.node_id, &token)
+                invite
             );
         }
     }
@@ -623,7 +623,7 @@ enum SchedulerTarget {
     Tcp(String),
     Iroh {
         endpoint: Endpoint,
-        remote: EndpointId,
+        remote: EndpointAddr,
         token: String,
     },
 }
@@ -636,7 +636,7 @@ async fn register_and_heartbeat(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
     profile.worker_endpoint = if let Some(iroh_node) = iroh_node {
-        iroh_transport::iroh_uri(&iroh_node.node_id, cluster_token)
+        iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), cluster_token)
     } else {
         let worker_listen = config.worker_listen.clone().unwrap_or_else(|| {
             if config.join.is_some() {
@@ -694,7 +694,7 @@ async fn register_and_heartbeat(
         } => {
             let client = IrohSchedulerClient {
                 endpoint: endpoint.clone(),
-                remote: *remote,
+                remote: remote.clone(),
                 token: token.clone(),
             };
             let registration: RegisterWorkerResponse = client
@@ -707,7 +707,7 @@ async fn register_and_heartbeat(
                 .await?;
             println!(
                 "bitty node joined iroh scheduler {}; topology_epoch={} assignments={}",
-                remote,
+                remote.id,
                 registration.topology_epoch,
                 registration.assignments.len()
             );
@@ -739,13 +739,13 @@ async fn register_and_heartbeat(
 }
 
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some((endpoint_id, token)) = iroh_transport::parse_iroh_uri(&config.node) {
+    if let Some(target) = iroh_transport::parse_iroh_target(&config.node) {
         let data_dir = bitty_data_dir(None);
         let iroh_node = start_iroh_node(&data_dir).await?;
         let client = IrohSchedulerClient {
             endpoint: iroh_node.endpoint,
-            remote: endpoint_id.parse()?,
-            token: token.unwrap_or_default().to_string(),
+            remote: target.endpoint_addr,
+            token: target.token.unwrap_or_default(),
         };
         let response: GenerateResponse = client
             .request(
@@ -849,13 +849,13 @@ async fn fetch_cluster_status(
     node: &str,
     data_dir: Option<&str>,
 ) -> Result<ClusterStatusResponse, Box<dyn std::error::Error>> {
-    let status = if let Some((endpoint_id, token)) = iroh_transport::parse_iroh_uri(node) {
+    let status = if let Some(target) = iroh_transport::parse_iroh_target(node) {
         let data_dir = bitty_data_dir(data_dir);
         let iroh_node = start_iroh_node(&data_dir).await?;
         let client = IrohSchedulerClient {
             endpoint: iroh_node.endpoint,
-            remote: endpoint_id.parse()?,
-            token: token.unwrap_or_default().to_string(),
+            remote: target.endpoint_addr,
+            token: target.token.unwrap_or_default(),
         };
         client
             .request::<_, ClusterStatusResponse>(SCHEDULER_CLUSTER_STATUS, &ClusterStatusRequest {})
@@ -1301,6 +1301,7 @@ async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::er
         ])
         .bind()
         .await?;
+    let _ = timeout(Duration::from_secs(10), endpoint.online()).await;
     let node_id = endpoint.id().to_string();
     let bound_sockets = endpoint
         .bound_sockets()
@@ -1348,7 +1349,9 @@ async fn handle_scheduler_connection(
             let mut request: RegisterWorkerRequest =
                 frame.decode_message(SCHEDULER_REGISTER_WORKER)?;
             if let Some(profile) = request.profile.as_mut() {
-                profile.worker_endpoint = iroh_transport::iroh_uri(remote_id, &cluster_token);
+                if profile.worker_endpoint.is_empty() {
+                    profile.worker_endpoint = iroh_transport::iroh_uri(remote_id, &cluster_token);
+                }
             }
             let response = coordinator
                 .register_worker(tonic::Request::new(request))
@@ -1431,7 +1434,7 @@ async fn handle_worker_connection(
 
 struct IrohSchedulerClient {
     endpoint: Endpoint,
-    remote: EndpointId,
+    remote: EndpointAddr,
     token: String,
 }
 
@@ -1445,9 +1448,9 @@ impl IrohSchedulerClient {
         M: prost::Message,
         R: prost::Message + Default,
     {
-        let response = iroh_transport::request(
+        let response = iroh_transport::request_addr(
             &self.endpoint,
-            self.remote,
+            self.remote.clone(),
             BITTY_SCHEDULER_ALPN,
             IrohFrame::message(op, self.token.clone(), message),
             DEFAULT_FRAME_LIMIT,
@@ -1462,15 +1465,14 @@ async fn resolve_scheduler_target(
     iroh_node: Option<&IrohNode>,
     cluster_token: &str,
 ) -> Result<SchedulerTarget, Box<dyn std::error::Error>> {
-    if let Some((endpoint_id, token)) = iroh_transport::parse_iroh_uri(join) {
-        let endpoint_id: EndpointId = endpoint_id.parse()?;
+    if let Some(target) = iroh_transport::parse_iroh_target(join) {
         let Some(iroh_node) = iroh_node else {
             return Err("iroh join target requires Iroh to be enabled".into());
         };
         return Ok(SchedulerTarget::Iroh {
             endpoint: iroh_node.endpoint.clone(),
-            remote: endpoint_id,
-            token: token.unwrap_or(cluster_token).to_string(),
+            remote: target.endpoint_addr,
+            token: target.token.unwrap_or_else(|| cluster_token.to_string()),
         });
     }
     Ok(SchedulerTarget::Tcp(parse_tcp_join_target(join)))
