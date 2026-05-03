@@ -5,7 +5,7 @@ use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, BitNetLogits as ProtoBitNetLogits, CleanupRequest,
     CleanupResponse, HeartbeatResponse, LoadShardRequest, LoadShardResponse, TopologyUpdate,
 };
-use bitty_protocol::{ActivationTensor, LayerAssignment, NodeId, ShardManifestMessage};
+use bitty_protocol::{ActivationTensor, LayerAssignment, ModelStage, NodeId, ShardManifestMessage};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
@@ -156,6 +156,17 @@ where
             )));
         }
 
+        let assignment = LayerAssignment {
+            node_id: manifest.node_id.clone(),
+            range: manifest.range.clone(),
+            assigned_weight_bytes: manifest.byte_len,
+            expected_latency_ms: 0.0,
+            next_node_id: None,
+            disk_offload_fraction: 0.0,
+            model_stage: ModelStage::LayerRange,
+        };
+
+        *self.assignment.lock().await = Some(assignment);
         *self.loaded_shard.lock().await = Some(manifest);
         Ok(Response::new(LoadShardResponse {
             loaded: true,

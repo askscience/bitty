@@ -17,8 +17,8 @@ bitty serve
 ```
 
 `bitty node` starts the local peer runtime and remembers the active cluster.
-After that, `bitty run`, `bitty chat`, `bitty status`, and `bitty cluster`
-commands can use the cluster without repeating an `iroh://...` invite.
+`bitty invite`, `bitty join`, and `bitty use` add short local names for clusters,
+so everyday commands do not need repeated `iroh://...` invites.
 
 ## What Bitty Does
 
@@ -283,19 +283,31 @@ up to three rotated files: `bitty.log.1`, `bitty.log.2`, and `bitty.log.3`.
 Checks and inspects the distributed Bitty cluster.
 
 ```bash
+bitty invite --name home
+bitty join 'iroh://INVITE_FROM_ANOTHER_NODE' --name home
+bitty use home
+bitty use 'iroh://INVITE_FROM_ANOTHER_NODE' --name home
+bitty clusters
 bitty cluster status
 bitty cluster nodes
 bitty cluster check
-bitty cluster invite
 ```
+
+`bitty invite` prints the local Iroh invite string and saves it under a local
+name. `bitty join` accepts either a full invite or a saved name and starts a
+worker node. `bitty use` switches the active cluster without starting a node,
+and `bitty clusters` lists saved local names.
 
 `cluster status` prints leader, topology, worker count, model readiness, and
 layer assignments. `cluster nodes` focuses on node/layer placement. `cluster
-check` exits with an error when the cluster is not ready. `cluster invite`
-prints the local Iroh invite string for sharing with another Bitty node.
-Keep `bitty node` running while other machines join and run requests.
-Pass `--node TARGET` only when you want to inspect a cluster that is not saved
-as the active cluster.
+check` exits with an error when the cluster is not ready. Keep `bitty node`
+running while other machines join and run requests. Pass `--node TARGET` only
+when you want to inspect a cluster that is not saved as the active cluster.
+
+Cluster names are local aliases stored under `~/.bitty/clusters.toml`. If you
+try to save a different invite under an existing name, Bitty reports a conflict
+instead of silently replacing it. Use `--replace` only when you intentionally
+want that name to point to a different cluster.
 
 ## Generation Options
 
@@ -394,9 +406,9 @@ bitty settings set api_host 127.0.0.1:11435
 bitty settings get active_cluster
 ```
 
-`active_cluster` is usually managed automatically by `bitty node` and
-`bitty cluster invite`. Set it manually only when you want this machine to use a
-specific cluster target by default.
+`active_cluster` is usually managed automatically by `bitty node`, `bitty
+invite`, `bitty join`, and `bitty use`. Set it manually only when you want this
+machine to use a specific cluster target by default.
 
 Current settings include:
 
@@ -512,25 +524,26 @@ The node prints an `iroh://...` join value containing the peer identity, cluster
 token, and Iroh addressing information. Bitty also saves this as the active
 cluster in `~/.bitty/config.toml`.
 
-You can also print the current local Iroh invite:
+You can also print the current local Iroh invite and save a local cluster name:
 
 ```bash
-bitty cluster invite
+bitty invite --name home
 ```
 
-Keep the first `bitty node` process running. `bitty cluster invite` is only for
-printing the invite; it is not the cluster runtime.
+Keep the first `bitty node` process running. `bitty invite` is only for printing
+the invite; it is not the cluster runtime.
 
 Join another machine:
 
 ```bash
-bitty node \
-  --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE' \
-  --node-id worker-a \
+bitty join 'iroh://INVITE_FROM_BITTY_INVITE' \
+  --name home \
   --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 ```
 
-After joining, the invite is saved on that machine too. Use the cluster normally:
+After joining, the invite is saved on that machine too. Later, you can switch
+back to it with `bitty use home` or inspect saved names with `bitty clusters`.
+Use the cluster normally:
 
 ```bash
 bitty run bitnet-b1.58 "Hello"

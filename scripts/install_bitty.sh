@@ -322,7 +322,7 @@ In another terminal, use the cluster:
 
 The node stores a stable Iroh identity and active cluster in ~/.bitty.
 It prints an iroh:// invite for other PCs. You can print it again with:
-  $BIN_DIR/bitty cluster invite
+  $BIN_DIR/bitty invite --name home
 
 Keep bitty node running while other machines join and run requests.
 EOF
@@ -332,11 +332,11 @@ EOF
       MODEL_PATH="$HOME/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf"
     fi
     if [ -z "$JOIN" ]; then
-      JOIN="iroh://INVITE_FROM_BITTY_CLUSTER_INVITE"
+      JOIN="iroh://INVITE_FROM_BITTY_INVITE"
     fi
     cat <<EOF
 Join an existing Bitty node:
-  $BIN_DIR/bitty node --join "$JOIN" --node-id "$NODE_ID" --model "$MODEL_PATH"
+  $BIN_DIR/bitty join "$JOIN" --name home --model "$MODEL_PATH"
 
 Then use Bitty without repeating the invite:
   $BIN_DIR/bitty run bitnet-b1.58
@@ -345,11 +345,11 @@ EOF
     ;;
   client)
     if [ -z "$JOIN" ]; then
-      JOIN="iroh://INVITE_FROM_BITTY_CLUSTER_INVITE"
+      JOIN="iroh://INVITE_FROM_BITTY_INVITE"
     fi
     cat <<EOF
 Save the cluster target:
-  $BIN_DIR/bitty settings set active_cluster "$JOIN"
+  $BIN_DIR/bitty use "$JOIN" --name home
 
 Send requests:
   $BIN_DIR/bitty run bitnet-b1.58 "Hello"

@@ -1,3 +1,4 @@
+mod cluster_store;
 mod logger;
 mod model_store;
 mod modelfile;
@@ -53,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Settings(config)) => run_settings(config).await,
         Ok(CliCommand::Logs(config)) => run_logs(config).await,
         Ok(CliCommand::Cluster(config)) => run_cluster(config).await,
+        Ok(CliCommand::Invite(config)) => run_invite(config).await,
+        Ok(CliCommand::Join(config)) => run_join(config).await,
+        Ok(CliCommand::Use(config)) => run_use(config).await,
+        Ok(CliCommand::Clusters(config)) => run_clusters(config).await,
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
@@ -88,6 +93,10 @@ enum CliCommand {
     Settings(SettingsCommand),
     Logs(LogsConfig),
     Cluster(ClusterCommand),
+    Invite(InviteConfig),
+    Join(JoinConfig),
+    Use(UseConfig),
+    Clusters(DataDirConfig),
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
@@ -215,6 +224,30 @@ struct ClusterConfig {
     data_dir: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InviteConfig {
+    name: Option<String>,
+    replace: bool,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JoinConfig {
+    target: String,
+    name: Option<String>,
+    replace: bool,
+    model: Option<String>,
+    node_id: Option<String>,
+    data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UseConfig {
+    target: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+}
+
 struct Cli;
 
 impl Cli {
@@ -238,6 +271,10 @@ impl Cli {
             "settings" => parse_settings(&mut args).map(CliCommand::Settings),
             "logs" => parse_logs(&mut args).map(CliCommand::Logs),
             "cluster" => parse_cluster(&mut args).map(CliCommand::Cluster),
+            "invite" => parse_invite(&mut args).map(CliCommand::Invite),
+            "join" => parse_join(&mut args).map(CliCommand::Join),
+            "use" => parse_use(&mut args).map(CliCommand::Use),
+            "clusters" => parse_data_dir(&mut args).map(CliCommand::Clusters),
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
@@ -668,24 +705,93 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
             }
         }
         ClusterCommand::Invite(config) => {
-            let data_dir = bitty_data_dir(config.data_dir.as_deref());
-            let token = load_or_create_cluster_token(&data_dir);
-            let settings = BittySettings::load(data_dir.clone());
-            let invite = if let Some(saved) = active_cluster_target(&settings) {
-                relay_only_invite(&saved).unwrap_or(saved)
-            } else {
-                let iroh_node = start_iroh_node(&data_dir).await?;
-                iroh_transport::iroh_uri_for_relay_addr(&iroh_node.endpoint.addr(), &token)
-            };
-            remember_active_cluster(&data_dir, &invite)?;
-            println!("{invite}");
-            println!("Share this invite with another Bitty node:");
-            println!(
-                "bitty node --join '{}' --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
-                invite
-            );
-            println!("Keep `bitty node` running while other machines join.");
+            run_invite(InviteConfig {
+                name: None,
+                replace: false,
+                data_dir: config.data_dir,
+            })
+            .await?;
         }
+    }
+    Ok(())
+}
+
+async fn run_invite(config: InviteConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let token = load_or_create_cluster_token(&data_dir);
+    let settings = BittySettings::load(data_dir.clone());
+    let invite = if let Some(saved) = active_cluster_target(&settings) {
+        relay_only_invite(&saved).unwrap_or(saved)
+    } else {
+        let iroh_node = start_iroh_node(&data_dir).await?;
+        iroh_transport::iroh_uri_for_relay_addr(&iroh_node.endpoint.addr(), &token)
+    };
+    let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
+    remember_active_cluster(&data_dir, &invite)?;
+    println!("Invite name: {name}");
+    println!("Invite:");
+    println!("  {invite}");
+    println!();
+    println!("On another machine:");
+    println!(
+        "  bitty join '{}' --name {name} --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
+        invite
+    );
+    println!("Keep `bitty node` running while other machines join.");
+    Ok(())
+}
+
+async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let invite = resolve_cluster_alias_or_invite(&data_dir, &config.target)?;
+    let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
+    remember_active_cluster(&data_dir, &invite)?;
+    println!("using cluster `{name}`");
+    run_node(NodeConfig {
+        model: config
+            .model
+            .unwrap_or_else(|| default_model_path(&data_dir)),
+        node_id: config.node_id.unwrap_or_default(),
+        listen: "0.0.0.0:50051".into(),
+        worker_listen: None,
+        public_endpoint: None,
+        join: Some(invite),
+        layers: 30,
+        heartbeat_interval_ms: 1000,
+        iroh: true,
+        data_dir: config.data_dir,
+        cluster_token: None,
+    })
+    .await
+}
+
+async fn run_use(config: UseConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let invite = resolve_cluster_alias_or_invite(&data_dir, &config.target)?;
+    if let Some(name) = config.name.as_deref() {
+        remember_cluster_alias(&data_dir, Some(name), &invite, false)?;
+    }
+    remember_active_cluster(&data_dir, &invite)?;
+    println!(
+        "active cluster: {}",
+        config.name.as_deref().unwrap_or(&config.target)
+    );
+    Ok(())
+}
+
+async fn run_clusters(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let settings = BittySettings::load(data_dir.clone());
+    let active = active_cluster_target(&settings);
+    let store = cluster_store::ClusterStore::load(&data_dir);
+    println!("NAME\tACTIVE\tTARGET");
+    for (name, invite) in store.aliases() {
+        let marker = if Some(invite) == active.as_deref() {
+            "yes"
+        } else {
+            "no"
+        };
+        println!("{name}\t{marker}\t{}", compact_invite(invite));
     }
     Ok(())
 }
@@ -1371,6 +1477,69 @@ fn parse_cluster(args: &mut impl Iterator<Item = String>) -> Result<ClusterComma
     }
 }
 
+fn parse_invite(args: &mut impl Iterator<Item = String>) -> Result<InviteConfig, String> {
+    let mut config = InviteConfig {
+        name: None,
+        replace: false,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" | "-n" => config.name = Some(required_next(args, "--name")?),
+            "--replace" => config.replace = true,
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            other => return Err(format!("unknown invite argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_join(args: &mut impl Iterator<Item = String>) -> Result<JoinConfig, String> {
+    let mut config = JoinConfig {
+        target: String::new(),
+        name: None,
+        replace: false,
+        model: None,
+        node_id: None,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" | "-n" => config.name = Some(required_next(args, "--name")?),
+            "--replace" => config.replace = true,
+            "--model" => config.model = Some(required_next(args, "--model")?),
+            "--node-id" => config.node_id = Some(required_next(args, "--node-id")?),
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.target.is_empty() => config.target = value.into(),
+            other => return Err(format!("unknown join argument: {other}")),
+        }
+    }
+    if config.target.is_empty() {
+        return Err("bitty join requires INVITE_OR_NAME".into());
+    }
+    Ok(config)
+}
+
+fn parse_use(args: &mut impl Iterator<Item = String>) -> Result<UseConfig, String> {
+    let mut config = UseConfig {
+        target: String::new(),
+        name: None,
+        data_dir: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" | "-n" => config.name = Some(required_next(args, "--name")?),
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            value if config.target.is_empty() => config.target = value.into(),
+            other => return Err(format!("unknown use argument: {other}")),
+        }
+    }
+    if config.target.is_empty() {
+        return Err("bitty use requires NAME_OR_INVITE".into());
+    }
+    Ok(config)
+}
+
 fn parse_cluster_config(args: &mut impl Iterator<Item = String>) -> Result<ClusterConfig, String> {
     let mut config = ClusterConfig {
         node: None,
@@ -1694,7 +1863,8 @@ fn resolve_cluster_node(
     data_dir: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !explicit.trim().is_empty() {
-        return Ok(explicit.trim().to_string());
+        let data_dir = bitty_data_dir(data_dir);
+        return resolve_cluster_alias_or_invite(&data_dir, explicit.trim());
     }
     let settings = load_settings(data_dir);
     active_cluster_target(&settings).ok_or_else(|| {
@@ -1705,6 +1875,35 @@ fn resolve_cluster_node(
     })
 }
 
+fn resolve_cluster_alias_or_invite(
+    data_dir: &PathBuf,
+    value: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if cluster_store::looks_like_invite(value) {
+        return Ok(value.to_string());
+    }
+    let store = cluster_store::ClusterStore::load(data_dir);
+    if let Some(invite) = store.get(value) {
+        return Ok(invite.to_string());
+    }
+    if value.contains("://") || value.contains(':') {
+        return Ok(value.to_string());
+    }
+    Err(format!("unknown cluster `{value}`. Use `bitty clusters` to list saved names.").into())
+}
+
+fn remember_cluster_alias(
+    data_dir: &PathBuf,
+    name: Option<&str>,
+    invite: &str,
+    replace: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut store = cluster_store::ClusterStore::load(data_dir);
+    let name = store.insert(name, invite, replace)?;
+    store.save(data_dir)?;
+    Ok(name)
+}
+
 fn remember_active_cluster(
     data_dir: &PathBuf,
     target: &str,
@@ -1713,6 +1912,26 @@ fn remember_active_cluster(
     settings.active_cluster = target.to_string();
     settings.save()?;
     Ok(())
+}
+
+fn default_model_path(data_dir: &PathBuf) -> String {
+    let settings = BittySettings::load(data_dir.clone());
+    resolve_model(&settings, &settings.default_model)
+        .map(|model| model.model_path(&settings).display().to_string())
+        .unwrap_or_else(|| {
+            settings
+                .models_dir
+                .join("bitnet-b1.58/latest/ggml-model-i2_s.gguf")
+                .display()
+                .to_string()
+        })
+}
+
+fn compact_invite(invite: &str) -> String {
+    let Some((head, _)) = invite.split_once("?token=") else {
+        return invite.to_string();
+    };
+    format!("{head}?token=...")
 }
 
 fn bitty_data_dir(configured: Option<&str>) -> PathBuf {
@@ -1881,6 +2100,10 @@ fn print_help() {
     println!("  bitty cp SOURCE DEST");
     println!("  bitty settings get|set|path");
     println!("  bitty logs [--lines N|--path|--clear]");
+    println!("  bitty invite [--name NAME] [--replace]");
+    println!("  bitty join INVITE_OR_NAME [--name NAME] [--model PATH]");
+    println!("  bitty use NAME_OR_INVITE [--name NAME]");
+    println!("  bitty clusters");
     println!("  bitty cluster status|nodes|check|invite [--node TARGET]");
     println!("  bitty node --model PATH");
     println!("  bitty node --join 'iroh://INVITE' --model PATH");
@@ -1889,7 +2112,10 @@ fn print_help() {
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
     println!();
-    println!("Bitty remembers the active cluster after `bitty node` or `bitty cluster invite`.");
+    println!(
+        "Bitty remembers the active cluster after `bitty node`, `bitty join`, or `bitty invite`."
+    );
+    println!("Cluster names are local aliases. A reused name must match the same invite unless --replace is set.");
     println!("Use `--local` on `bitty run` to force local-only generation.");
 }
 
@@ -2091,6 +2317,48 @@ mod tests {
         assert!(matches!(
             Cli::parse(vec!["cluster".into(), "invite".into()]).unwrap(),
             CliCommand::Cluster(ClusterCommand::Invite(DataDirConfig { .. }))
+        ));
+    }
+
+    #[test]
+    fn parses_simple_cluster_alias_commands() {
+        assert!(matches!(
+            Cli::parse(vec![
+                "invite".into(),
+                "--name".into(),
+                "Home".into(),
+                "--replace".into()
+            ])
+            .unwrap(),
+            CliCommand::Invite(InviteConfig {
+                name: Some(_),
+                replace: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(vec![
+                "join".into(),
+                "iroh://abc?token=secret".into(),
+                "--name".into(),
+                "home".into(),
+                "--model".into(),
+                "/m.gguf".into()
+            ])
+            .unwrap(),
+            CliCommand::Join(JoinConfig {
+                name: Some(_),
+                model: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["use".into(), "home".into()]).unwrap(),
+            CliCommand::Use(UseConfig { target, .. }) if target == "home"
+        ));
+        assert!(matches!(
+            Cli::parse(vec!["clusters".into()]).unwrap(),
+            CliCommand::Clusters(DataDirConfig { .. })
         ));
     }
 
