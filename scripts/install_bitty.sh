@@ -323,6 +323,8 @@ In another terminal, use the cluster:
 The node stores a stable Iroh identity and active cluster in ~/.bitty.
 It prints an iroh:// invite for other PCs. You can print it again with:
   $BIN_DIR/bitty cluster invite
+
+Keep bitty node running while other machines join and run requests.
 EOF
     ;;
   join)

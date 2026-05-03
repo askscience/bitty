@@ -181,6 +181,18 @@ pub fn iroh_uri(endpoint_id: impl std::fmt::Display, token: &str) -> String {
 }
 
 pub fn iroh_uri_for_addr(endpoint_addr: &EndpointAddr, token: &str) -> String {
+    iroh_uri_for_addr_options(endpoint_addr, token, true)
+}
+
+pub fn iroh_uri_for_relay_addr(endpoint_addr: &EndpointAddr, token: &str) -> String {
+    iroh_uri_for_addr_options(endpoint_addr, token, false)
+}
+
+fn iroh_uri_for_addr_options(
+    endpoint_addr: &EndpointAddr,
+    token: &str,
+    include_direct: bool,
+) -> String {
     let mut params = Vec::new();
     if !token.is_empty() {
         params.push(format!("token={token}"));
@@ -188,9 +200,11 @@ pub fn iroh_uri_for_addr(endpoint_addr: &EndpointAddr, token: &str) -> String {
     for relay in endpoint_addr.relay_urls() {
         params.push(format!("relay={relay}"));
     }
-    for addr in endpoint_addr.ip_addrs() {
-        if !addr.ip().is_unspecified() {
-            params.push(format!("addr={addr}"));
+    if include_direct {
+        for addr in endpoint_addr.ip_addrs() {
+            if !addr.ip().is_unspecified() {
+                params.push(format!("addr={addr}"));
+            }
         }
     }
     if params.is_empty() {

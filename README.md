@@ -293,6 +293,7 @@ bitty cluster invite
 layer assignments. `cluster nodes` focuses on node/layer placement. `cluster
 check` exits with an error when the cluster is not ready. `cluster invite`
 prints the local Iroh invite string for sharing with another Bitty node.
+Keep `bitty node` running while other machines join and run requests.
 Pass `--node TARGET` only when you want to inspect a cluster that is not saved
 as the active cluster.
 
@@ -516,6 +517,9 @@ You can also print the current local Iroh invite:
 ```bash
 bitty cluster invite
 ```
+
+Keep the first `bitty node` process running. `bitty cluster invite` is only for
+printing the invite; it is not the cluster runtime.
 
 Join another machine:
 

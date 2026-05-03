@@ -656,9 +656,14 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
         }
         ClusterCommand::Invite(config) => {
             let data_dir = bitty_data_dir(config.data_dir.as_deref());
-            let iroh_node = start_iroh_node(&data_dir).await?;
             let token = load_or_create_cluster_token(&data_dir);
-            let invite = iroh_transport::iroh_uri_for_addr(&iroh_node.endpoint.addr(), &token);
+            let settings = BittySettings::load(data_dir.clone());
+            let invite = if let Some(saved) = active_cluster_target(&settings) {
+                relay_only_invite(&saved).unwrap_or(saved)
+            } else {
+                let iroh_node = start_iroh_node(&data_dir).await?;
+                iroh_transport::iroh_uri_for_relay_addr(&iroh_node.endpoint.addr(), &token)
+            };
             remember_active_cluster(&data_dir, &invite)?;
             println!("{invite}");
             println!("Share this invite with another Bitty node:");
@@ -666,6 +671,7 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
                 "bitty node --join '{}' --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf",
                 invite
             );
+            println!("Keep `bitty node` running while other machines join.");
         }
     }
     Ok(())
@@ -794,10 +800,9 @@ async fn register_and_heartbeat(
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
     if let Some(target) = iroh_transport::parse_iroh_target(&node) {
-        let data_dir = bitty_data_dir(config.data_dir.as_deref());
-        let iroh_node = start_iroh_node(&data_dir).await?;
+        let endpoint = start_iroh_client().await?;
         let client = IrohSchedulerClient {
-            endpoint: iroh_node.endpoint,
+            endpoint,
             remote: target.endpoint_addr,
             token: target.token.unwrap_or_default(),
         };
@@ -912,10 +917,9 @@ async fn fetch_cluster_status(
 ) -> Result<ClusterStatusResponse, Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(node.unwrap_or(""), data_dir)?;
     let status = if let Some(target) = iroh_transport::parse_iroh_target(&node) {
-        let data_dir = bitty_data_dir(data_dir);
-        let iroh_node = start_iroh_node(&data_dir).await?;
+        let endpoint = start_iroh_client().await?;
         let client = IrohSchedulerClient {
-            endpoint: iroh_node.endpoint,
+            endpoint,
             remote: target.endpoint_addr,
             token: target.token.unwrap_or_default(),
         };
@@ -1403,6 +1407,19 @@ async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::er
     })
 }
 
+async fn start_iroh_client() -> Result<Endpoint, Box<dyn std::error::Error>> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::generate())
+        .alpns(vec![
+            BITTY_SCHEDULER_ALPN.to_vec(),
+            BITTY_WORKER_ALPN.to_vec(),
+        ])
+        .bind()
+        .await?;
+    let _ = timeout(Duration::from_secs(10), endpoint.online()).await;
+    Ok(endpoint)
+}
+
 async fn handle_iroh_request(
     incoming: iroh::endpoint::Incoming,
     coordinator: Option<NetworkCoordinator>,
@@ -1578,6 +1595,14 @@ fn token_from_join(join: Option<&str>) -> Option<String> {
 fn active_cluster_target(settings: &BittySettings) -> Option<String> {
     let target = settings.active_cluster.trim();
     (!target.is_empty()).then(|| target.to_string())
+}
+
+fn relay_only_invite(value: &str) -> Option<String> {
+    let target = iroh_transport::parse_iroh_target(value)?;
+    Some(iroh_transport::iroh_uri_for_relay_addr(
+        &target.endpoint_addr,
+        target.token.as_deref().unwrap_or_default(),
+    ))
 }
 
 fn resolve_cluster_node(
