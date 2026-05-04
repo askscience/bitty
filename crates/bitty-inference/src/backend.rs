@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+// Registration wire id for experimental / placeholder executors lives in
+// `bitty_protocol::validate_register_worker` (`inference_backend_id: "stub"` ↔
+// `StubLayerExecutor` in `crate::executor`).
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelBackendKind {
     ExternalBitnetCpp,

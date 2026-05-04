@@ -1,0 +1,15 @@
+# Optional: run `cargo bench` without blocking every PR.
+name: Benches
+
+on:
+  workflow_dispatch:
+
+jobs:
+  criterion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run bitty-protocol benches
+        run: cargo bench -p bitty-protocol --bench logits_wire

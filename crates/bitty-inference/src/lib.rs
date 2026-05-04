@@ -7,6 +7,7 @@ pub mod tiny_lm;
 pub use backend::{BackendCapability, BackendDecision, ModelBackendKind};
 pub use executor::{
     DraftExecutor, ExecutorError, FakeLayerExecutor, LayerExecutor, LowBitReferenceExecutor,
+    StubLayerExecutor,
 };
 pub use lifecycle::{
     BatchPolicy, DecodePipeline, InferencePhase, PrefixCacheKey, RequestLifecycle,

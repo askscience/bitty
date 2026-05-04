@@ -16,5 +16,12 @@ thiserror.workspace = true
 tonic.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
 [build-dependencies]
 tonic-build.workspace = true
+
+[[bench]]
+name = "logits_wire"
+harness = false

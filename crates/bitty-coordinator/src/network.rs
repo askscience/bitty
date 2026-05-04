@@ -1,28 +1,27 @@
 use crate::security::{request_rate_limiter, AuthMode, SharedRateLimiter};
+use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
 #[cfg(test)]
 use bitty_inference::{LayerExecutor, LowBitReferenceExecutor};
 use bitty_observability::record_halda_run;
-use bitty_protocol::iroh_transport::{
-    self, IrohFrame, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT, WORKER_CLEANUP,
-    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
-};
+use bitty_protocol::endpoint::validate_worker_endpoint_for_dial;
 use bitty_protocol::pb::coordinator_service_server::{
     CoordinatorService, CoordinatorServiceServer,
 };
-use bitty_protocol::pb::worker_service_client::WorkerServiceClient;
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, ClusterStatusRequest, ClusterStatusResponse,
     GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
     RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
     ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
 };
+use bitty_protocol::security::BITTY_TOKEN_HEADER;
+use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
 use bitty_protocol::{
     ActivationDType, ActivationTensor, HardwareProfile, Heartbeat, LayerMetadata,
     ShardManifestMessage,
 };
 use futures::stream;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::Endpoint;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -70,6 +69,9 @@ impl NetworkCoordinator {
     }
 
     pub fn with_auth_mode(mut self, auth_mode: AuthMode) -> Self {
+        if let AuthMode::PreSharedToken(token) = &auth_mode {
+            self.cluster_token = Some(token.clone());
+        }
         self.auth_mode = auth_mode;
         self
     }
@@ -88,10 +90,10 @@ impl NetworkCoordinator {
         let addr = listen_addr.parse()?;
         println!("bitty-coordinator: listening on {listen_addr}");
         self.clone().spawn_eviction_loop(Duration::from_secs(15));
-        Server::builder()
-            .add_service(CoordinatorServiceServer::new(self))
-            .serve(addr)
-            .await?;
+        let service = CoordinatorServiceServer::new(self)
+            .max_decoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES)
+            .max_encoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES);
+        Server::builder().add_service(service).serve(addr).await?;
         Ok(())
     }
 
@@ -154,9 +156,9 @@ impl NetworkCoordinator {
 
         let token = request
             .metadata()
-            .get("x-bitty-token")
+            .get(BITTY_TOKEN_HEADER)
             .and_then(|value| value.to_str().ok());
-        if self.auth_mode.accepts_token(token) {
+        if self.auth_mode.accepts(token, request.remote_addr()) {
             None
         } else {
             Some(Status::unauthenticated("missing or invalid x-bitty-token"))
@@ -368,144 +370,12 @@ impl NetworkCoordinator {
     }
 
     async fn worker_client(&self, endpoint: &str) -> Result<WorkerRpcClient, Status> {
-        if let Some(target) = bitty_protocol::iroh_transport::parse_iroh_target(endpoint) {
-            let iroh_endpoint = self
-                .iroh_endpoint
-                .clone()
-                .ok_or_else(|| Status::failed_precondition("coordinator has no iroh endpoint"))?;
-            return Ok(WorkerRpcClient::Iroh(IrohWorkerClient {
-                endpoint: iroh_endpoint,
-                endpoint_addr: target.endpoint_addr,
-                token: target
-                    .token
-                    .or_else(|| self.cluster_token.clone())
-                    .unwrap_or_default(),
-            }));
-        }
-        let client = WorkerServiceClient::connect(normalize_endpoint(endpoint))
-            .await
-            .map_err(|err| Status::unavailable(err.to_string()))?;
-        Ok(WorkerRpcClient::Tcp(client))
-    }
-}
-
-enum WorkerRpcClient {
-    Tcp(WorkerServiceClient<tonic::transport::Channel>),
-    Iroh(IrohWorkerClient),
-}
-
-impl WorkerRpcClient {
-    async fn load_shard(&mut self, request: LoadShardRequest) -> Result<(), Status> {
-        match self {
-            Self::Tcp(client) => {
-                client
-                    .load_shard(request)
-                    .await
-                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
-            }
-            Self::Iroh(client) => {
-                let _: bitty_protocol::pb::LoadShardResponse = client
-                    .request(WORKER_LOAD_SHARD, &request)
-                    .await
-                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn forward_activation(
-        &mut self,
-        activation: &ActivationTensor,
-    ) -> Result<ActivationTensor, Status> {
-        match self {
-            Self::Tcp(client) => ActivationTensor::try_from(
-                client
-                    .forward_activation(ProtoActivationTensor::from(activation))
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?
-                    .into_inner(),
-            )
-            .map_err(|err| Status::internal(err.to_string())),
-            Self::Iroh(client) => {
-                let response = client
-                    .request::<_, ProtoActivationTensor>(
-                        WORKER_FORWARD_ACTIVATION,
-                        &ProtoActivationTensor::from(activation),
-                    )
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?;
-                ActivationTensor::try_from(response)
-                    .map_err(|err| Status::internal(err.to_string()))
-            }
-        }
-    }
-
-    async fn sample_token(
-        &mut self,
-        request: SampleTokenRequest,
-    ) -> Result<ProtoTokenOutput, Status> {
-        match self {
-            Self::Tcp(client) => Ok(client
-                .sample_token(request)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .into_inner()),
-            Self::Iroh(client) => client
-                .request(WORKER_SAMPLE_TOKEN, &request)
-                .await
-                .map_err(|err| Status::internal(err.to_string())),
-        }
-    }
-
-    async fn cleanup(&mut self, request: bitty_protocol::pb::CleanupRequest) -> Result<(), Status> {
-        match self {
-            Self::Tcp(client) => {
-                let _ = client.cleanup(request).await;
-            }
-            Self::Iroh(client) => {
-                let _ = client
-                    .request::<_, bitty_protocol::pb::CleanupResponse>(WORKER_CLEANUP, &request)
-                    .await;
-            }
-        }
-        Ok(())
-    }
-}
-
-struct IrohWorkerClient {
-    endpoint: Endpoint,
-    endpoint_addr: EndpointAddr,
-    token: String,
-}
-
-impl IrohWorkerClient {
-    async fn request<M, R>(
-        &self,
-        op: u8,
-        message: &M,
-    ) -> Result<R, iroh_transport::IrohTransportError>
-    where
-        M: prost::Message,
-        R: prost::Message + Default,
-    {
-        let frame = IrohFrame::message(op, self.token.clone(), message);
-        let response = iroh_transport::request_addr(
-            &self.endpoint,
-            self.endpoint_addr.clone(),
-            BITTY_WORKER_ALPN,
-            frame,
-            DEFAULT_FRAME_LIMIT,
+        connect_worker(
+            endpoint,
+            self.iroh_endpoint.clone(),
+            self.cluster_token.clone(),
         )
-        .await?;
-        response.decode_message(op)
-    }
-}
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.into()
-    } else {
-        format!("http://{endpoint}")
+        .await
     }
 }
 
@@ -523,12 +393,18 @@ impl CoordinatorService for NetworkCoordinator {
         if let Some(status) = self.authorize_status(&request) {
             return Err(status);
         }
-        let profile = request
-            .into_inner()
+        let register = request.into_inner();
+        bitty_protocol::validate_register_worker(&register)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let profile = register
             .profile
             .ok_or_else(|| Status::invalid_argument("missing worker profile"))?;
         let profile = HardwareProfile::try_from(profile)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if !profile.worker_endpoint.is_empty() {
+            validate_worker_endpoint_for_dial(&profile.worker_endpoint)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        }
         let node_id = profile.node_id.clone();
 
         self.registry.lock().await.register(profile);
@@ -571,6 +447,8 @@ impl CoordinatorService for NetworkCoordinator {
             return Err(status);
         }
         let request = request.into_inner();
+        bitty_protocol::GenerateRequest::try_from(request.clone())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let coordinator = self.clone();
         let (sender, receiver) = mpsc::channel(8);
         tokio::spawn(async move {
@@ -683,5 +561,28 @@ mod tests {
         );
         assert_eq!(first.len(), 2);
         assert!(first.last().unwrap().finished);
+    }
+
+    #[test]
+    fn pre_shared_token_rejects_missing_metadata() {
+        let coordinator = NetworkCoordinator::new(Vec::new())
+            .with_auth_mode(AuthMode::PreSharedToken("secret".into()));
+        let request = Request::new(ClusterStatusRequest {});
+
+        let status = coordinator.authorize_status(&request).unwrap();
+
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn pre_shared_token_accepts_matching_metadata() {
+        let coordinator = NetworkCoordinator::new(Vec::new())
+            .with_auth_mode(AuthMode::PreSharedToken("secret".into()));
+        let mut request = Request::new(ClusterStatusRequest {});
+        request
+            .metadata_mut()
+            .insert(BITTY_TOKEN_HEADER, "secret".parse().unwrap());
+
+        assert!(coordinator.authorize_status(&request).is_none());
     }
 }

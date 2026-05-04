@@ -276,7 +276,7 @@ fn detect_disk_bandwidth_mbps() -> f64 {
     std::env::var("BITTY_DISK_MBPS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| match std::env::consts::OS {
+        .unwrap_or(match std::env::consts::OS {
             "macos" => 900.0,
             "linux" => 500.0,
             _ => 300.0,

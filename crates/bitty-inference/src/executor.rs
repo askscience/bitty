@@ -144,6 +144,25 @@ impl RangeScale for AssignedLayerRange {
     }
 }
 
+/// Placeholder for a second inference engine: use with `inference_backend_id: "stub"` on
+/// [`bitty_protocol::pb::RegisterWorkerRequest`] so the coordinator rejects unknown backends
+/// without coupling workers to BitNet-only types.
+#[derive(Clone, Debug, Default)]
+pub struct StubLayerExecutor;
+
+#[async_trait]
+impl LayerExecutor for StubLayerExecutor {
+    async fn execute_range(
+        &self,
+        _range: &AssignedLayerRange,
+        _activation: ActivationTensor,
+    ) -> Result<ActivationTensor, ExecutorError> {
+        Err(ExecutorError::Failed(
+            "StubLayerExecutor: second backend not implemented".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +184,20 @@ mod tests {
 
         assert_eq!(output.target_layer, 2);
         assert_eq!(output.payload, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn stub_executor_rejects_execute_range() {
+        let range = AssignedLayerRange {
+            start_layer: 0,
+            end_layer_exclusive: 1,
+            quantization: Quantization::Bit1,
+        };
+        let activation = ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
+        let err = StubLayerExecutor
+            .execute_range(&range, activation)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::Failed(_)));
     }
 }

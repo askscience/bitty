@@ -51,7 +51,7 @@ What works today:
 - Manage local settings, model profiles, and aliases.
 - Inspect local logs and cluster/node health from the `bitty` CLI.
 - Start advanced Bitty nodes that communicate over Iroh.
-- Run simulations, unit tests, and distributed control-plane smoke tests.
+- Run simulations, unit tests, and documented distributed control-plane smoke tests.
 
 Important limitations:
 
@@ -610,6 +610,33 @@ traversal or encrypted fallback. This lets machines communicate across networks
 without manually entering worker IP addresses. Use `--no-iroh` only for
 fully-local TCP-only testing.
 
+### Security Notes
+
+Network-facing coordinator and worker RPCs should use a shared cluster token.
+Iroh invites include the token in the invite URL, so treat invite strings like
+secrets and avoid pasting them into public logs or issue trackers. The CLI
+redacts token arguments from Bitty logs, but shell history and terminal scrollback
+can still contain pasted invites.
+
+The standalone TCP binaries are local-first by default: unauthenticated requests
+are accepted only from loopback/internal calls. When binding to `0.0.0.0` or
+joining over TCP from another machine, pass the same token to both sides:
+
+```bash
+cargo run -p bitty-coordinator -- \
+  --listen 0.0.0.0:50051 \
+  --model /models/ggml-model-i2_s.gguf \
+  --token "$BITTY_CLUSTER_TOKEN"
+
+cargo run -p bitty-worker -- \
+  --node-id worker-a \
+  --listen 0.0.0.0:50061 \
+  --public-endpoint worker-a.example:50061 \
+  --coordinator coordinator.example:50051 \
+  --model /models/ggml-model-i2_s.gguf \
+  --token "$BITTY_CLUSTER_TOKEN"
+```
+
 ## Development
 
 Run the full verification suite:
@@ -618,6 +645,7 @@ Run the full verification suite:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo audit
 ```
 
 Run a local Halda scheduling pass:

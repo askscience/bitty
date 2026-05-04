@@ -9,7 +9,18 @@ pub mod pb {
     tonic::include_proto!("bitty.v1");
 }
 
+pub mod cli;
+pub mod endpoint;
 pub mod iroh_transport;
+pub mod logits_codec;
+pub mod registration;
+pub mod security;
+pub mod validation;
+
+/// Wire compatibility: bump when changing registration or tensor encoding contract.
+pub const BITTY_PROTOCOL_VERSION: u32 = 1;
+
+pub use registration::validate_register_worker;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct NodeId(pub String);
@@ -425,8 +436,12 @@ pub enum ProtocolConversionError {
     UnknownQuantization(String),
     #[error("unknown compression: {0}")]
     UnknownCompression(String),
+    #[error("unknown activation dtype: {0}")]
+    UnknownDType(String),
     #[error("unknown model stage: {0}")]
     UnknownModelStage(String),
+    #[error("protocol validation failed: {0}")]
+    Validation(String),
 }
 
 impl From<&HardwareProfile> for pb::HardwareProfile {
@@ -485,7 +500,7 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
         } else {
             (profile.memory_gb * 1024.0).max(0.0) as u64
         };
-        Ok(Self {
+        let profile = Self {
             node_id: NodeId::new(profile.node_id),
             cpu_tflops: profile.cpu_tflops,
             gpu_tflops: profile.gpu_tflops,
@@ -513,12 +528,10 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             } else {
                 profile.layer_eligible
             },
-            max_layers: if profile.max_layers == 0 {
-                u32::MAX
-            } else {
-                profile.max_layers
-            },
-        })
+            max_layers: profile.max_layers,
+        };
+        validation::validate_model_path(&profile.model_path)?;
+        Ok(profile)
     }
 }
 
@@ -613,9 +626,9 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             "" | "fp16" => ActivationDType::Fp16,
             "fp8" => ActivationDType::Fp8,
             "i8" => ActivationDType::I8,
-            other => return Err(ProtocolConversionError::UnknownCompression(other.into())),
+            other => return Err(ProtocolConversionError::UnknownDType(other.into())),
         };
-        Ok(Self {
+        let activation = Self {
             request_id: activation.request_id,
             token_position: activation.token_position,
             source_layer: activation.source_layer,
@@ -625,7 +638,9 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             payload: activation.payload,
             crc32: activation.crc32,
             compression: CompressionKind::try_from(activation.compression.as_str())?,
-        })
+        };
+        validation::validate_activation_tensor(&activation)?;
+        Ok(activation)
     }
 }
 
@@ -643,15 +658,19 @@ impl From<&TokenOutput> for pb::TokenOutput {
     }
 }
 
-impl From<pb::GenerateRequest> for GenerateRequest {
-    fn from(request: pb::GenerateRequest) -> Self {
-        Self {
+impl TryFrom<pb::GenerateRequest> for GenerateRequest {
+    type Error = ProtocolConversionError;
+
+    fn try_from(request: pb::GenerateRequest) -> Result<Self, Self::Error> {
+        let request = Self {
             request_id: request.request_id,
             prompt_tokens: request.prompt_tokens,
             prompt: request.prompt,
             max_new_tokens: request.max_new_tokens,
             temperature: request.temperature,
-        }
+        };
+        validation::validate_generate_request(&request)?;
+        Ok(request)
     }
 }
 
@@ -660,20 +679,30 @@ impl From<&BitNetLogits> for pb::BitNetLogits {
         Self {
             request_id: logits.request_id.clone(),
             token_position: logits.token_position,
-            logits: logits.logits.clone(),
+            logits: Vec::new(),
             crc32: logits.crc32,
+            logits_f32_le: logits_codec::logits_f32_le_bytes(&logits.logits),
         }
     }
 }
 
-impl From<pb::BitNetLogits> for BitNetLogits {
-    fn from(logits: pb::BitNetLogits) -> Self {
-        Self {
+impl TryFrom<pb::BitNetLogits> for BitNetLogits {
+    type Error = ProtocolConversionError;
+
+    fn try_from(logits: pb::BitNetLogits) -> Result<Self, Self::Error> {
+        let vec = if !logits.logits_f32_le.is_empty() {
+            logits_codec::logits_from_f32_le_bytes(&logits.logits_f32_le)?
+        } else {
+            logits.logits
+        };
+        let logits = Self {
             request_id: logits.request_id,
             token_position: logits.token_position,
-            logits: logits.logits,
+            logits: vec,
             crc32: logits.crc32,
-        }
+        };
+        validation::validate_logits(&logits)?;
+        Ok(logits)
     }
 }
 
@@ -694,7 +723,7 @@ impl TryFrom<pb::ShardManifest> for ShardManifestMessage {
     type Error = ProtocolConversionError;
 
     fn try_from(manifest: pb::ShardManifest) -> Result<Self, Self::Error> {
-        Ok(Self {
+        let manifest = Self {
             shard_id: manifest.shard_id,
             node_id: NodeId::new(manifest.node_id),
             range: manifest
@@ -704,7 +733,9 @@ impl TryFrom<pb::ShardManifest> for ShardManifestMessage {
             byte_len: manifest.byte_len,
             sha256_hex: manifest.sha256_hex,
             path: manifest.path,
-        })
+        };
+        validation::validate_model_path(&manifest.path)?;
+        Ok(manifest)
     }
 }
 
@@ -799,5 +830,74 @@ mod tests {
         let decoded = ShardManifestMessage::try_from(proto).unwrap();
 
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn unknown_activation_dtype_reports_dtype_error() {
+        let err = ActivationTensor::try_from(pb::ActivationTensor {
+            request_id: "req".into(),
+            token_position: 0,
+            source_layer: 0,
+            target_layer: 1,
+            shape: vec![1],
+            dtype: "bf16".into(),
+            payload: Vec::new(),
+            crc32: 0,
+            compression: "none".into(),
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ProtocolConversionError::UnknownDType(value) if value == "bf16"));
+    }
+
+    #[test]
+    fn activation_payload_limit_is_enforced() {
+        let err = ActivationTensor::try_from(pb::ActivationTensor {
+            request_id: "req".into(),
+            token_position: 0,
+            source_layer: 0,
+            target_layer: 1,
+            shape: vec![1],
+            dtype: "fp16".into(),
+            payload: vec![0; validation::MAX_ACTIVATION_PAYLOAD_BYTES + 1],
+            crc32: 0,
+            compression: "none".into(),
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ProtocolConversionError::Validation(_)));
+    }
+
+    #[test]
+    fn bitnet_logits_round_trips_through_f32_le_wire() {
+        let logits = BitNetLogits::new("r", 1, vec![1.0, -2.5, f32::NAN]);
+        let proto = pb::BitNetLogits::from(&logits);
+        assert!(proto.logits.is_empty());
+        assert_eq!(proto.logits_f32_le.len(), 12);
+        let decoded = BitNetLogits::try_from(proto).unwrap();
+        assert_eq!(decoded.request_id, logits.request_id);
+        assert_eq!(decoded.token_position, logits.token_position);
+        assert_eq!(decoded.crc32, logits.crc32);
+        assert_eq!(decoded.logits.len(), logits.logits.len());
+        for (left, right) in decoded.logits.iter().zip(logits.logits.iter()) {
+            if left.is_nan() {
+                assert!(right.is_nan());
+            } else {
+                assert!((left - right).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn bitnet_logits_legacy_repeated_float_still_decodes() {
+        let proto = pb::BitNetLogits {
+            request_id: "x".into(),
+            token_position: 0,
+            logits: vec![1.0, 2.0],
+            crc32: 0,
+            logits_f32_le: Vec::new(),
+        };
+        let decoded = BitNetLogits::try_from(proto).unwrap();
+        assert_eq!(decoded.logits, vec![1.0, 2.0]);
     }
 }

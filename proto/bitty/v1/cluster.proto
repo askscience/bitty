@@ -80,8 +80,11 @@ message TokenOutput {
 message BitNetLogits {
   string request_id = 1;
   uint32 token_position = 2;
+  // Legacy path; prefer logits_f32_le when encoding (smaller on the wire for large vocabs).
   repeated float logits = 3;
   uint32 crc32 = 4;
+  // Little-endian f32 array. When non-empty, decoders must use this field instead of logits.
+  bytes logits_f32_le = 5;
 }
 
 message GenerateRequest {
@@ -98,6 +101,10 @@ message GenerateResponse {
 
 message RegisterWorkerRequest {
   HardwareProfile profile = 1;
+  // 0 = unspecified (treated as BITTY_PROTOCOL_VERSION 1 by current servers).
+  uint32 protocol_version = 2;
+  // e.g. "bitnet", "stub"; empty means default BitNet stack.
+  string inference_backend_id = 3;
 }
 
 message RegisterWorkerResponse {

@@ -6,6 +6,7 @@ pub mod scheduler;
 pub mod security;
 pub mod snapshot;
 pub mod topology;
+mod worker_client;
 
 pub use registry::{NodeHealth, Registry};
 pub use scheduler::{Halda, HaldaError, SchedulerConfig};

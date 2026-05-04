@@ -6,7 +6,10 @@ use bitty_protocol::pb::{
     CleanupResponse, HeartbeatResponse, LoadShardRequest, LoadShardResponse, SampleTokenRequest,
     TokenOutput as ProtoTokenOutput, TopologyUpdate,
 };
+use bitty_protocol::security::{AuthMode, BITTY_TOKEN_HEADER};
+use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
 use bitty_protocol::{ActivationTensor, LayerAssignment, ModelStage, NodeId, ShardManifestMessage};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -21,6 +24,7 @@ pub struct NetworkWorker<E = FakeLayerExecutor> {
     topology_epoch: Arc<Mutex<String>>,
     loaded_shard: Arc<Mutex<Option<ShardManifestMessage>>>,
     stats: RuntimeStats,
+    auth_mode: AuthMode,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -99,7 +103,13 @@ where
             topology_epoch: Arc::new(Mutex::new("worker-epoch-0".into())),
             loaded_shard: Arc::new(Mutex::new(None)),
             stats: RuntimeStats::default(),
+            auth_mode: AuthMode::InsecureLocal,
         }
+    }
+
+    pub fn with_auth_mode(mut self, auth_mode: AuthMode) -> Self {
+        self.auth_mode = auth_mode;
+        self
     }
 
     pub fn runtime_stats(&self) -> RuntimeStats {
@@ -109,11 +119,25 @@ where
     pub async fn serve(self, listen_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let addr = listen_addr.parse()?;
         println!("bitty-worker: serving activation RPCs on {listen_addr}");
-        Server::builder()
-            .add_service(WorkerServiceServer::new(self))
-            .serve(addr)
-            .await?;
+        let service = WorkerServiceServer::new(self)
+            .max_decoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES)
+            .max_encoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES);
+        Server::builder().add_service(service).serve(addr).await?;
         Ok(())
+    }
+}
+
+impl<E> NetworkWorker<E> {
+    fn authorize_status<T>(&self, request: &Request<T>) -> Option<Status> {
+        let token = request
+            .metadata()
+            .get(BITTY_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if self.auth_mode.accepts(token, request.remote_addr()) {
+            None
+        } else {
+            Some(Status::unauthenticated("missing or invalid x-bitty-token"))
+        }
     }
 }
 
@@ -126,6 +150,9 @@ where
         &self,
         request: Request<ProtoActivationTensor>,
     ) -> Result<Response<ProtoActivationTensor>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let activation = ActivationTensor::try_from(request.into_inner())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let assignment = self
@@ -167,6 +194,9 @@ where
         &self,
         request: Request<ProtoActivationTensor>,
     ) -> Result<Response<ProtoBitNetLogits>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let activation = ActivationTensor::try_from(request.into_inner())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         if !activation.verify_checksum() {
@@ -189,6 +219,9 @@ where
         &self,
         request: Request<SampleTokenRequest>,
     ) -> Result<Response<ProtoTokenOutput>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let request = request.into_inner();
         let activation = request
             .activation
@@ -235,6 +268,9 @@ where
         &self,
         request: Request<TopologyUpdate>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let update = request.into_inner();
         let assignment = update
             .assignments
@@ -257,6 +293,9 @@ where
         &self,
         request: Request<LoadShardRequest>,
     ) -> Result<Response<LoadShardResponse>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let manifest = request
             .into_inner()
             .manifest
@@ -274,6 +313,10 @@ where
                 "shard path does not exist: {}",
                 manifest.path
             )));
+        }
+        if !manifest.sha256_hex.is_empty() && !manifest.path.is_empty() {
+            verify_file_sha256(&manifest.path, &manifest.sha256_hex)
+                .map_err(ShardHashError::into_status)?;
         }
         if self.loaded_shard.lock().await.as_ref() == Some(&manifest) {
             return Ok(Response::new(LoadShardResponse {
@@ -304,10 +347,114 @@ where
         &self,
         request: Request<CleanupRequest>,
     ) -> Result<Response<CleanupResponse>, Status> {
+        if let Some(status) = self.authorize_status(&request) {
+            return Err(status);
+        }
         let request_id = request.into_inner().request_id;
         if request_id.is_empty() {
             return Err(Status::invalid_argument("missing request_id"));
         }
         Ok(Response::new(CleanupResponse { cleaned: true }))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShardHashError {
+    InvalidExpected,
+    Read(String),
+    Mismatch,
+}
+
+impl ShardHashError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::InvalidExpected => Status::invalid_argument("invalid shard sha256_hex"),
+            Self::Read(err) => Status::not_found(err),
+            Self::Mismatch => Status::failed_precondition("shard sha256 mismatch"),
+        }
+    }
+}
+
+fn verify_file_sha256(path: &str, expected: &str) -> Result<(), ShardHashError> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ShardHashError::InvalidExpected);
+    }
+    let bytes = std::fs::read(path).map_err(|err| ShardHashError::Read(err.to_string()))?;
+    let actual = Sha256::digest(&bytes);
+    let actual_hex = actual
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_hex != expected.to_ascii_lowercase() {
+        return Err(ShardHashError::Mismatch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_protocol::security::BITTY_TOKEN_HEADER;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn worker_pre_shared_token_rejects_missing_metadata() {
+        let worker = NetworkWorker::with_fake_executor("node-a")
+            .with_auth_mode(AuthMode::PreSharedToken("secret".into()));
+        let request = Request::new(CleanupRequest {
+            request_id: "req".into(),
+        });
+
+        let status = worker.authorize_status(&request).unwrap();
+
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn worker_pre_shared_token_accepts_matching_metadata() {
+        let worker = NetworkWorker::with_fake_executor("node-a")
+            .with_auth_mode(AuthMode::PreSharedToken("secret".into()));
+        let mut request = Request::new(CleanupRequest {
+            request_id: "req".into(),
+        });
+        request
+            .metadata_mut()
+            .insert(BITTY_TOKEN_HEADER, "secret".parse().unwrap());
+
+        assert!(worker.authorize_status(&request).is_none());
+    }
+
+    #[test]
+    fn verifies_matching_shard_sha256() {
+        let path = unique_temp_path();
+        std::fs::write(&path, b"weights").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"weights"));
+
+        let result = verify_file_sha256(path.to_str().unwrap(), &expected);
+
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatched_shard_sha256() {
+        let path = unique_temp_path();
+        std::fs::write(&path, b"weights").unwrap();
+
+        let result = verify_file_sha256(
+            path.to_str().unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(result.unwrap_err(), ShardHashError::Mismatch);
+    }
+
+    fn unique_temp_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bitty-worker-test-{nanos}"))
     }
 }

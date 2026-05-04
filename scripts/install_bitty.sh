@@ -12,6 +12,7 @@ LISTEN="${LISTEN:-0.0.0.0:50051}"
 WORKER_LISTEN="${WORKER_LISTEN:-}"
 PUBLIC_ENDPOINT="${PUBLIC_ENDPOINT:-}"
 LAYERS="${LAYERS:-30}"
+CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
 RUN_TESTS="${RUN_TESTS:-0}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 INSTALL_RUST="${INSTALL_RUST:-1}"
@@ -45,6 +46,7 @@ Options:
   --worker-listen HOST:PORT TCP fallback worker listen address
   --public-endpoint ADDR    TCP fallback worker address reachable by other nodes
   --layers N                Model layer count. Default: 30
+  --cluster-token TOKEN     Shared token for TCP coordinator/worker RPCs
   --run-tests               Run cargo test --workspace after build
   --debug                   Build debug binaries instead of release
   --no-system-deps          Do not auto-install native build dependencies
@@ -53,7 +55,7 @@ Options:
 
 Environment variables with the same uppercase names are also supported:
   REPO_URL, INSTALL_DIR, BIN_DIR, ROLE, MODEL_PATH, JOIN, NODE_ID, LISTEN,
-  WORKER_LISTEN, PUBLIC_ENDPOINT, LAYERS, RUN_TESTS, BUILD_PROFILE,
+  WORKER_LISTEN, PUBLIC_ENDPOINT, LAYERS, CLUSTER_TOKEN, RUN_TESTS, BUILD_PROFILE,
   INSTALL_RUST, INSTALL_SYSTEM_DEPS.
 
 Performance controls for heterogeneous clusters:
@@ -216,6 +218,7 @@ while [ "$#" -gt 0 ]; do
     --worker-listen) WORKER_LISTEN="$2"; shift 2 ;;
     --public-endpoint) PUBLIC_ENDPOINT="$2"; shift 2 ;;
     --layers) LAYERS="$2"; shift 2 ;;
+    --cluster-token|--token) CLUSTER_TOKEN="$2"; shift 2 ;;
     --run-tests) RUN_TESTS=1; shift ;;
     --debug) BUILD_PROFILE=debug; shift ;;
     --no-system-deps) INSTALL_SYSTEM_DEPS=0; shift ;;
@@ -315,6 +318,14 @@ Update an existing install later with:
   "$INSTALL_DIR/scripts/install_bitty.sh"
 
 EOF
+
+if [ -n "$CLUSTER_TOKEN" ]; then
+  cat <<EOF
+TCP cluster token:
+  export BITTY_CLUSTER_TOKEN="$CLUSTER_TOKEN"
+
+EOF
+fi
 
 case "$ROLE" in
   node)

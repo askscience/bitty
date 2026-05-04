@@ -1,11 +1,15 @@
-use bitty_coordinator::{network::NetworkCoordinator, Halda, RingTopology, SchedulerConfig};
+use bitty_coordinator::{
+    network::NetworkCoordinator, security::AuthMode, Halda, RingTopology, SchedulerConfig,
+};
+use bitty_protocol::cli::{parse_next_or_exit, required_next_or_exit};
 use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, NodeTier};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = CoordinatorConfig::from_env();
     if let Some(listen_addr) = &config.listen {
-        let coordinator = NetworkCoordinator::new(demo_layers(config.layers));
+        let coordinator =
+            NetworkCoordinator::new(demo_layers(config.layers)).with_auth_mode(config.auth_mode());
         let coordinator = if let Some(model_path) = &config.model {
             coordinator.with_model_path(model_path)
         } else {
@@ -52,6 +56,7 @@ struct CoordinatorConfig {
     layers: u32,
     listen: Option<String>,
     model: Option<String>,
+    token: Option<String>,
 }
 
 impl CoordinatorConfig {
@@ -61,15 +66,19 @@ impl CoordinatorConfig {
             layers: 16,
             listen: None,
             model: None,
+            token: None,
         };
         let mut args = std::env::args().skip(1);
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--nodes" => config.nodes = parse_next(&mut args, "--nodes"),
-                "--layers" => config.layers = parse_next(&mut args, "--layers"),
-                "--listen" => config.listen = Some(required_next(&mut args, "--listen")),
-                "--model" => config.model = Some(required_next(&mut args, "--model")),
+                "--nodes" => config.nodes = parse_next_or_exit(&mut args, "--nodes"),
+                "--layers" => config.layers = parse_next_or_exit(&mut args, "--layers"),
+                "--listen" => config.listen = Some(required_next_or_exit(&mut args, "--listen")),
+                "--model" => config.model = Some(required_next_or_exit(&mut args, "--model")),
+                "--token" | "--cluster-token" => {
+                    config.token = Some(required_next_or_exit(&mut args, "--token"))
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -83,6 +92,15 @@ impl CoordinatorConfig {
         }
 
         config
+    }
+}
+
+impl CoordinatorConfig {
+    fn auth_mode(&self) -> AuthMode {
+        self.token
+            .clone()
+            .map(AuthMode::PreSharedToken)
+            .unwrap_or(AuthMode::InsecureLocal)
     }
 }
 
@@ -142,26 +160,7 @@ fn demo_layers(count: u32) -> Vec<LayerMetadata> {
         .collect()
 }
 
-fn parse_next<T>(args: &mut impl Iterator<Item = String>, name: &str) -> T
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let value = required_next(args, name);
-    value.parse().unwrap_or_else(|err| {
-        eprintln!("invalid value for {name}: {err}");
-        std::process::exit(2);
-    })
-}
-
-fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> String {
-    args.next().unwrap_or_else(|| {
-        eprintln!("missing value for {name}");
-        std::process::exit(2);
-    })
-}
-
 fn print_help() {
-    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR] [--model PATH]");
-    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /models/ggml-model-i2_s.gguf --layers 30");
+    println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR] [--model PATH] [--token TOKEN]");
+    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /models/ggml-model-i2_s.gguf --layers 30 --token secret");
 }

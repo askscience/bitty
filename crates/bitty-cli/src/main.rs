@@ -2,12 +2,14 @@ mod cluster_store;
 mod logger;
 mod model_store;
 mod modelfile;
+mod secrets;
 mod server;
 mod settings;
 
 use bitty_bitnet_runtime::BitNetRuntime;
 use bitty_coordinator::network::NetworkCoordinator;
 use bitty_inference::BitNetLayerExecutor;
+use bitty_protocol::endpoint::normalize_endpoint;
 use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
     SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_REGISTER_WORKER,
@@ -23,7 +25,10 @@ use bitty_protocol::pb::{
     LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
     TopologyUpdate,
 };
-use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId};
+use bitty_protocol::security::{
+    constant_time_eq, validate_cluster_token, AuthMode, BITTY_TOKEN_HEADER,
+};
+use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, BITTY_PROTOCOL_VERSION};
 use bitty_worker::{
     network::{NetworkWorker, RuntimeStats},
     HardwareProfiler,
@@ -33,7 +38,7 @@ use model_store::{copy_model, installed_models, pull_model, remove_model, resolv
 use settings::BittySettings;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,7 +49,10 @@ const DEFAULT_TCP_CLUSTER: &str = "127.0.0.1:50051";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
-    logger::log_default(format!("bitty command: {}", raw_args.join(" ")));
+    logger::log_default(format!(
+        "bitty command: {}",
+        secrets::redact_secret_args(&raw_args).join(" ")
+    ));
     let result = match Cli::parse(raw_args) {
         Ok(CliCommand::Node(config)) => run_node(config).await,
         Ok(CliCommand::Run(config)) => run_model(config).await,
@@ -72,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
+        Ok(CliCommand::Clean(config)) => run_clean(config).await,
+        Ok(CliCommand::Reset(config)) => run_reset(config).await,
         Ok(CliCommand::Help) => {
             print_help();
             Ok(())
@@ -120,6 +130,8 @@ enum CliCommand {
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
+    Clean(DataDirConfig),
+    Reset(DataDirConfig),
     Help,
     Version,
 }
@@ -318,6 +330,8 @@ impl Cli {
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
+            "clean" => parse_data_dir(&mut args).map(CliCommand::Clean),
+            "reset" => parse_data_dir(&mut args).map(CliCommand::Reset),
             "-h" | "--help" | "help" => Ok(CliCommand::Help),
             "-V" | "--version" | "version" => Ok(CliCommand::Version),
             other => Err(format!("unknown command: {other}")),
@@ -335,10 +349,6 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         config.model,
         config.join.as_deref().unwrap_or("leader")
     ));
-    let executor = Arc::new(BitNetLayerExecutor::load(&config.model).await?);
-    let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor);
-    let worker_stats = worker.runtime_stats();
-
     let use_iroh = config.iroh || config.join.as_deref().is_some_and(is_iroh_join_target);
     let data_dir = bitty_data_dir(config.data_dir.as_deref());
     let iroh_node = if use_iroh {
@@ -351,6 +361,11 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         .clone()
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
+    validate_cluster_token(&cluster_token)?;
+    let executor = Arc::new(BitNetLayerExecutor::load(&config.model).await?);
+    let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
+        .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
+    let worker_stats = worker.runtime_stats();
     if let Some(join) = &config.join {
         remember_active_cluster(&data_dir, join)?;
     }
@@ -389,8 +404,9 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         resolve_scheduler_target(&join, iroh_node.as_ref(), &cluster_token).await?
     } else {
         let leader = listen_as_connect_endpoint(&config.listen);
-        let mut coordinator =
-            NetworkCoordinator::new(demo_layers(config.layers)).with_model_path(&config.model);
+        let mut coordinator = NetworkCoordinator::new(demo_layers(config.layers))
+            .with_model_path(&config.model)
+            .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         if let Some(iroh_node) = &iroh_node {
             coordinator =
                 coordinator.with_iroh_endpoint(iroh_node.endpoint.clone(), cluster_token.clone());
@@ -706,6 +722,49 @@ async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+async fn run_clean(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    assert_destructive_data_dir(&settings.data_dir)?;
+    if !confirm_yes(
+        "This removes local models, saved cluster aliases, cluster token, Iroh identity key, logs, and runtime state.\n\
+         Your config.toml is kept (API host and defaults), but the active cluster is cleared.",
+    )? {
+        println!("Aborted.");
+        return Ok(());
+    }
+    let mut settings = settings;
+    stop_background_runtime(&settings)?;
+    clean_local_state(&settings)?;
+    settings.active_cluster.clear();
+    settings.save()?;
+    println!(
+        "Cleaned Bitty data under {}. Run `bitty setup` or `bitty pull` to restore models.",
+        settings.data_dir.display()
+    );
+    Ok(())
+}
+
+async fn run_reset(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    assert_destructive_data_dir(&settings.data_dir)?;
+    if !confirm_yes(
+        "This permanently deletes the entire Bitty data directory (models, config, clusters, tokens, keys, logs).\n\
+         Afterward you get a fresh default config, as after a first install.",
+    )? {
+        println!("Aborted.");
+        return Ok(());
+    }
+    let data_dir = settings.data_dir.clone();
+    stop_background_runtime(&settings)?;
+    std::fs::remove_dir_all(&data_dir)?;
+    BittySettings::defaults(data_dir.clone()).save()?;
+    println!(
+        "Reset complete. Data directory: {}. Run `bitty setup` when you are ready.",
+        data_dir.display()
+    );
+    Ok(())
+}
+
 async fn run_create(config: CreateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
     let model = modelfile::create_profile(&settings, &config.name, &PathBuf::from(config.file))?;
@@ -962,9 +1021,14 @@ async fn register_and_heartbeat(
     match target {
         SchedulerTarget::Local(coordinator) => {
             let registration = coordinator
-                .register_worker(tonic::Request::new(RegisterWorkerRequest {
-                    profile: Some((&profile).into()),
-                }))
+                .register_worker(request_with_token(
+                    RegisterWorkerRequest {
+                        profile: Some((&profile).into()),
+                        protocol_version: BITTY_PROTOCOL_VERSION,
+                        inference_backend_id: "bitnet".into(),
+                    },
+                    cluster_token,
+                ))
                 .await?
                 .into_inner();
             println!(
@@ -976,16 +1040,19 @@ async fn register_and_heartbeat(
                 sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
                 let snapshot = worker_stats.snapshot().await;
                 let response = coordinator
-                    .heartbeat(tonic::Request::new(HeartbeatRequest {
-                        node_id: profile.node_id.0.clone(),
-                        observed_tokens_per_second: observed_tokens_per_second(
-                            &profile,
-                            snapshot.observed_tokens_per_second,
-                        ),
-                        avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
-                        activation_bytes_per_second: snapshot.activation_bytes_per_second,
-                        backend_type: profile.backend_type.clone(),
-                    }))
+                    .heartbeat(request_with_token(
+                        HeartbeatRequest {
+                            node_id: profile.node_id.0.clone(),
+                            observed_tokens_per_second: observed_tokens_per_second(
+                                &profile,
+                                snapshot.observed_tokens_per_second,
+                            ),
+                            avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                            activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                            backend_type: profile.backend_type.clone(),
+                        },
+                        cluster_token,
+                    ))
                     .await;
                 match response {
                     Ok(response) => {
@@ -1004,9 +1071,14 @@ async fn register_and_heartbeat(
             let endpoint = normalize_endpoint(leader);
             let mut client = CoordinatorServiceClient::connect(endpoint.clone()).await?;
             let registration = client
-                .register_worker(RegisterWorkerRequest {
-                    profile: Some((&profile).into()),
-                })
+                .register_worker(request_with_token(
+                    RegisterWorkerRequest {
+                        profile: Some((&profile).into()),
+                        protocol_version: BITTY_PROTOCOL_VERSION,
+                        inference_backend_id: "bitnet".into(),
+                    },
+                    cluster_token,
+                ))
                 .await?
                 .into_inner();
             println!(
@@ -1018,16 +1090,19 @@ async fn register_and_heartbeat(
                 sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
                 let snapshot = worker_stats.snapshot().await;
                 let response = client
-                    .heartbeat(HeartbeatRequest {
-                        node_id: profile.node_id.0.clone(),
-                        observed_tokens_per_second: observed_tokens_per_second(
-                            &profile,
-                            snapshot.observed_tokens_per_second,
-                        ),
-                        avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
-                        activation_bytes_per_second: snapshot.activation_bytes_per_second,
-                        backend_type: profile.backend_type.clone(),
-                    })
+                    .heartbeat(request_with_token(
+                        HeartbeatRequest {
+                            node_id: profile.node_id.0.clone(),
+                            observed_tokens_per_second: observed_tokens_per_second(
+                                &profile,
+                                snapshot.observed_tokens_per_second,
+                            ),
+                            avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                            activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                            backend_type: profile.backend_type.clone(),
+                        },
+                        cluster_token,
+                    ))
                     .await;
                 match response {
                     Ok(response) => {
@@ -1057,6 +1132,8 @@ async fn register_and_heartbeat(
                     SCHEDULER_REGISTER_WORKER,
                     &RegisterWorkerRequest {
                         profile: Some((&profile).into()),
+                        protocol_version: BITTY_PROTOCOL_VERSION,
+                        inference_backend_id: "bitnet".into(),
                     },
                 )
                 .await?;
@@ -1140,6 +1217,14 @@ fn observed_tokens_per_second(profile: &HardwareProfile, measured: f64) -> f64 {
     } else {
         profile.effective_compute_score()
     }
+}
+
+fn request_with_token<T>(message: T, token: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Ok(value) = token.parse() {
+        request.metadata_mut().insert(BITTY_TOKEN_HEADER, value);
+    }
+    request
 }
 
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1827,8 +1912,7 @@ fn parse_cluster_config(args: &mut impl Iterator<Item = String>) -> Result<Clust
 }
 
 fn required_next(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("missing value for {name}"))
+    bitty_protocol::cli::required_next(args, name)
 }
 
 fn parse_next<T>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String>
@@ -1836,17 +1920,7 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    required_next(args, name)?
-        .parse()
-        .map_err(|err| format!("invalid value for {name}: {err}"))
-}
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.into()
-    } else {
-        format!("http://{endpoint}")
-    }
+    bitty_protocol::cli::parse_next(args, name)
 }
 
 struct IrohNode {
@@ -1943,7 +2017,7 @@ async fn handle_scheduler_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
-    if frame.token != cluster_token {
+    if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
         return Err("invalid cluster token".into());
     }
     let response = match handle_scheduler_frame(frame, remote_id, coordinator, &cluster_token).await
@@ -1969,22 +2043,26 @@ async fn handle_scheduler_frame(
                 frame.decode_message(SCHEDULER_REGISTER_WORKER)?;
             if let Some(profile) = request.profile.as_mut() {
                 if profile.worker_endpoint.is_empty() {
-                    profile.worker_endpoint = iroh_transport::iroh_uri(remote_id, &cluster_token);
+                    profile.worker_endpoint = iroh_transport::iroh_uri(remote_id, cluster_token);
                 }
             }
             let response = coordinator
-                .register_worker(tonic::Request::new(request))
+                .register_worker(request_with_token(request, cluster_token))
                 .await?;
             IrohFrame::message(SCHEDULER_REGISTER_WORKER, "", &response.into_inner())
         }
         SCHEDULER_HEARTBEAT => {
             let request: HeartbeatRequest = frame.decode_message(SCHEDULER_HEARTBEAT)?;
-            let response = coordinator.heartbeat(tonic::Request::new(request)).await?;
+            let response = coordinator
+                .heartbeat(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(SCHEDULER_HEARTBEAT, "", &response.into_inner())
         }
         SCHEDULER_GENERATE => {
             let request: GenerateRequest = frame.decode_message(SCHEDULER_GENERATE)?;
-            let response = coordinator.generate(tonic::Request::new(request)).await?;
+            let response = coordinator
+                .generate(request_with_token(request, cluster_token))
+                .await?;
             let mut stream = response.into_inner();
             let mut tokens = Vec::new();
             while let Some(token) = futures::StreamExt::next(&mut stream).await {
@@ -1995,7 +2073,7 @@ async fn handle_scheduler_frame(
         SCHEDULER_CLUSTER_STATUS => {
             let request: ClusterStatusRequest = frame.decode_message(SCHEDULER_CLUSTER_STATUS)?;
             let response = coordinator
-                .cluster_status(tonic::Request::new(request))
+                .cluster_status(request_with_token(request, cluster_token))
                 .await?;
             IrohFrame::message(SCHEDULER_CLUSTER_STATUS, "", &response.into_inner())
         }
@@ -2011,10 +2089,10 @@ async fn handle_worker_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
-    if frame.token != cluster_token {
+    if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
         return Err("invalid cluster token".into());
     }
-    let response = match handle_worker_frame(frame, worker).await {
+    let response = match handle_worker_frame(frame, worker, &cluster_token).await {
         Ok(response) => response,
         Err(err) => iroh_transport::error_frame(err),
     };
@@ -2027,38 +2105,49 @@ async fn handle_worker_connection(
 async fn handle_worker_frame(
     frame: IrohFrame,
     worker: NetworkWorker<BitNetLayerExecutor>,
+    cluster_token: &str,
 ) -> Result<IrohFrame, Box<dyn std::error::Error>> {
     let response = match frame.op {
         WORKER_FORWARD_ACTIVATION => {
             let request: ProtoActivationTensor = frame.decode_message(WORKER_FORWARD_ACTIVATION)?;
             let response = worker
-                .forward_activation(tonic::Request::new(request))
+                .forward_activation(request_with_token(request, cluster_token))
                 .await?;
             IrohFrame::message(WORKER_FORWARD_ACTIVATION, "", &response.into_inner())
         }
         WORKER_FINAL_LOGITS => {
             let request: ProtoActivationTensor = frame.decode_message(WORKER_FINAL_LOGITS)?;
-            let response = worker.final_logits(tonic::Request::new(request)).await?;
+            let response = worker
+                .final_logits(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(WORKER_FINAL_LOGITS, "", &response.into_inner())
         }
         WORKER_SAMPLE_TOKEN => {
             let request: SampleTokenRequest = frame.decode_message(WORKER_SAMPLE_TOKEN)?;
-            let response = worker.sample_token(tonic::Request::new(request)).await?;
+            let response = worker
+                .sample_token(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(WORKER_SAMPLE_TOKEN, "", &response.into_inner())
         }
         WORKER_APPLY_TOPOLOGY => {
             let request: TopologyUpdate = frame.decode_message(WORKER_APPLY_TOPOLOGY)?;
-            let response = worker.apply_topology(tonic::Request::new(request)).await?;
+            let response = worker
+                .apply_topology(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(WORKER_APPLY_TOPOLOGY, "", &response.into_inner())
         }
         WORKER_LOAD_SHARD => {
             let request: LoadShardRequest = frame.decode_message(WORKER_LOAD_SHARD)?;
-            let response = worker.load_shard(tonic::Request::new(request)).await?;
+            let response = worker
+                .load_shard(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(WORKER_LOAD_SHARD, "", &response.into_inner())
         }
         WORKER_CLEANUP => {
             let request: CleanupRequest = frame.decode_message(WORKER_CLEANUP)?;
-            let response = worker.cleanup(tonic::Request::new(request)).await?;
+            let response = worker
+                .cleanup(request_with_token(request, cluster_token))
+                .await?;
             IrohFrame::message(WORKER_CLEANUP, "", &response.into_inner())
         }
         _ => return Err(format!("unknown worker op {}", frame.op).into()),
@@ -2152,7 +2241,7 @@ fn resolve_cluster_node(
 }
 
 fn resolve_cluster_alias_or_invite(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     value: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if cluster_store::looks_like_invite(value) {
@@ -2296,12 +2385,12 @@ fn print_runtime_summary(settings: &BittySettings) {
 }
 
 async fn wait_for_active_cluster(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     wait: Duration,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     loop {
-        let settings = BittySettings::load(data_dir.clone());
+        let settings = BittySettings::load(data_dir.to_path_buf());
         if let Some(target) = active_cluster_target(&settings) {
             return Ok(Some(target));
         }
@@ -2335,7 +2424,7 @@ fn model_path_for_runtime(
     Ok(path.display().to_string())
 }
 
-fn read_runtime_state(data_dir: &PathBuf) -> Option<RuntimeState> {
+fn read_runtime_state(data_dir: &Path) -> Option<RuntimeState> {
     let contents = std::fs::read_to_string(runtime_state_path(data_dir)).ok()?;
     let mut state = RuntimeState::default();
     for line in contents.lines() {
@@ -2353,7 +2442,7 @@ fn read_runtime_state(data_dir: &PathBuf) -> Option<RuntimeState> {
     (state.pid > 0).then_some(state)
 }
 
-fn write_runtime_state(data_dir: &PathBuf, state: &RuntimeState) -> std::io::Result<()> {
+fn write_runtime_state(data_dir: &Path, state: &RuntimeState) -> std::io::Result<()> {
     let contents = format!(
         "pid = {}\nmode = \"{}\"\nmodel = \"{}\"\ntarget = \"{}\"\n",
         state.pid,
@@ -2364,7 +2453,7 @@ fn write_runtime_state(data_dir: &PathBuf, state: &RuntimeState) -> std::io::Res
     std::fs::write(runtime_state_path(data_dir), contents)
 }
 
-fn runtime_state_path(data_dir: &PathBuf) -> PathBuf {
+fn runtime_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime").join("runtime.toml")
 }
 
@@ -2382,7 +2471,7 @@ fn escape_toml(value: &str) -> String {
 }
 
 fn remember_cluster_alias(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     name: Option<&str>,
     invite: &str,
     replace: bool,
@@ -2394,17 +2483,17 @@ fn remember_cluster_alias(
 }
 
 fn remember_active_cluster(
-    data_dir: &PathBuf,
+    data_dir: &Path,
     target: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut settings = BittySettings::load(data_dir.clone());
+    let mut settings = BittySettings::load(data_dir.to_path_buf());
     settings.active_cluster = target.to_string();
     settings.save()?;
     Ok(())
 }
 
-fn default_model_path(data_dir: &PathBuf) -> String {
-    let settings = BittySettings::load(data_dir.clone());
+fn default_model_path(data_dir: &Path) -> String {
+    let settings = BittySettings::load(data_dir.to_path_buf());
     resolve_model(&settings, &settings.default_model)
         .map(|model| model.model_path(&settings).display().to_string())
         .unwrap_or_else(|| {
@@ -2421,6 +2510,66 @@ fn compact_invite(invite: &str) -> String {
         return invite.to_string();
     };
     format!("{head}?token=...")
+}
+
+fn confirm_yes(details: &str) -> Result<bool, std::io::Error> {
+    println!("{details}");
+    println!();
+    println!("Type yes to confirm (anything else aborts):");
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim() == "yes")
+}
+
+fn assert_destructive_data_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path.as_os_str().is_empty() {
+        return Err("refusing empty data directory path".into());
+    }
+    if path == Path::new("/") {
+        return Err("refusing destructive operation on filesystem root".into());
+    }
+    let allowed = std::env::var("BITTY_ALLOW_ANY_DATA_DIR_RESET").map_or(false, |v| {
+        matches!(v.as_str(), "1" | "true" | "yes")
+    }) || path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".bitty");
+    if !allowed {
+        return Err(format!(
+            "refusing to modify `{}`: directory name must be `.bitty`, or set BITTY_ALLOW_ANY_DATA_DIR_RESET=1",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+fn clean_local_state(settings: &BittySettings) -> std::io::Result<()> {
+    let data_dir = &settings.data_dir;
+    remove_path_if_exists(&settings.data_dir.join("models"))?;
+    if settings.models_dir != settings.data_dir.join("models")
+        && settings.models_dir.starts_with(data_dir)
+    {
+        remove_path_if_exists(&settings.models_dir)?;
+    }
+    remove_path_if_exists(&cluster_store::path(data_dir))?;
+    remove_path_if_exists(&data_dir.join("cluster-token"))?;
+    remove_path_if_exists(&data_dir.join("iroh-secret.key"))?;
+    remove_path_if_exists(&data_dir.join("logs"))?;
+    remove_path_if_exists(&data_dir.join("state"))?;
+    remove_path_if_exists(&data_dir.join("runtime"))?;
+    Ok(())
 }
 
 fn bitty_data_dir(configured: Option<&str>) -> PathBuf {
@@ -2453,7 +2602,7 @@ fn load_or_create_cluster_token(data_dir: &PathBuf) -> String {
     let path = data_dir.join("cluster-token");
     if let Ok(value) = std::fs::read_to_string(&path) {
         let token = value.trim();
-        if !token.is_empty() {
+        if validate_cluster_token(token).is_ok() {
             return token.to_string();
         }
     }
@@ -2616,6 +2765,8 @@ fn print_help() {
     println!("  bitty generate --prompt TEXT [--node TARGET]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
+    println!("  bitty clean [--data-dir DIR]   # models + cluster state + secrets; keeps config.toml");
+    println!("  bitty reset [--data-dir DIR]   # delete entire data dir; fresh default config");
     println!("  bitty version");
     println!();
     println!("Simple flow: `bitty setup`, then `bitty share home` or `bitty connect INVITE --name home`.");
@@ -2627,6 +2778,20 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_clean_and_reset() {
+        let clean = Cli::parse(vec!["clean".into(), "--data-dir".into(), "/tmp/.bitty".into()]).unwrap();
+        match clean {
+            CliCommand::Clean(cfg) => assert_eq!(cfg.data_dir.as_deref(), Some("/tmp/.bitty")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let reset = Cli::parse(vec!["reset".into()]).unwrap();
+        match reset {
+            CliCommand::Reset(cfg) => assert!(cfg.data_dir.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 
     #[test]
     fn parses_bootstrap_node() {
