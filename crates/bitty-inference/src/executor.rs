@@ -18,6 +18,11 @@ pub trait LayerExecutor: Send + Sync {
         activation: ActivationTensor,
     ) -> Result<ActivationTensor, ExecutorError>;
 
+    /// UTF-8 fragment for one sampled token id (cluster streaming). Override on real models.
+    async fn decode_token_text(&self, token_id: u32) -> String {
+        format!("<bitnet-rs:{token_id}>")
+    }
+
     async fn final_logits(
         &self,
         activation: ActivationTensor,

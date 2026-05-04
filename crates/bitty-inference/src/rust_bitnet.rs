@@ -166,6 +166,17 @@ impl LayerExecutor for BitNetLayerExecutor {
         Ok(output)
     }
 
+    async fn decode_token_text(&self, token_id: u32) -> String {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return format!("<bitnet-rs:{token_id}>");
+        };
+        let runtime = runtime.lock().await;
+        match runtime.tokenizer().decode_one(token_id) {
+            Ok(text) => text,
+            Err(_) => char::REPLACEMENT_CHARACTER.to_string(),
+        }
+    }
+
     async fn final_logits(
         &self,
         activation: ActivationTensor,
