@@ -285,6 +285,34 @@ bitty logs --clear
 Logs rotate automatically when `bitty.log` grows past roughly 1 MB. Bitty keeps
 up to three rotated files: `bitty.log.1`, `bitty.log.2`, and `bitty.log.3`.
 
+`bitty clean` and `bitty reset`
+
+Use these when you want a clean slate on this machine. Both stop the background
+Bitty runtime if it is running, print what they will remove, then ask you to
+type **`yes`** exactly (anything else aborts with no changes).
+
+`bitty clean [--data-dir DIR]`
+
+Removes downloaded models, `clusters.toml`, `cluster-token`, `iroh-secret.key`,
+`logs/`, `state/`, and `runtime/` under the data directory. Your **`config.toml`**
+is kept (API host, defaults, and similar), but **`active_cluster`** is cleared so
+Bitty no longer points at a saved cluster.
+
+`bitty reset [--data-dir DIR]`
+
+Deletes the **entire** Bitty data directory (including `config.toml`) and
+recreates a fresh default `config.toml`, similar to a first install.
+
+By default the data directory is `~/.bitty` (or `BITTY_DATA_DIR`). For safety,
+these commands only run when that directory is named **`.bitty`**. To reset a
+custom-named data directory, set **`BITTY_ALLOW_ANY_DATA_DIR_RESET=1`**.
+
+```bash
+bitty clean
+bitty clean --data-dir /path/to/.bitty
+bitty reset
+```
+
 `bitty cluster`
 
 Checks and inspects the distributed Bitty cluster.
