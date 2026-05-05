@@ -20,6 +20,7 @@ pub mod validation;
 /// Wire compatibility: bump when changing registration or tensor encoding contract.
 pub const BITTY_PROTOCOL_VERSION: u32 = 1;
 
+pub use logits_codec::{logits_f32_le_bytes, logits_from_f32_le_bytes};
 pub use registration::validate_register_worker;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -75,7 +76,11 @@ impl TryFrom<&str> for NodeTier {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Quantization {
+    F32,
     Fp16,
+    Q8,
+    Q6,
+    Q5,
     Q4,
     Q3,
     Q2,
@@ -85,7 +90,11 @@ pub enum Quantization {
 impl Quantization {
     pub fn bytes_per_weight(self) -> f64 {
         match self {
+            Self::F32 => 4.0,
             Self::Fp16 => 2.0,
+            Self::Q8 => 1.0,
+            Self::Q6 => 0.75,
+            Self::Q5 => 0.625,
             Self::Q4 => 0.5,
             Self::Q3 => 0.375,
             Self::Q2 => 0.25,
@@ -95,7 +104,11 @@ impl Quantization {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::F32 => "f32",
             Self::Fp16 => "fp16",
+            Self::Q8 => "q8",
+            Self::Q6 => "q6",
+            Self::Q5 => "q5",
             Self::Q4 => "q4",
             Self::Q3 => "q3",
             Self::Q2 => "q2",
@@ -109,7 +122,11 @@ impl TryFrom<&str> for Quantization {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
+            "f32" => Ok(Self::F32),
             "fp16" => Ok(Self::Fp16),
+            "q8" => Ok(Self::Q8),
+            "q6" => Ok(Self::Q6),
+            "q5" => Ok(Self::Q5),
             "q4" => Ok(Self::Q4),
             "q3" => Ok(Self::Q3),
             "q2" => Ok(Self::Q2),

@@ -13,3 +13,30 @@ memmap2.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "gguf_parsing"
+harness = false
+
+[[bench]]
+name = "metadata_extraction"
+harness = false
+
+[[bench]]
+name = "gguf_helpers"
+harness = false
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[[bench]]
+name = "activation_codec"
+harness = false
+
+[[bench]]
+name = "shard_planning"
+harness = false

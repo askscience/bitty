@@ -25,3 +25,7 @@ tonic-build.workspace = true
 [[bench]]
 name = "logits_wire"
 harness = false
+
+[[bench]]
+name = "activation_wire"
+harness = false

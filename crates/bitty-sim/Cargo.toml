@@ -13,3 +13,10 @@ bitty-protocol.workspace = true
 bitty-worker.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "cluster_simulation"
+harness = false

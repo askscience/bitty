@@ -1,3 +1,4 @@
+use bitty_protocol::Quantization;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -6,7 +7,134 @@ use std::path::Path;
 use thiserror::Error;
 
 pub const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+
+pub const GGML_TYPE_F32: u32 = 0;
+pub const GGML_TYPE_F16: u32 = 1;
+pub const GGML_TYPE_Q4_0: u32 = 2;
+pub const GGML_TYPE_Q4_1: u32 = 3;
+pub const GGML_TYPE_Q5_0: u32 = 6;
+pub const GGML_TYPE_Q5_1: u32 = 7;
+pub const GGML_TYPE_Q8_0: u32 = 8;
+pub const GGML_TYPE_Q8_1: u32 = 9;
+pub const GGML_TYPE_Q2_K: u32 = 10;
+pub const GGML_TYPE_Q3_K: u32 = 11;
+pub const GGML_TYPE_Q4_K: u32 = 12;
+pub const GGML_TYPE_Q5_K: u32 = 13;
+pub const GGML_TYPE_Q6_K: u32 = 14;
+pub const GGML_TYPE_Q8_K: u32 = 15;
+pub const GGML_TYPE_IQ2_XXS: u32 = 16;
+pub const GGML_TYPE_IQ2_XS: u32 = 17;
+pub const GGML_TYPE_IQ3_XXS: u32 = 18;
+pub const GGML_TYPE_IQ3_S: u32 = 19;
+pub const GGML_TYPE_IQ2_S: u32 = 20;
+pub const GGML_TYPE_IQ1_S: u32 = 21;
+pub const GGML_TYPE_IQ4_NL: u32 = 22;
+pub const GGML_TYPE_IQ3_M: u32 = 23;
+pub const GGML_TYPE_IQ4_XS: u32 = 24;
+pub const GGML_TYPE_I8: u32 = 25;
+pub const GGML_TYPE_I16: u32 = 26;
+pub const GGML_TYPE_I32: u32 = 27;
+pub const GGML_TYPE_I64: u32 = 28;
+pub const GGML_TYPE_F64: u32 = 29;
+pub const GGML_TYPE_IQ1_M: u32 = 30;
+pub const GGML_TYPE_BF16: u32 = 31;
+pub const GGML_TYPE_Q4_0_4_4: u32 = 32;
+pub const GGML_TYPE_Q4_0_4_8: u32 = 33;
+pub const GGML_TYPE_Q4_0_8_8: u32 = 34;
+pub const GGML_TYPE_TQ1_0: u32 = 35;
 pub const GGML_TYPE_I2_S: u32 = 36;
+pub const GGML_TYPE_TQ2_0: u32 = 37;
+
+pub fn ggml_type_name(ggml_type: u32) -> &'static str {
+    match ggml_type {
+        GGML_TYPE_F32 => "f32",
+        GGML_TYPE_F16 => "f16",
+        GGML_TYPE_Q4_0 => "q4_0",
+        GGML_TYPE_Q4_1 => "q4_1",
+        GGML_TYPE_Q5_0 => "q5_0",
+        GGML_TYPE_Q5_1 => "q5_1",
+        GGML_TYPE_Q8_0 => "q8_0",
+        GGML_TYPE_Q8_1 => "q8_1",
+        GGML_TYPE_Q2_K => "q2_k",
+        GGML_TYPE_Q3_K => "q3_k",
+        GGML_TYPE_Q4_K => "q4_k",
+        GGML_TYPE_Q5_K => "q5_k",
+        GGML_TYPE_Q6_K => "q6_k",
+        GGML_TYPE_Q8_K => "q8_k",
+        GGML_TYPE_IQ2_XXS => "iq2_xxs",
+        GGML_TYPE_IQ2_XS => "iq2_xs",
+        GGML_TYPE_IQ3_XXS => "iq3_xxs",
+        GGML_TYPE_IQ3_S => "iq3_s",
+        GGML_TYPE_IQ2_S => "iq2_s",
+        GGML_TYPE_IQ1_S => "iq1_s",
+        GGML_TYPE_IQ4_NL => "iq4_nl",
+        GGML_TYPE_IQ3_M => "iq3_m",
+        GGML_TYPE_IQ4_XS => "iq4_xs",
+        GGML_TYPE_I8 => "i8",
+        GGML_TYPE_I16 => "i16",
+        GGML_TYPE_I32 => "i32",
+        GGML_TYPE_I64 => "i64",
+        GGML_TYPE_F64 => "f64",
+        GGML_TYPE_IQ1_M => "iq1_m",
+        GGML_TYPE_BF16 => "bf16",
+        GGML_TYPE_Q4_0_4_4 => "q4_0_4_4",
+        GGML_TYPE_Q4_0_4_8 => "q4_0_4_8",
+        GGML_TYPE_Q4_0_8_8 => "q4_0_8_8",
+        GGML_TYPE_TQ1_0 => "tq1_0",
+        GGML_TYPE_I2_S => "i2_s",
+        GGML_TYPE_TQ2_0 => "tq2_0",
+        _ => "unknown",
+    }
+}
+
+pub fn bytes_per_element(ggml_type: u32) -> f64 {
+    match ggml_type {
+        GGML_TYPE_F32 | GGML_TYPE_I32 => 4.0,
+        GGML_TYPE_F16 | GGML_TYPE_BF16 | GGML_TYPE_I16 => 2.0,
+        GGML_TYPE_I8 => 1.0,
+        GGML_TYPE_I64 | GGML_TYPE_F64 => 8.0,
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K => 1.0,
+        GGML_TYPE_Q6_K => 0.84375,
+        GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q5_K => 0.6875,
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K
+        | GGML_TYPE_Q4_0_4_4 | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8 => 0.5,
+        GGML_TYPE_Q3_K => 0.4375,
+        GGML_TYPE_Q2_K => 0.3125,
+        GGML_TYPE_I2_S | GGML_TYPE_TQ2_0 => 0.125,
+        GGML_TYPE_IQ1_S | GGML_TYPE_IQ1_M | GGML_TYPE_TQ1_0 => 0.15625,
+        GGML_TYPE_IQ2_XXS => 0.28125,
+        GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S => 0.3125,
+        GGML_TYPE_IQ3_XXS => 0.375,
+        GGML_TYPE_IQ3_S | GGML_TYPE_IQ3_M => 0.4375,
+        GGML_TYPE_IQ4_NL | GGML_TYPE_IQ4_XS => 0.5,
+        _ => 2.0,
+    }
+}
+
+pub fn quantization_from_ggml_type(ggml_type: u32) -> Quantization {
+    match ggml_type {
+        GGML_TYPE_F32 => Quantization::F32,
+        GGML_TYPE_F16 | GGML_TYPE_BF16 => Quantization::Fp16,
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K => Quantization::Q8,
+        GGML_TYPE_Q6_K => Quantization::Q6,
+        GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q5_K => Quantization::Q5,
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K
+        | GGML_TYPE_Q4_0_4_4 | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8
+        | GGML_TYPE_IQ4_NL | GGML_TYPE_IQ4_XS => Quantization::Q4,
+        GGML_TYPE_Q3_K | GGML_TYPE_IQ3_XXS | GGML_TYPE_IQ3_S | GGML_TYPE_IQ3_M => {
+            Quantization::Q3
+        }
+        GGML_TYPE_Q2_K | GGML_TYPE_IQ2_XXS | GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S => {
+            Quantization::Q2
+        }
+        GGML_TYPE_I2_S
+        | GGML_TYPE_TQ1_0
+        | GGML_TYPE_TQ2_0
+        | GGML_TYPE_IQ1_S
+        | GGML_TYPE_IQ1_M => Quantization::Bit1,
+        _ => Quantization::Fp16,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GgufFileMetadata {

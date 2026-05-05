@@ -21,3 +21,10 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "profiling"
+harness = false

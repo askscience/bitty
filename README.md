@@ -1,10 +1,12 @@
 # Bitty
 
-Bitty is an experimental Rust project for testing distributed inference with
-BitNet-style 1-bit models over heterogeneous peer networks.
+Bitty is an experimental Rust project for testing distributed inference over
+heterogeneous peer networks with GGUF models. It supports BitNet-style 1-bit
+models and is expanding toward all GGUF model architectures (Llama, Mistral,
+Phi, Qwen, Gemma, and more).
 
 This project is **in development**. It is useful for testing, research, and
-iterating on distributed BitNet runtime ideas. It is not yet a polished
+iterating on distributed inference runtime ideas. It is not yet a polished
 production inference server, and APIs or commands may still change.
 
 Install from GitHub:
@@ -34,10 +36,13 @@ Bitty provides:
 - A local model cache under `~/.bitty/models`.
 - A settings file under `~/.bitty/config.toml`.
 - Persistent logs under `~/.bitty/logs/bitty.log` with simple rotation.
-- A Rust BitNet runtime path for Microsoft's `BitNet-b1.58-2B-4T` GGUF model.
+- A Rust BitNet runtime for Microsoft's `BitNet-b1.58-2B-4T` GGUF model.
+- Architecture detection for all GGUF models (Llama, Mistral, Phi, Qwen2, Gemma, Falcon, StableLM, DeepSeek, and more).
+- Automatic quantization detection and classification from GGUF tensor types.
 - An Iroh-based peer transport for encrypted peer-to-peer node communication.
 - Experimental scheduler/worker internals for distributed layer execution.
 - A simple HTTP API on `127.0.0.1:11435` for Ollama-style and OpenAI-compatible clients.
+- Comprehensive Criterion benchmarks for GGUF parsing, metadata extraction, serialization, scheduling, and cluster simulation.
 
 ## Current Status
 
@@ -45,6 +50,7 @@ What works today:
 
 - Install Bitty from source with one script.
 - Pull the known BitNet GGUF model into the local Bitty model cache.
+- Run any local GGUF file by path — Bitty auto-detects architecture, quantization, layer count, and metadata.
 - Start and stop a background Bitty runtime with simple commands.
 - Run prompts with `bitty run MODEL`; if a cluster is active, Bitty uses it by default.
 - Start an API server with `bitty serve`.
@@ -56,8 +62,8 @@ What works today:
 Important limitations:
 
 - Bitty is still a development/test app.
-- The main supported real model path is currently BitNet b1.58 GGUF.
-- Normal GGUF models are not broadly supported yet.
+- The main end-to-end inference runtime currently supports BitNet b1.58 GGUF.
+- Metadata extraction and architecture detection work for all GGUF models; full inference for non-BitNet architectures is in progress.
 - The distributed runtime is experimental and should be tested before relying on it.
 - The HTTP API is a compatibility layer, not a full Ollama replacement yet.
 
@@ -139,6 +145,12 @@ bitty run bitnet-b1.58 "Explain 1-bit inference in simple words"
 
 Bitty keeps the local scheduler/worker runtime in the background. Use `bitty ps`
 to check it and `bitty stop` to stop it.
+
+Run any local GGUF file directly — Bitty auto-detects the architecture:
+
+```bash
+bitty run /path/to/any-model.gguf "Hello"
+```
 
 Start interactive chat:
 
@@ -402,11 +414,46 @@ For the default model, the local file is normally:
 ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
 ```
 
-You can also run with an explicit local GGUF path:
+### Running Any GGUF Model
+
+Bitty auto-detects model architecture, quantization, layer count, and metadata
+from any GGUF file. Supported architectures include:
+
+- **Llama** (Llama 2, Llama 3, Llama 3.1)
+- **Mistral** (Mistral 7B, Mixtral)
+- **Phi** (Phi-3, Phi-3.5)
+- **Qwen2** (Qwen2, Qwen2.5)
+- **Gemma** (Gemma 1, Gemma 2)
+- **Falcon**, **StableLM**, **DeepSeek**, **Mamba**
+- **BitNet** (b1.58, OneBit)
+
+Run with an explicit local GGUF path:
 
 ```bash
-bitty run /path/to/ggml-model-i2_s.gguf "Hello"
+bitty run /path/to/model.gguf "Hello"
+bitty run /path/to/Llama-3.2-1B-Instruct-Q4_K_M.gguf "Write a haiku"
 ```
+
+Bitty reads `general.architecture` from the GGUF header, extracts all metadata
+(hidden size, attention heads, vocab size, context length, ROPE dimensions), and
+classifies the quantization level from tensor types (F32 through IQ2_XXS).
+
+### Built-in Registry
+
+The registry supports standard fields:
+
+```toml
+[[model]]
+name = "my-model"
+backend = "bitnet-i2s"
+quantization = "q4_k"
+filename = "model-q4_k.gguf"
+layers = 32
+url = "https://huggingface.co/org/model-gguf/resolve/main/model-q4_k.gguf"
+source = "org/model-gguf"
+```
+
+Add entries to `models/registry.toml` to make models pullable by name.
 
 ## Settings
 
@@ -665,9 +712,56 @@ cargo run -p bitty-worker -- \
   --token "$BITTY_CLUSTER_TOKEN"
 ```
 
-## Development
+## Benchmarks
 
-Run the full verification suite:
+Bitty has comprehensive Criterion micro-benchmarks covering every hot path in the
+codebase. Run all benchmarks:
+
+```bash
+cargo bench --workspace
+```
+
+Run a specific benchmark group:
+
+```bash
+# GGUF parsing — byte-level parsing at 2/30/80 layers, 100–1000 tensors, variable metadata
+cargo bench -p bitty-model --bench gguf_parsing
+
+# Metadata extraction — architecture classification (14 archs), ModelMetadata::from_gguf at scale
+cargo bench -p bitty-model --bench metadata_extraction
+
+# Low-level helpers — layer_id_from_tensor_name, ggml_type_name, bytes_per_element, i2_s decode
+cargo bench -p bitty-model --bench gguf_helpers
+
+# Tensor operations — packed_len_for all 9 quantizations, validate_len
+cargo bench -p bitty-model --bench tensor_ops
+
+# Activation codecs — FP8, sparse topk, raw encode/decode at 4KB–1MB, roundtrip
+cargo bench -p bitty-model --bench activation_codec
+
+# Shard planning — shard_plan for 1/4/8 nodes × 4/30/80 layers, layer_metadata scaling
+cargo bench -p bitty-model --bench shard_planning
+
+# Protocol wire format — logits encoding, CRC32 checksum (4KB–1MB), activation proto roundtrip
+cargo bench -p bitty-protocol --bench logits_wire
+cargo bench -p bitty-protocol --bench activation_wire
+
+# Inference executor — FakeLayerExecutor forward throughput, logits, dispatch overhead
+cargo bench -p bitty-inference --bench ring_execution
+
+# Scheduler — Halda::assign scaling with 4–256 nodes × 30–120 layers, compute score ranking
+cargo bench -p bitty-coordinator --bench scheduling
+
+# Cluster simulation — SimulatedCluster::build (4/8/16 nodes), token streaming throughput
+cargo bench -p bitty-sim --bench cluster_simulation
+
+# Worker profiling — HardwareProfiler wall-clock time, compute score, memory estimation
+cargo bench -p bitty-worker --bench profiling
+```
+
+All benchmarks use `criterion = "0.5"` with `harness = false`. Results are
+written to `target/criterion/` with HTML reports. CI runs all 12 benchmarks via
+`.github/workflows/benches.yml` (manual trigger).
 
 ```bash
 cargo fmt --all -- --check
@@ -748,11 +842,11 @@ bitty cluster check
 ## Workspace Layout
 
 - `bitty-cli`: user-facing `bitty` binary.
-- `bitty-protocol`: shared protobuf messages, domain types, and Iroh framing.
+- `bitty-protocol`: shared protobuf messages, domain types, CRC32 checksums, and Iroh framing.
 - `bitty-coordinator`: worker registry, Halda scheduling, topology, routing, and snapshots.
 - `bitty-worker`: profiling, shard lifecycle, ring execution, keepalive, and worker metrics.
 - `bitty-bitnet-runtime`: Rust BitNet split runtime for loading, layer ranges, KV cache, logits, and sampling.
-- `bitty-model`: low-bit shard and activation codec primitives.
+- `bitty-model`: GGUF parsing, architecture detection, model metadata extraction, low-bit shard primitives, and activation codecs (FP8, sparse topk, delta).
 - `bitty-inference`: executor traits and request lifecycle orchestration.
 - `bitty-sim`: deterministic in-process cluster simulation.
 - `bitty-observability`: metrics and tracing helpers.

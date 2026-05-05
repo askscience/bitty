@@ -20,7 +20,11 @@ pub struct LowBitTensor {
 impl LowBitTensor {
     pub fn packed_len_for(elements: usize, quantization: Quantization) -> usize {
         match quantization {
+            Quantization::F32 => elements * 4,
             Quantization::Fp16 => elements * 2,
+            Quantization::Q8 => elements,
+            Quantization::Q6 => (elements * 6).div_ceil(8),
+            Quantization::Q5 => (elements * 5).div_ceil(8),
             Quantization::Q4 => elements.div_ceil(2),
             Quantization::Q3 => (elements * 3).div_ceil(8),
             Quantization::Q2 => elements.div_ceil(4),

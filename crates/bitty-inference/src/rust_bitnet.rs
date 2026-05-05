@@ -256,11 +256,17 @@ mod tests {
 
     fn metadata() -> BitNetModelMetadata {
         BitNetModelMetadata {
-            family: BitNetModelFamily::BitNetB158,
+            architecture: BitNetModelFamily::BitNetB158,
             layer_count: 2,
             hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
             activation_bytes: 8,
             quantization: Quantization::Bit1,
+            vocab_size: 32000,
+            max_seq_len: 2048,
+            rope_dimension_count: 4,
             tokenizer_path: None,
             tensors: vec![
                 BitNetTensorMetadata {

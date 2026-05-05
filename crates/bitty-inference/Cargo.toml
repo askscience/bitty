@@ -20,9 +20,16 @@ thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
 [features]
 default = []
 oxbitnet-backend = ["dep:futures", "dep:oxbitnet"]
+
+[[bench]]
+name = "ring_execution"
+harness = false
 
 [[bin]]
 name = "bitty-tiny-lm"
