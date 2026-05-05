@@ -340,8 +340,9 @@ impl Cli {
 }
 
 async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
     if config.node_id.is_empty() {
-        config.node_id = default_node_id();
+        config.node_id = load_or_generate_node_id(&data_dir);
     }
     logger::log_default(format!(
         "starting node id={} model={} join={}",
@@ -350,7 +351,6 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         config.join.as_deref().unwrap_or("leader")
     ));
     let use_iroh = config.iroh || config.join.as_deref().is_some_and(is_iroh_join_target);
-    let data_dir = bitty_data_dir(config.data_dir.as_deref());
     let iroh_node = if use_iroh {
         Some(start_iroh_node(&data_dir).await?)
     } else {
@@ -911,6 +911,8 @@ async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> 
     let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
     remember_active_cluster(&data_dir, &invite)?;
     println!("using cluster `{name}`");
+    let settings = BittySettings::load(data_dir.clone());
+    let _ = stop_background_runtime(&settings);
     run_node(NodeConfig {
         model: config
             .model
@@ -2272,7 +2274,15 @@ async fn ensure_background_runtime(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(state) = read_runtime_state(&settings.data_dir) {
         if is_pid_running(state.pid) {
-            return Ok(());
+            if let Some(ref new_join) = join_override {
+                if state.target != *new_join {
+                    stop_background_runtime(settings)?;
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
         }
     }
 
@@ -2694,6 +2704,23 @@ fn public_endpoint_from_listen(listen: &str) -> String {
     } else {
         listen.into()
     }
+}
+
+fn node_id_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("node-id")
+}
+
+fn load_or_generate_node_id(data_dir: &Path) -> String {
+    let path = node_id_path(data_dir);
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = default_node_id();
+    let _ = std::fs::write(&path, &id);
+    id
 }
 
 fn default_node_id() -> String {
