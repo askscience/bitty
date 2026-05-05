@@ -14,9 +14,9 @@ use bitty_inference::BitNetLayerExecutor;
 use bitty_protocol::endpoint::normalize_endpoint;
 use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
-    SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_REGISTER_WORKER,
-    WORKER_APPLY_TOPOLOGY, WORKER_CLEANUP, WORKER_FINAL_LOGITS, WORKER_FORWARD_ACTIVATION,
-    WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
+    SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_LIST_MODELS,
+    SCHEDULER_REGISTER_WORKER, WORKER_APPLY_TOPOLOGY, WORKER_CLEANUP, WORKER_FINAL_LOGITS,
+    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
 };
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
 use bitty_protocol::pb::coordinator_service_server::CoordinatorService;
@@ -24,8 +24,8 @@ use bitty_protocol::pb::worker_service_server::WorkerService;
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, CleanupRequest, ClusterStatusRequest,
     ClusterStatusResponse, GenerateRequest, GenerateResponse, HeartbeatRequest, HeartbeatResponse,
-    LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
-    TopologyUpdate,
+    ListModelsRequest, ListModelsResponse, LoadShardRequest, RegisterWorkerRequest,
+    RegisterWorkerResponse, SampleTokenRequest, TopologyUpdate,
 };
 use bitty_protocol::security::{
     constant_time_eq, validate_cluster_token, AuthMode, BITTY_TOKEN_HEADER,
@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
+        Ok(CliCommand::Models(config)) => run_models(config).await,
         Ok(CliCommand::Clean(config)) => run_clean(config).await,
         Ok(CliCommand::Reset(config)) => run_reset(config).await,
         Ok(CliCommand::Help) => {
@@ -132,6 +133,7 @@ enum CliCommand {
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
+    Models(ModelsConfig),
     Clean(DataDirConfig),
     Reset(DataDirConfig),
     Help,
@@ -151,6 +153,9 @@ struct NodeConfig {
     iroh: bool,
     data_dir: Option<String>,
     cluster_token: Option<String>,
+    visibility: String,
+    cluster_name: String,
+    cluster_description: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +181,13 @@ struct ChatConfig {
 struct StatusConfig {
     node: Option<String>,
     data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelsConfig {
+    node: Option<String>,
+    data_dir: Option<String>,
+    detail: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +277,7 @@ enum ClusterCommand {
     Check(ClusterConfig),
     Benchmark(ClusterConfig),
     Invite(DataDirConfig),
+    Models(ClusterConfig),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -332,6 +345,7 @@ impl Cli {
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
+            "models" => parse_models(&mut args).map(CliCommand::Models),
             "clean" => parse_data_dir(&mut args).map(CliCommand::Clean),
             "reset" => parse_data_dir(&mut args).map(CliCommand::Reset),
             "-h" | "--help" | "help" => Ok(CliCommand::Help),
@@ -408,7 +422,10 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         let leader = listen_as_connect_endpoint(&config.listen);
         let mut coordinator = NetworkCoordinator::new(demo_layers(config.layers))
             .with_model_path(&config.model)
-            .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
+            .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()))
+            .with_visibility(&config.visibility)
+            .with_cluster_name(&config.cluster_name)
+            .with_cluster_description(&config.cluster_description);
         if let Some(iroh_node) = &iroh_node {
             coordinator =
                 coordinator.with_iroh_endpoint(iroh_node.endpoint.clone(), cluster_token.clone());
@@ -863,6 +880,34 @@ async fn setup_cluster(settings: &BittySettings) -> Result<(), Box<dyn std::erro
             }
         }
         "s" | "share" => {
+            println!();
+            println!(
+                "  {}private ─ invite-only, requires cluster token{}",
+                D, R
+            );
+            println!(
+                "  {}public ─ anyone can browse models and cluster info{}",
+                D, R
+            );
+            println!();
+            let visibility = if prompt_bool("make cluster public?", false) {
+                "public"
+            } else {
+                "private"
+            };
+            let mut settings = settings.clone();
+            settings.cluster_mode = visibility.to_string();
+            if visibility == "public" {
+                let name = prompt_line("cluster name (leave empty to skip)");
+                if !name.is_empty() {
+                    settings.cluster_name = name;
+                }
+                let desc = prompt_line("description (leave empty to skip)");
+                if !desc.is_empty() {
+                    settings.cluster_description = desc;
+                }
+            }
+            settings.save()?;
             let _ = run_share(InviteConfig {
                 name: Some("home".into()),
                 replace: true,
@@ -1066,6 +1111,11 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
             })
             .await?;
         }
+        ClusterCommand::Models(config) => {
+            let models =
+                fetch_list_models(config.node.as_deref(), config.data_dir.as_deref()).await?;
+            print_list_models(&models);
+        }
     }
     Ok(())
 }
@@ -1102,21 +1152,24 @@ async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> 
     println!("using cluster `{name}`");
     let settings = BittySettings::load(data_dir.clone());
     let _ = stop_background_runtime(&settings);
-    run_node(NodeConfig {
-        model: config
-            .model
-            .unwrap_or_else(|| default_model_path(&data_dir)),
-        node_id: config.node_id.unwrap_or_default(),
-        listen: "0.0.0.0:50051".into(),
-        worker_listen: None,
-        public_endpoint: None,
-        join: Some(invite),
-        layers: 30,
-        heartbeat_interval_ms: 1000,
-        iroh: true,
-        data_dir: config.data_dir,
-        cluster_token: None,
-    })
+        run_node(NodeConfig {
+            model: config
+                .model
+                .unwrap_or_else(|| default_model_path(&data_dir)),
+            node_id: config.node_id.unwrap_or_default(),
+            listen: "0.0.0.0:50051".into(),
+            worker_listen: None,
+            public_endpoint: None,
+            join: Some(invite),
+            layers: 30,
+            heartbeat_interval_ms: 1000,
+            iroh: true,
+            data_dir: config.data_dir,
+            cluster_token: None,
+            visibility: "private".into(),
+            cluster_name: String::new(),
+            cluster_description: String::new(),
+        })
     .await
 }
 
@@ -1162,6 +1215,73 @@ async fn run_clusters(config: DataDirConfig) -> Result<(), Box<dyn std::error::E
         println!("  {} {}  {}", if is_active { ui::bold(name) } else { ui::dim(name) }, marker, ui::dim(&compact_invite(invite)));
     }
     Ok(())
+}
+
+async fn run_models(config: ModelsConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let response = fetch_list_models(config.node.as_deref(), config.data_dir.as_deref()).await?;
+    print_list_models(&response);
+    if config.detail {
+        let status =
+            fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
+        ui::rule();
+        print_cluster_status(status, true);
+    }
+    Ok(())
+}
+
+async fn fetch_list_models(
+    node: Option<&str>,
+    data_dir: Option<&str>,
+) -> Result<ListModelsResponse, Box<dyn std::error::Error>> {
+    let node = resolve_cluster_node(node.unwrap_or(""), data_dir)?;
+    let response = if let Some(target) = iroh_transport::parse_iroh_target(&node) {
+        let endpoint = start_iroh_client().await?;
+        let client = IrohSchedulerClient {
+            endpoint,
+            remote: target.endpoint_addr,
+            token: target.token.unwrap_or_default(),
+        };
+        client
+            .request::<_, ListModelsResponse>(
+                SCHEDULER_LIST_MODELS,
+                &ListModelsRequest { cluster_name: String::new() },
+            )
+            .await?
+    } else {
+        let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&node)).await?;
+        client
+            .list_models(ListModelsRequest { cluster_name: String::new() })
+            .await?
+            .into_inner()
+    };
+    Ok(response)
+}
+
+fn print_list_models(response: &ListModelsResponse) {
+    ui::header("bitty models", &PathBuf::from(""), &bitty_version());
+    let visibility = if response.visibility == "public" {
+        ui::green(&response.visibility)
+    } else {
+        ui::dim(&response.visibility)
+    };
+    println!("  {}  {}", ui::dim("cluster"), ui::bold(&response.cluster_name));
+    if !response.cluster_description.is_empty() {
+        println!("  {}  {}", ui::dim("description"), response.cluster_description);
+    }
+    println!("  {}  {}", ui::dim("visibility"), visibility);
+    println!("  {}  {}", ui::dim("workers"), response.active_workers);
+    let model_status = if response.model_ready { ui::ready() } else { ui::not_ready() };
+    println!("  {}  {}", ui::dim("model"), model_status);
+    if !response.model_path.is_empty() {
+        println!("  {}  {}", ui::dim("path"), ui::dim(&response.model_path));
+    }
+    println!("  {}  {}", ui::dim("layers"), response.layer_count);
+    ui::rule();
+    if response.model_ready {
+        println!();
+        println!("  run {}bitty run \"hello\"{} to generate text", ui::bold(""), ui::N);
+    }
+    println!();
 }
 
 #[derive(Clone)]
@@ -1666,6 +1786,9 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
         iroh: true,
         data_dir: None,
         cluster_token: None,
+        visibility: "private".into(),
+        cluster_name: String::new(),
+        cluster_description: String::new(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1686,6 +1809,11 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             "--cluster-token" => {
                 config.cluster_token = Some(required_next(args, "--cluster-token")?)
+            }
+            "--visibility" => config.visibility = required_next(args, "--visibility")?,
+            "--cluster-name" => config.cluster_name = required_next(args, "--cluster-name")?,
+            "--description" => {
+                config.cluster_description = required_next(args, "--description")?
             }
             "--no-iroh" => config.iroh = false,
             other => return Err(format!("unknown node argument: {other}")),
@@ -1754,6 +1882,23 @@ fn parse_status(args: &mut impl Iterator<Item = String>) -> Result<StatusConfig,
             "--node" => config.node = Some(required_next(args, "--node")?),
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown status argument: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn parse_models(args: &mut impl Iterator<Item = String>) -> Result<ModelsConfig, String> {
+    let mut config = ModelsConfig {
+        node: None,
+        data_dir: None,
+        detail: false,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--node" => config.node = Some(required_next(args, "--node")?),
+            "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            "--detail" => config.detail = true,
+            other => return Err(format!("unknown models argument: {other}")),
         }
     }
     Ok(config)
@@ -1984,6 +2129,7 @@ fn parse_cluster(args: &mut impl Iterator<Item = String>) -> Result<ClusterComma
         "check" => parse_cluster_config(args).map(ClusterCommand::Check),
         "benchmark" | "bench" => parse_cluster_config(args).map(ClusterCommand::Benchmark),
         "invite" => parse_data_dir(args).map(ClusterCommand::Invite),
+        "models" => parse_cluster_config(args).map(ClusterCommand::Models),
         other => Err(format!("unknown cluster command: {other}")),
     }
 }
@@ -2190,9 +2336,6 @@ async fn handle_scheduler_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
-    if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
-        return Err("invalid cluster token".into());
-    }
     let response = match handle_scheduler_frame(frame, remote_id, coordinator, &cluster_token).await
     {
         Ok(response) => response,
@@ -2210,6 +2353,14 @@ async fn handle_scheduler_frame(
     coordinator: NetworkCoordinator,
     cluster_token: &str,
 ) -> Result<IrohFrame, Box<dyn std::error::Error>> {
+    let is_query_op = matches!(frame.op, SCHEDULER_CLUSTER_STATUS | SCHEDULER_LIST_MODELS);
+    let is_public = coordinator.visibility() == "public";
+    let skip_token = is_query_op && is_public;
+
+    if !skip_token && !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
+        return Err("invalid cluster token".into());
+    }
+
     let response = match frame.op {
         SCHEDULER_REGISTER_WORKER => {
             let mut request: RegisterWorkerRequest =
@@ -2245,10 +2396,25 @@ async fn handle_scheduler_frame(
         }
         SCHEDULER_CLUSTER_STATUS => {
             let request: ClusterStatusRequest = frame.decode_message(SCHEDULER_CLUSTER_STATUS)?;
-            let response = coordinator
-                .cluster_status(request_with_token(request, cluster_token))
-                .await?;
+            let response = if skip_token {
+                coordinator.cluster_status(tonic::Request::new(request)).await?
+            } else {
+                coordinator
+                    .cluster_status(request_with_token(request, cluster_token))
+                    .await?
+            };
             IrohFrame::message(SCHEDULER_CLUSTER_STATUS, "", &response.into_inner())
+        }
+        SCHEDULER_LIST_MODELS => {
+            let request: ListModelsRequest = frame.decode_message(SCHEDULER_LIST_MODELS)?;
+            let response = if skip_token {
+                coordinator.list_models(tonic::Request::new(request)).await?
+            } else {
+                coordinator
+                    .list_models(request_with_token(request, cluster_token))
+                    .await?
+            };
+            IrohFrame::message(SCHEDULER_LIST_MODELS, "", &response.into_inner())
         }
         _ => return Err(format!("unknown scheduler op {}", frame.op).into()),
     };
@@ -2503,6 +2669,15 @@ async fn spawn_background_node(
         .stderr(Stdio::from(err_log));
     if let Some(join) = &join {
         command.arg("--join").arg(join);
+    }
+    command
+        .arg("--visibility")
+        .arg(&settings.cluster_mode);
+    if !settings.cluster_name.is_empty() {
+        command.arg("--cluster-name").arg(&settings.cluster_name);
+    }
+    if !settings.cluster_description.is_empty() {
+        command.arg("--description").arg(&settings.cluster_description);
     }
     let mode = if join.is_some() { "worker" } else { "leader" };
     let child = command.spawn()?;

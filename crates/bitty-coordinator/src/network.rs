@@ -10,9 +10,10 @@ use bitty_protocol::pb::coordinator_service_server::{
 };
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, ClusterStatusRequest, ClusterStatusResponse,
-    GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
-    RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
-    ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
+    GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse,
+    ListModelsRequest, ListModelsResponse, LoadShardRequest, RegisterWorkerRequest,
+    RegisterWorkerResponse, SampleTokenRequest, ShardManifest as ProtoShardManifest,
+    TokenOutput as ProtoTokenOutput,
 };
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
 use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
@@ -46,6 +47,9 @@ pub struct NetworkCoordinator {
     iroh_endpoint: Option<Endpoint>,
     cluster_token: Option<String>,
     shard_cache: Arc<Mutex<HashMap<String, ShardManifestMessage>>>,
+    cluster_name: String,
+    cluster_description: String,
+    visibility: String,
 }
 
 impl NetworkCoordinator {
@@ -60,6 +64,9 @@ impl NetworkCoordinator {
             iroh_endpoint: None,
             cluster_token: None,
             shard_cache: Arc::new(Mutex::new(HashMap::new())),
+            cluster_name: String::new(),
+            cluster_description: String::new(),
+            visibility: "private".into(),
         }
     }
 
@@ -84,6 +91,25 @@ impl NetworkCoordinator {
         self.iroh_endpoint = Some(endpoint);
         self.cluster_token = Some(cluster_token.into());
         self
+    }
+
+    pub fn with_cluster_name(mut self, name: impl Into<String>) -> Self {
+        self.cluster_name = name.into();
+        self
+    }
+
+    pub fn with_cluster_description(mut self, description: impl Into<String>) -> Self {
+        self.cluster_description = description.into();
+        self
+    }
+
+    pub fn with_visibility(mut self, visibility: impl Into<String>) -> Self {
+        self.visibility = visibility.into();
+        self
+    }
+
+    pub fn visibility(&self) -> &str {
+        &self.visibility
     }
 
     pub async fn serve(self, listen_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -496,8 +522,10 @@ impl CoordinatorService for NetworkCoordinator {
         &self,
         request: Request<ClusterStatusRequest>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
-        if let Some(status) = self.authorize_status(&request) {
-            return Err(status);
+        if self.visibility != "public" {
+            if let Some(status) = self.authorize_status(&request) {
+                return Err(status);
+            }
         }
         let assignments = self.current_assignments().await?;
         let profiles = self.registry.lock().await.profiles();
@@ -517,7 +545,39 @@ impl CoordinatorService for NetworkCoordinator {
             profiles: profiles.iter().map(Into::into).collect(),
         }))
     }
+
+    async fn list_models(
+        &self,
+        request: Request<ListModelsRequest>,
+    ) -> Result<Response<ListModelsResponse>, Status> {
+        if self.visibility != "public" {
+            if let Some(status) = self.authorize_status(&request) {
+                return Err(status);
+            }
+        }
+        let profiles = self.registry.lock().await.profiles();
+        let active_workers = profiles.len() as u32;
+        let model_path = self
+            .model_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let model_ready = !model_path.is_empty();
+        Ok(Response::new(ListModelsResponse {
+            cluster_name: self.cluster_name.clone(),
+            cluster_description: self.cluster_description.clone(),
+            visibility: self.visibility.clone(),
+            active_workers,
+            model_path,
+            model_ready,
+            model_architecture: String::new(),
+            quantization: String::new(),
+            layer_count: self.layers.len() as u32,
+            model_id: String::new(),
+        }))
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -13,6 +13,8 @@ pub struct BittySettings {
     pub default_num_ctx: u32,
     pub iroh_relays: String,
     pub cluster_mode: String,
+    pub cluster_name: String,
+    pub cluster_description: String,
     pub active_cluster: String,
 }
 
@@ -45,6 +47,8 @@ impl BittySettings {
             default_num_ctx: 2048,
             iroh_relays: "public".into(),
             cluster_mode: "private".into(),
+            cluster_name: String::new(),
+            cluster_description: String::new(),
             active_cluster: String::new(),
         }
     }
@@ -71,6 +75,8 @@ impl BittySettings {
             "default_num_ctx" => Some(self.default_num_ctx.to_string()),
             "iroh_relays" => Some(self.iroh_relays.clone()),
             "cluster_mode" => Some(self.cluster_mode.clone()),
+            "cluster_name" => Some(self.cluster_name.clone()),
+            "cluster_description" => Some(self.cluster_description.clone()),
             "active_cluster" => Some(self.active_cluster.clone()),
             _ => None,
         }
@@ -95,6 +101,8 @@ impl BittySettings {
             }
             "iroh_relays" => self.iroh_relays = value.into(),
             "cluster_mode" => self.cluster_mode = value.into(),
+            "cluster_name" => self.cluster_name = value.into(),
+            "cluster_description" => self.cluster_description = value.into(),
             "active_cluster" => self.active_cluster = value.into(),
             _ => return false,
         }
@@ -103,7 +111,7 @@ impl BittySettings {
 
     pub fn to_toml(&self) -> String {
         format!(
-            "data_dir = \"{}\"\nmodels_dir = \"{}\"\ndefault_model = \"{}\"\napi_host = \"{}\"\nauto_pull = {}\nauto_start_node = {}\ndefault_temperature = {}\ndefault_num_predict = {}\ndefault_num_ctx = {}\niroh_relays = \"{}\"\ncluster_mode = \"{}\"\nactive_cluster = \"{}\"\n",
+            "data_dir = \"{}\"\nmodels_dir = \"{}\"\ndefault_model = \"{}\"\napi_host = \"{}\"\nauto_pull = {}\nauto_start_node = {}\ndefault_temperature = {}\ndefault_num_predict = {}\ndefault_num_ctx = {}\niroh_relays = \"{}\"\ncluster_mode = \"{}\"\ncluster_name = \"{}\"\ncluster_description = \"{}\"\nactive_cluster = \"{}\"\n",
             escape(&self.data_dir.display().to_string()),
             escape(&self.models_dir.display().to_string()),
             escape(&self.default_model),
@@ -115,6 +123,8 @@ impl BittySettings {
             self.default_num_ctx,
             escape(&self.iroh_relays),
             escape(&self.cluster_mode),
+            escape(&self.cluster_name),
+            escape(&self.cluster_description),
             escape(&self.active_cluster)
         )
     }
