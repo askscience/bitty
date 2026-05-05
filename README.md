@@ -156,6 +156,13 @@ bitty run ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf "Hello"
 Bitty keeps the local scheduler/worker runtime in the background. Use `bitty ps`
 to check it and `bitty stop` to stop it.
 
+Browse a public cluster's models and metadata:
+
+```bash
+bitty models
+bitty cluster models --node iroh://...
+```
+
 Start interactive chat:
 
 ```bash
@@ -345,6 +352,8 @@ bitty stop
 bitty cluster status
 bitty cluster nodes
 bitty cluster check
+bitty cluster models
+bitty models --detail
 ```
 
 `bitty share` starts the background runtime if needed, prints the local Iroh
@@ -355,7 +364,10 @@ clusters` lists saved local names.
 
 `cluster status` prints leader, topology, worker count, model readiness, and
 layer assignments. `cluster nodes` focuses on node/layer placement. `cluster
-check` exits with an error when the cluster is not ready. Pass `--node TARGET`
+check` exits with an error when the cluster is not ready. `cluster models` and
+`bitty models` show available models and cluster metadata — unauthenticated for
+public clusters, token-required for private ones. `--detail` includes the full
+cluster status output. Pass `--node TARGET`
 only when you want to inspect a cluster that is not saved as the active cluster.
 
 Cluster names are local aliases stored under `~/.bitty/clusters.toml`. If you
@@ -547,6 +559,8 @@ Current settings include:
 - `default_num_ctx`
 - `iroh_relays`
 - `cluster_mode`
+- `cluster_name`
+- `cluster_description`
 
 ## Modelfile
 
@@ -666,6 +680,44 @@ bitty status
 `bitty use home` to switch back to it, `bitty clusters` to list saved names,
 `bitty ps` to check the background runtime, and `bitty stop` to stop it.
 
+### Public and Private Clusters
+
+When creating a cluster, you can choose between private (invite-only, the default)
+and public (anyone can browse).
+
+A **private** cluster requires the cluster token for all operations. Only nodes
+with the invite can join, query status, or list models.
+
+A **public** cluster allows unauthenticated browsing — anyone who knows the Iroh
+address can use `bitty models` or `bitty cluster status` to see what models are
+available, the cluster name and description, and how many workers are active.
+Joining, generating, and heartbeating still require the cluster token.
+
+Create a public cluster from setup:
+
+```bash
+bitty setup
+# choose "share" → "public" → enter a name and description
+bitty share home
+```
+
+Or start a public node manually:
+
+```bash
+bitty node --model /path/to/model.gguf \
+  --visibility public \
+  --cluster-name "My Cluster" \
+  --description "Public BitNet cluster"
+```
+
+Toggle the default visibility in settings:
+
+```bash
+bitty settings set cluster_mode public
+bitty settings set cluster_name "My Cluster"
+bitty settings set cluster_description "Public BitNet cluster"
+```
+
 ### Advanced Manual Nodes
 
 The advanced manual flow is still available when you want direct control over
@@ -718,6 +770,7 @@ bitty status
 bitty cluster status
 bitty cluster nodes
 bitty cluster check
+bitty models
 ```
 
 You can still override the saved target for one command:
