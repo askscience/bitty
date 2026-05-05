@@ -5,7 +5,9 @@ mod modelfile;
 mod secrets;
 mod server;
 mod settings;
+mod ui;
 
+use crate::ui::{prompt_bool, prompt_line, spinner};
 use bitty_bitnet_runtime::BitNetRuntime;
 use bitty_coordinator::network::NetworkCoordinator;
 use bitty_inference::BitNetLayerExecutor;
@@ -597,23 +599,29 @@ async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
     )?;
     let model = pull_model(&settings, &config.model)?;
     println!(
-        "pulled {} to {}",
-        model.id(),
-        model.model_path(&settings).display()
+        "  {} {}  {}",
+        ui::green("pulled"),
+        ui::bold(&model.id()),
+        ui::dim(&model.model_path(&settings).display().to_string())
     );
     Ok(())
 }
 
 async fn run_list(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
-    println!("NAME\tBACKEND\tQUANTIZATION\tPATH");
-    for model in installed_models(&settings) {
+    let models = installed_models(&settings);
+    if models.is_empty() {
+        println!("  {}no models installed{}", ui::Y, ui::N);
+        return Ok(());
+    }
+    println!("  {}  {:<20} {}  {}", ui::dim("name"), ui::dim("backend"), ui::dim("quantization"), ui::dim("path"));
+    for model in models {
         println!(
-            "{}\t{}\t{}\t{}",
-            model.id(),
-            model.backend,
+            "  {}  {:<20} {}  {}",
+            ui::bold(&model.id()),
+            ui::dim(&model.backend),
             model.quantization,
-            model.model_path(&settings).display()
+            ui::dim(&model.model_path(&settings).display().to_string())
         );
     }
     Ok(())
@@ -623,16 +631,16 @@ async fn run_show(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
     let settings = load_settings(config.data_dir.as_deref());
     let model = resolve_model(&settings, &config.model)
         .ok_or_else(|| format!("model not found: {}", config.model))?;
-    println!("name: {}", model.id());
-    println!("display_name: {}", model.display_name);
-    println!("backend: {}", model.backend);
-    println!("quantization: {}", model.quantization);
-    println!("layers: {}", model.layers);
-    println!("path: {}", model.model_path(&settings).display());
-    println!("source: {}", model.source);
-    println!("temperature: {}", model.temperature);
-    println!("num_predict: {}", model.num_predict);
-    println!("num_ctx: {}", model.num_ctx);
+    println!("  {}  {}", ui::dim("name"), ui::bold(&model.id()));
+    println!("  {}  {}", ui::dim("display"), model.display_name);
+    println!("  {}  {}", ui::dim("backend"), &model.backend);
+    println!("  {}  {}", ui::dim("quantization"), &model.quantization);
+    println!("  {}  {}", ui::dim("layers"), model.layers);
+    println!("  {}  {}", ui::dim("path"), ui::dim(&model.model_path(&settings).display().to_string()));
+    println!("  {}  {}", ui::dim("source"), &model.source);
+    println!("  {}  {}", ui::dim("temperature"), model.temperature);
+    println!("  {}  {}", ui::dim("num_predict"), model.num_predict);
+    println!("  {}  {}", ui::dim("num_ctx"), model.num_ctx);
     Ok(())
 }
 
@@ -641,9 +649,11 @@ async fn run_ps(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>>
     print_runtime_summary(&settings);
     let path = running_models_path(&settings);
     let contents = std::fs::read_to_string(path).unwrap_or_default();
-    println!("NAME\tSTATUS");
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-        println!("{line}\tloaded");
+        println!("  {}  {}{}{}", ui::bold(line), ui::G, "loaded", ui::N);
+    }
+    if contents.trim().is_empty() {
+        println!("  {}no loaded models{}", ui::Y, ui::N);
     }
     Ok(())
 }
@@ -663,7 +673,7 @@ async fn run_stop(config: StopConfig) -> Result<(), Box<dyn std::error::Error>> 
         .join("\n");
     settings::ensure_parent(&path)?;
     std::fs::write(path, next)?;
-    println!("stopped {model}");
+    println!("  {}  {}", ui::green("stopped"), ui::bold(&model));
     Ok(())
 }
 
@@ -701,8 +711,6 @@ const D: &str = "\x1b[2m";
 const B: &str = "\x1b[1m";
 const R: &str = "\x1b[0m";
 
-const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 fn setup_header(settings: &BittySettings) {
     println!();
     println!("  {}bitty setup{}  {}v{}  ·  {}{}", B, R, D, bitty_version(), settings.data_dir.display(), R);
@@ -728,49 +736,6 @@ fn setup_status(settings: &BittySettings) {
         println!("{}not configured{}", Y, R);
     }
     println!();
-}
-
-fn prompt_line(prompt: &str) -> String {
-    print!("  {}›{} {} ", C, R, prompt);
-    io::stdout().flush().ok();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line).ok();
-    line.trim().to_string()
-}
-
-fn prompt_bool(prompt: &str, default: bool) -> bool {
-    let hint = if default { "Y/n" } else { "y/N" };
-    let input = prompt_line(&format!("{} [{}]", prompt, hint));
-    match input.to_lowercase().as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default,
-    }
-}
-
-async fn with_spinner<F, T>(label: &str, f: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    let frames = BRAILLE;
-    let mut tick = 0usize;
-    let label_owned = label.to_string();
-    let handle = tokio::spawn(async move {
-        loop {
-            print!(
-                "\r  {} {} {}...{}",
-                frames[tick % frames.len()],
-                D, label_owned, R
-            );
-            io::stdout().flush().ok();
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            tick += 1;
-        }
-    });
-    let result = f.await;
-    handle.abort();
-    print!("\r{}\r", " ".repeat(label.len() + 20));
-    result
 }
 
 async fn setup_model(settings: &BittySettings) -> Result<(), Box<dyn std::error::Error>> {
@@ -907,7 +872,7 @@ async fn setup_cluster(settings: &BittySettings) -> Result<(), Box<dyn std::erro
 async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
     setup_header(&settings);
-    with_spinner("checking", async { tokio::time::sleep(Duration::from_millis(400)).await }).await;
+    spinner("checking", async { tokio::time::sleep(Duration::from_millis(400)).await }).await;
     setup_status(&settings);
 
     let model_ready = resolve_model(&settings, &settings.default_model)
@@ -945,11 +910,11 @@ async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Erro
 async fn run_clean(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
     assert_destructive_data_dir(&settings.data_dir)?;
-    if !confirm_yes(
+    if !ui::confirm_destructive(
         "This removes local models, saved cluster aliases, cluster token, Iroh identity key, logs, and runtime state.\n\
          Your config.toml is kept (API host and defaults), but the active cluster is cleared.",
-    )? {
-        println!("Aborted.");
+    ) {
+        println!("  {} {}", ui::yellow("aborted"), ui::dim("no changes"));
         return Ok(());
     }
     let mut settings = settings;
@@ -957,21 +922,19 @@ async fn run_clean(config: DataDirConfig) -> Result<(), Box<dyn std::error::Erro
     clean_local_state(&settings)?;
     settings.active_cluster.clear();
     settings.save()?;
-    println!(
-        "Cleaned Bitty data under {}. Run `bitty setup` or `bitty pull` to restore models.",
-        settings.data_dir.display()
-    );
+    println!("  {}  cleaned {}", ui::green("done"), ui::dim(&settings.data_dir.display().to_string()));
+    println!("  {}  run {}bitty setup{} or {}bitty pull{} to restore models", ui::dim("next"), ui::B, ui::N, ui::B, ui::N);
     Ok(())
 }
 
 async fn run_reset(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
     assert_destructive_data_dir(&settings.data_dir)?;
-    if !confirm_yes(
+    if !ui::confirm_destructive(
         "This permanently deletes the entire Bitty data directory (models, config, clusters, tokens, keys, logs).\n\
          Afterward you get a fresh default config, as after a first install.",
-    )? {
-        println!("Aborted.");
+    ) {
+        println!("  {} {}", ui::yellow("aborted"), ui::dim("no changes"));
         return Ok(());
     }
     let data_dir = settings.data_dir.clone();
@@ -979,16 +942,18 @@ async fn run_reset(config: DataDirConfig) -> Result<(), Box<dyn std::error::Erro
     std::fs::remove_dir_all(&data_dir)?;
     BittySettings::defaults(data_dir.clone()).save()?;
     println!(
-        "Reset complete. Data directory: {}. Run `bitty setup` when you are ready.",
-        data_dir.display()
+        "  {}  reset {}",
+        ui::green("done"),
+        ui::dim(&data_dir.display().to_string())
     );
+    println!("  {}  run {}bitty setup{} to get started", ui::dim("next"), ui::B, ui::N);
     Ok(())
 }
 
 async fn run_create(config: CreateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
     let model = modelfile::create_profile(&settings, &config.name, &PathBuf::from(config.file))?;
-    println!("created {}", model.id());
+    println!("  {}  {}", ui::green("created"), ui::bold(&model.id()));
     Ok(())
 }
 
@@ -1111,13 +1076,11 @@ async fn run_invite(config: InviteConfig) -> Result<(), Box<dyn std::error::Erro
     let invite = relay_only_invite(&invite).unwrap_or(invite);
     let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
     remember_active_cluster(&data_dir, &invite)?;
-    println!("Invite name: {name}");
-    println!("Invite:");
-    println!("  {invite}");
+    println!("  {}  {}", ui::dim("invite name"), ui::bold(&name));
+    println!("  {}", invite);
     println!();
-    println!("On another machine:");
-    println!("  bitty connect '{}' --name {name}", invite);
-    println!("Bitty is running in the background. Use `bitty stop` to stop it.");
+    println!("  {}  bitty connect '{}' --name {}{}", ui::dim("on another machine"), invite, name, ui::N);
+    println!("  {}bitty stop{} to stop the background runtime", ui::dim(""), ui::N);
     Ok(())
 }
 
@@ -1158,8 +1121,8 @@ async fn run_connect(config: JoinConfig) -> Result<(), Box<dyn std::error::Error
     let name = remember_cluster_alias(&data_dir, config.name.as_deref(), &invite, config.replace)?;
     remember_active_cluster(&data_dir, &invite)?;
     ensure_background_runtime(&settings, config.model, Some(invite)).await?;
-    println!("connected to cluster `{name}`");
-    println!("You can now run: bitty run bitnet-b1.58 \"hello\"");
+    println!("  {} cluster `{}`{}", ui::green("connected"), name, ui::N);
+    println!("  run {}bitty run bitnet-b1.58 \"hello\"{}", ui::bold(""), ui::N);
     Ok(())
 }
 
@@ -1182,14 +1145,15 @@ async fn run_clusters(config: DataDirConfig) -> Result<(), Box<dyn std::error::E
     let settings = BittySettings::load(data_dir.clone());
     let active = active_cluster_target(&settings);
     let store = cluster_store::ClusterStore::load(&data_dir);
-    println!("NAME\tACTIVE\tTARGET");
+    let has_any = store.aliases().next().is_some();
+    if !has_any {
+        println!("  {}no saved clusters{}", ui::Y, ui::N);
+        return Ok(());
+    }
     for (name, invite) in store.aliases() {
-        let marker = if Some(invite) == active.as_deref() {
-            "yes"
-        } else {
-            "no"
-        };
-        println!("{name}\t{marker}\t{}", compact_invite(invite));
+        let is_active = Some(invite) == active.as_deref();
+        let marker = if is_active { ui::green("active") } else { ui::dim("") };
+        println!("  {} {}  {}", if is_active { ui::bold(name) } else { ui::dim(name) }, marker, ui::dim(&compact_invite(invite)));
     }
     Ok(())
 }
@@ -1595,71 +1559,57 @@ async fn fetch_cluster_status(
 }
 
 fn print_cluster_status(status: ClusterStatusResponse, include_assignments: bool) {
-    println!("Bitty cluster");
-    println!("-------------");
-    println!("leader: {}", status.leader_id);
-    println!("epoch: {}", status.topology_epoch);
-    println!("workers: {}", status.active_workers);
-    println!("model ready: {}", yes_no(status.model_ready));
+    let ready = if status.model_ready { ui::ready() } else { ui::not_ready() };
+    ui::rule();
+    println!("  {}  {}", ui::dim("leader"), status.leader_id);
+    println!("  {}  {}", ui::dim("epoch"), status.topology_epoch);
+    println!("  {}  {}", ui::dim("workers"), status.active_workers);
+    println!("  {}  {}", ui::dim("model"), ready);
     if !status.model_path.is_empty() {
-        println!("model: {}", status.model_path);
+        println!("  {}  {}", ui::dim("path"), ui::dim(&status.model_path));
     }
-    println!("assignments: {}", status.assignments.len());
+    println!("  {}  {}", ui::dim("assignments"), status.assignments.len());
     if !include_assignments {
         return;
     }
     if !status.assignments.is_empty() {
         println!();
-        println!("Assignments");
     }
     for assignment in status.assignments {
-        let range = assignment.range;
-        if let Some(range) = range {
+        if let Some(range) = assignment.range {
+            let node = &assignment.node_id;
+            let next = &assignment.next_node_id;
             println!(
-                "  {} layers {}..{} stage={} next={}",
-                assignment.node_id,
-                range.start_layer,
-                range.end_layer_exclusive,
-                assignment.model_stage,
-                assignment.next_node_id
+                "  {}  layers {}..{}  {}  next:{}",
+                ui::dim(node), range.start_layer, range.end_layer_exclusive,
+                ui::dim(&assignment.model_stage), ui::dim(next)
             );
         }
     }
 }
 
 fn print_cluster_nodes(status: ClusterStatusResponse) {
-    println!("Bitty nodes");
-    println!("-----------");
-    println!("NODE\tLAYERS\tSTAGE\tNEXT");
     for assignment in status.assignments {
         if let Some(range) = assignment.range {
+            let node = &assignment.node_id;
+            let next = &assignment.next_node_id;
             println!(
-                "{}\t{}..{}\t{}\t{}",
-                assignment.node_id,
-                range.start_layer,
-                range.end_layer_exclusive,
-                assignment.model_stage,
-                assignment.next_node_id
+                "  {}  layers {}..{}  {}  next:{}",
+                ui::bold(node), range.start_layer, range.end_layer_exclusive,
+                ui::dim(&assignment.model_stage), ui::dim(next)
             );
         }
     }
 }
 
 fn print_cluster_check(status: &ClusterStatusResponse) {
-    println!("Bitty cluster check");
-    println!("-------------------");
-    println!(
-        "status: {}",
-        if status.active_workers > 0 && status.model_ready {
-            "ready"
-        } else {
-            "not ready"
-        }
-    );
-    println!("leader: {}", status.leader_id);
-    println!("workers: {}", status.active_workers);
-    println!("model ready: {}", yes_no(status.model_ready));
-    println!("assignments: {}", status.assignments.len());
+    let green = status.active_workers > 0 && status.model_ready;
+    let status_text = if green { ui::green("ready") } else { ui::yellow("not ready") };
+    println!("  {} {}", ui::dim("status"), status_text);
+    println!("  {}  {}", ui::dim("leader"), status.leader_id);
+    println!("  {}  {}", ui::dim("workers"), status.active_workers);
+    println!("  {}  {}", ui::dim("model"), if status.model_ready { ui::ready() } else { ui::not_ready() });
+    println!("  {}  {}", ui::dim("assignments"), status.assignments.len());
     if !status.profiles.is_empty() {
         println!();
         print_cluster_benchmark(status);
@@ -1667,38 +1617,21 @@ fn print_cluster_check(status: &ClusterStatusResponse) {
 }
 
 fn print_cluster_benchmark(status: &ClusterStatusResponse) {
-    println!("Hardware profile");
-    println!("----------------");
-    println!("NODE\tBACKEND\tELIGIBLE\tRAM\tVRAM\tCPU TFLOPS\tGPU TFLOPS\tRTT\tUPLINK");
+    println!("  {} {}", ui::dim("hardware"), ui::dim("profiles"));
     for profile in &status.profiles {
+        let backend = if profile.backend_type.is_empty() {
+            if profile.gpu_tflops > 0.0 { "gpu" } else { "cpu" }
+        } else {
+            profile.backend_type.as_str()
+        };
+        let eligible = if profile.layer_eligible { ui::green("yes") } else { ui::yellow("no") };
         println!(
-            "{}\t{}\t{}\t{} MB\t{} MB\t{:.2}\t{:.2}\t{:.1} ms\t{:.0} Mbps",
-            profile.node_id,
-            if profile.backend_type.is_empty() {
-                if profile.gpu_tflops > 0.0 {
-                    "gpu"
-                } else {
-                    "cpu"
-                }
-            } else {
-                profile.backend_type.as_str()
-            },
-            yes_no(profile.layer_eligible),
-            profile.ram_mb,
-            profile.vram_mb,
-            profile.cpu_tflops,
-            profile.gpu_tflops,
-            profile.network_rtt_ms,
-            profile.uplink_mbps
+            "  {}  {}  {}  {} MB  {} MB  {} TFLOPS  {} TFLOPS  {}ms  {} Mbps",
+            ui::bold(&profile.node_id), ui::dim(backend), eligible,
+            profile.ram_mb, profile.vram_mb,
+            profile.cpu_tflops, profile.gpu_tflops,
+            profile.network_rtt_ms, profile.uplink_mbps
         );
-    }
-}
-
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
     }
 }
 
@@ -2576,7 +2509,7 @@ async fn spawn_background_node(
 
 fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::error::Error>> {
     let Some(state) = read_runtime_state(&settings.data_dir) else {
-        println!("Bitty is not running.");
+        println!("  {} {}", ui::dim("runtime"), ui::yellow("not running"));
         return Ok(());
     };
     if is_pid_running(state.pid) {
@@ -2584,9 +2517,9 @@ fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::
         if !status.success() {
             return Err(format!("failed to stop Bitty runtime pid {}", state.pid).into());
         }
-        println!("stopped Bitty runtime pid {}", state.pid);
+        println!("  {} {} pid {}", ui::green("stopped"), ui::dim("runtime"), state.pid);
     } else {
-        println!("Bitty runtime pid {} was not running.", state.pid);
+        println!("  {} {} pid {} was {}", ui::yellow("stopped"), ui::dim("runtime"), state.pid, ui::dim("not running"));
     }
     let _ = std::fs::remove_file(runtime_state_path(&settings.data_dir));
     Ok(())
@@ -2594,23 +2527,24 @@ fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::
 
 fn print_runtime_summary(settings: &BittySettings) {
     if let Some(state) = read_runtime_state(&settings.data_dir) {
-        let status = if is_pid_running(state.pid) {
-            "running"
+        let alive = is_pid_running(state.pid);
+        let status = if alive {
+            ui::green("running")
         } else {
-            "stopped"
+            ui::yellow("stopped")
         };
         println!(
-            "Bitty runtime: {status} (pid {}, mode {})",
-            state.pid, state.mode
+            "  {} {}  (pid {}, mode {})",
+            ui::dim("runtime"), status, state.pid, state.mode
         );
-        if !state.target.is_empty() {
-            println!("Runtime cluster: {}", compact_invite(&state.target));
+        if !state.target.is_empty() && alive {
+            println!("  {} {}", ui::dim("cluster"), ui::dim(&compact_invite(&state.target)));
         }
     } else {
-        println!("Bitty runtime: stopped");
+        println!("  {} {}", ui::dim("runtime"), ui::yellow("stopped"));
     }
     if let Some(active) = active_cluster_target(settings) {
-        println!("Active cluster: {}", compact_invite(&active));
+        println!("  {} {}", ui::dim("active cluster"), ui::dim(&compact_invite(&active)));
     }
 }
 
@@ -2740,15 +2674,6 @@ fn compact_invite(invite: &str) -> String {
         return invite.to_string();
     };
     format!("{head}?token=...")
-}
-
-fn confirm_yes(details: &str) -> Result<bool, std::io::Error> {
-    println!("{details}");
-    println!();
-    println!("Type yes to confirm (anything else aborts):");
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.trim() == "yes")
 }
 
 fn assert_destructive_data_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -2978,48 +2903,55 @@ fn bitty_version() -> String {
 }
 
 fn print_version() {
-    println!("bitty {}", bitty_version());
-    println!("repository: {}", env!("CARGO_PKG_REPOSITORY"));
+    println!("  {}  {}", ui::bold("bitty"), ui::dim(&bitty_version()));
+    println!("  {}  {}", ui::dim("repository"), env!("CARGO_PKG_REPOSITORY"));
 }
 
 fn print_help() {
-    println!("Usage:");
-    println!("  bitty setup");
-    println!("  bitty share NAME");
-    println!("  bitty connect INVITE_OR_NAME [--name NAME]");
-    println!("  bitty start [--model MODEL_OR_PATH]");
-    println!("  bitty stop [MODEL]");
-    println!("  bitty restart");
-    println!("  bitty run MODEL [PROMPT] [--local|--node TARGET]");
-    println!("  bitty pull MODEL");
-    println!("  bitty ls | bitty list");
-    println!("  bitty show MODEL");
-    println!("  bitty ps");
-    println!("  bitty serve [--host 127.0.0.1:11435]");
-    println!("  bitty create NAME -f Modelfile");
-    println!("  bitty rm MODEL");
-    println!("  bitty cp SOURCE DEST");
-    println!("  bitty settings get|set|path");
-    println!("  bitty logs [--lines N|--path|--clear]");
-    println!("  bitty invite [--name NAME] [--replace]");
-    println!("  bitty join INVITE_OR_NAME [--name NAME] [--model PATH]");
-    println!("  bitty use NAME_OR_INVITE [--name NAME]");
-    println!("  bitty clusters");
-    println!("  bitty cluster status|nodes|check|benchmark|invite [--node TARGET]");
-    println!("  bitty node --model PATH");
-    println!("  bitty node --join 'iroh://INVITE' --model PATH");
-    println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
-    println!("  bitty generate --prompt TEXT [--node TARGET]");
-    println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
-    println!("  bitty status [--node TARGET]");
-    println!("  bitty clean [--data-dir DIR]   # models + cluster state + secrets; keeps config.toml");
-    println!("  bitty reset [--data-dir DIR]   # delete entire data dir; fresh default config");
-    println!("  bitty version");
+    println!("  {}bitty{} — distributed inference runtime", ui::B, ui::N);
+    println!("  {}", ui::dim(&format!("v{}  {}", bitty_version(), env!("CARGO_PKG_REPOSITORY"))));
     println!();
-    println!("Simple flow: `bitty setup`, then `bitty share home` or `bitty connect INVITE --name home`.");
-    println!("Bitty starts the node runtime in the background for simple commands.");
-    println!("Cluster names are local aliases. A reused name must match the same invite unless --replace is set.");
-    println!("Use `--local` on `bitty run` to force local-only generation.");
+    println!("  {}", ui::dim("getting started"));
+    println!("    {}     {}", ui::bold("bitty setup"), ui::dim("one-time setup wizard"));
+    println!("    {}     {}", ui::bold("bitty share NAME"), ui::dim("share this machine as a cluster leader"));
+    println!("    {}  {}", ui::bold("bitty connect INVITE"), ui::dim("join an existing cluster"));
+    println!("    {}          {}", ui::bold("bitty run MODEL"), ui::dim("run inference"));
+    println!();
+    println!("  {}", ui::dim("commands"));
+    println!("    {}          {}", ui::bold("bitty pull MODEL"), ui::dim("download a model"));
+    println!("    {}                     {}", ui::bold("bitty ls"), ui::dim("list installed models"));
+    println!("    {}          {}", ui::bold("bitty show MODEL"), ui::dim("show model details"));
+    println!("    {}                       {}", ui::bold("bitty ps"), ui::dim("show running models"));
+    println!("    {}               {}", ui::bold("bitty stop [MODEL]"), ui::dim("stop runtime or model"));
+    println!("    {}                    {}", ui::bold("bitty start"), ui::dim("start background runtime"));
+    println!("    {}                 {}", ui::bold("bitty restart"), ui::dim("restart background runtime"));
+    println!("    {}                    {}", ui::bold("bitty serve"), ui::dim("start HTTP API server"));
+    println!("    {}  {}", ui::bold("bitty create NAME -f FILE"), ui::dim("create model from Modelfile"));
+    println!("    {}               {}", ui::bold("bitty rm MODEL"), ui::dim("remove a model"));
+    println!("    {}            {}", ui::bold("bitty cp SRC DEST"), ui::dim("copy a model profile"));
+    println!("    {}                {}", ui::bold("bitty settings"), ui::dim("view or change settings"));
+    println!("    {}                    {}", ui::bold("bitty logs"), ui::dim("view runtime logs"));
+    println!("    {}                 {}", ui::bold("bitty version"), ui::dim("show version"));
+    println!();
+    println!("  {}", ui::dim("cluster"));
+    println!("    {}                   {}", ui::bold("bitty invite"), ui::dim("print cluster invite"));
+    println!("    {}          {}", ui::bold("bitty join INVITE"), ui::dim("join as a foreground worker"));
+    println!("    {}             {}", ui::bold("bitty use NAME"), ui::dim("switch active cluster"));
+    println!("    {}                {}", ui::bold("bitty clusters"), ui::dim("list saved clusters"));
+    println!("    {}  {}", ui::bold("bitty cluster status"), ui::dim("cluster status & assignments"));
+    println!("    {}   {}", ui::bold("bitty cluster nodes"), ui::dim("cluster topology"));
+    println!("    {}   {}", ui::bold("bitty cluster check"), ui::dim("cluster readiness check"));
+    println!("    {}  {}", ui::bold("bitty cluster benchmark"), ui::dim("hardware profiles"));
+    println!("    {}         {}", ui::bold("bitty node --model PATH"), ui::dim("advanced: run a node"));
+    println!("    {}               {}", ui::bold("bitty generate"), ui::dim("send a generate request"));
+    println!("    {}                     {}", ui::bold("bitty chat"), ui::dim("interactive chat"));
+    println!("    {}                  {}", ui::bold("bitty status"), ui::dim("full cluster + runtime status"));
+    println!();
+    println!("  {}", ui::dim("maintenance"));
+    println!("    {}                    {}", ui::bold("bitty clean"), ui::dim("remove models, config, cluster state"));
+    println!("    {}                    {}", ui::bold("bitty reset"), ui::dim("delete everything, fresh start"));
+    println!();
+    println!("  {}  background runtime auto-starts for simple commands, {} to stop", ui::dim("tip:"), ui::dim("bitty stop"));
 }
 
 #[cfg(test)]
