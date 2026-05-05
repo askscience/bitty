@@ -694,31 +694,251 @@ async fn run_serve(config: ServeConfig) -> Result<(), Box<dyn std::error::Error>
     server::serve(settings)
 }
 
-async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let settings = load_settings(config.data_dir.as_deref());
-    println!("Bitty {}", bitty_version());
-    println!("data dir: {}", settings.data_dir.display());
-    let model = resolve_model(&settings, &settings.default_model)
+const C: &str = "\x1b[36m";
+const G: &str = "\x1b[32m";
+const Y: &str = "\x1b[33m";
+const D: &str = "\x1b[2m";
+const B: &str = "\x1b[1m";
+const R: &str = "\x1b[0m";
+
+const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn setup_header(settings: &BittySettings) {
+    println!();
+    println!("  {}bitty setup{}  {}v{}  ·  {}{}", B, R, D, bitty_version(), settings.data_dir.display(), R);
+    println!("  {}", "─".repeat(50));
+    println!();
+}
+fn setup_status(settings: &BittySettings) {
+    let model = resolve_model(settings, &settings.default_model)
         .unwrap_or_else(|| model_store::find_registry_model(&settings.default_model).unwrap());
-    let path = model.model_path(&settings);
-    if path.exists() {
-        println!("model ready: {} ({})", model.id(), path.display());
-    } else if settings.auto_pull {
-        println!("pulling default model: {}", settings.default_model);
-        let model = pull_model(&settings, &settings.default_model)?;
-        println!(
-            "model ready: {} ({})",
-            model.id(),
-            model.model_path(&settings).display()
-        );
+    let exists = model.model_path(settings).exists();
+    print!("  {}model{}  {}{}{}", D, R, B, model.id(), R);
+    if exists {
+        println!("  {}ready{}", G, R);
     } else {
+        println!("  {}not downloaded{}", Y, R);
+    }
+
+    let cluster = active_cluster_target(settings);
+    print!("  {}cluster{}  ", D, R);
+    if cluster.is_some() {
+        println!("{}configured{}", G, R);
+    } else {
+        println!("{}not configured{}", Y, R);
+    }
+    println!();
+}
+
+fn prompt_line(prompt: &str) -> String {
+    print!("  {}›{} {} ", C, R, prompt);
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
+fn prompt_bool(prompt: &str, default: bool) -> bool {
+    let hint = if default { "Y/n" } else { "y/N" };
+    let input = prompt_line(&format!("{} [{}]", prompt, hint));
+    match input.to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    }
+}
+
+async fn with_spinner<F, T>(label: &str, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let frames = BRAILLE;
+    let mut tick = 0usize;
+    let label_owned = label.to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            print!(
+                "\r  {} {} {}...{}",
+                frames[tick % frames.len()],
+                D, label_owned, R
+            );
+            io::stdout().flush().ok();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            tick += 1;
+        }
+    });
+    let result = f.await;
+    handle.abort();
+    print!("\r{}\r", " ".repeat(label.len() + 20));
+    result
+}
+
+async fn setup_model(settings: &BittySettings) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = model_store::registry_models();
+    let installed = model_store::installed_models(settings);
+
+    println!("  {}model selection{}", B, R);
+    println!();
+
+    for m in &registry {
+        let is_installed = installed.iter().any(|i| i.name == m.name);
+        let status = if is_installed {
+            format!("{}downloaded{}", G, R)
+        } else {
+            format!("{}not downloaded{}", Y, R)
+        };
+        println!("  {} {:<16} {}  {}", D, m.id(), m.display_name, status);
+    }
+
+    println!();
+    let name = prompt_line("model name or URL (Enter for default)");
+    let model_name = if name.is_empty() {
+        settings.default_model.clone()
+    } else {
+        name
+    };
+
+    let spec = model_store::find_registry_model(&model_name)
+        .or_else(|| {
+            let path = std::path::Path::new(&model_name);
+            if path.exists() {
+                Some(model_store::ModelSpec {
+                    name: model_name.clone(),
+                    tag: "local".into(),
+                    display_name: "Local GGUF model".into(),
+                    backend: "bitnet-i2s".into(),
+                    quantization: "i2_s".into(),
+                    filename: path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("model.gguf")
+                        .into(),
+                    layers: 30,
+                    url: String::new(),
+                    source: String::new(),
+                    temperature: settings.default_temperature,
+                    num_predict: settings.default_num_predict,
+                    num_ctx: settings.default_num_ctx,
+                    path: Some(path.to_path_buf()),
+                })
+            } else {
+                None
+            }
+        });
+
+    let Some(spec) = spec else {
+        println!("  {}unknown model: {}{}", Y, model_name, R);
+        return Ok(());
+    };
+
+    let model_path = spec.model_path(settings);
+    if model_path.exists() {
+        println!("  {}model ready: {}{}", G, model_path.display(), R);
+        return Ok(());
+    }
+
+    if spec.url.is_empty() && spec.path.is_none() {
+        println!("  {}no download source for {}{}", Y, spec.id(), R);
+        return Ok(());
+    }
+
+    if let Some(ref custom_path) = spec.path {
+        println!("  {}using: {}{}", G, custom_path.display(), R);
+        return Ok(());
+    }
+
+    if prompt_bool(&format!("download {}?", spec.display_name), true) {
+        println!();
+        let model = pull_model(settings, &model_name)?;
         println!(
-            "model missing: {}. Run `bitty pull {}`.",
-            path.display(),
-            settings.default_model
+            "  {} {} {}downloaded to {}{}",
+            G,
+            B,
+            D,
+            model.model_path(settings).display(),
+            R
         );
     }
-    println!("next: `bitty share home` or `bitty connect INVITE --name home`");
+    Ok(())
+}
+
+async fn setup_cluster(settings: &BittySettings) -> Result<(), Box<dyn std::error::Error>> {
+    let existing = active_cluster_target(settings);
+    if existing.is_some() {
+        println!("  {}cluster already configured{}", G, R);
+        if !prompt_bool("switch to a different cluster?", false) {
+            return Ok(());
+        }
+    }
+
+    println!();
+    println!("  {}join  ─ paste an invite from another machine{}", D, R);
+    println!("  {}share ─ start your own cluster{}", D, R);
+    println!();
+    let choice = prompt_line("join or share? (j/s, Enter to skip)");
+    match choice.to_lowercase().as_str() {
+        "j" | "join" => {
+            let invite = prompt_line("paste the invite");
+            if !invite.is_empty() {
+                let _ = run_connect(JoinConfig {
+                    target: invite,
+                    name: None,
+                    replace: true,
+                    model: None,
+                    node_id: None,
+                    data_dir: Some(settings.data_dir.display().to_string()),
+                })
+                .await;
+            }
+        }
+        "s" | "share" => {
+            let _ = run_share(InviteConfig {
+                name: Some("home".into()),
+                replace: true,
+                data_dir: Some(settings.data_dir.display().to_string()),
+            })
+            .await;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn run_setup(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = load_settings(config.data_dir.as_deref());
+    setup_header(&settings);
+    with_spinner("checking", async { tokio::time::sleep(Duration::from_millis(400)).await }).await;
+    setup_status(&settings);
+
+    let model_ready = resolve_model(&settings, &settings.default_model)
+        .map(|m| m.model_path(&settings).exists())
+        .unwrap_or(false);
+    let cluster_ready = active_cluster_target(&settings).is_some();
+
+    if model_ready && cluster_ready {
+        println!("  {}all set!{}", G, R);
+        println!("  run {}bitty run bitnet-b1.58 \"hello\"{}", B, R);
+        println!();
+        return Ok(());
+    }
+
+    if !model_ready {
+        setup_model(&settings).await?;
+        println!();
+    }
+
+    if !cluster_ready {
+        setup_cluster(&settings).await?;
+        println!();
+    }
+
+    setup_status(&settings);
+    println!("  {}done{}", G, R);
+    if !cluster_ready {
+        println!("  run {}bitty share home{} to start your cluster", B, R);
+        println!("  or connect with: {}bitty connect INVITE --name home{}", B, R);
+    }
+    println!();
     Ok(())
 }
 
