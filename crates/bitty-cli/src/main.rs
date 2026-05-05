@@ -487,12 +487,12 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
     };
     if let Some(node) = cluster_node {
         if config.node.is_none() {
-            println!("using cluster: {node}");
+            println!("  {}", ui::dim(&format!("cluster: {}", compact_invite(&node))));
         }
         if prompt.is_empty() {
-            println!("Bitty cluster chat: {}. Type /exit to quit.", model.id());
+            println!("  {}  {}  {}", ui::dim("chat"), ui::bold(&model.id()), ui::dim("type /exit to quit"));
             loop {
-                print!("> ");
+                print!("  {}›{} ", ui::C, ui::N);
                 io::stdout().flush()?;
                 let mut line = String::new();
                 if io::stdin().read_line(&mut line)? == 0 {
@@ -526,9 +526,9 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
         .await;
     }
     if prompt.is_empty() {
-        println!("Bitty chat: {}. Type /exit to quit.", model.id());
+        println!("  {}  {}  {}", ui::dim("chat"), ui::bold(&model.id()), ui::dim("type /exit to quit"));
         loop {
-            print!("> ");
+            print!("  {}›{} ", ui::C, ui::N);
             io::stdout().flush()?;
             let mut line = String::new();
             if io::stdin().read_line(&mut line)? == 0 {
@@ -579,15 +579,21 @@ async fn run_local_model(
         .into());
     }
     record_running_model(settings, &model.id())?;
-    let runtime = BitNetRuntime::load(&path).await?;
-    let text = runtime
-        .generate_full(
-            prompt,
-            max_tokens as usize,
-            temperature.parse().unwrap_or(model.temperature),
-        )
-        .await?;
-    println!("{text}");
+    let runtime = spinner("loading model", async {
+        BitNetRuntime::load(&path).await
+    })
+    .await?;
+    let text = spinner("generating", async {
+        runtime
+            .generate_full(
+                prompt,
+                max_tokens as usize,
+                temperature.parse().unwrap_or(model.temperature),
+            )
+            .await
+    })
+    .await?;
+    println!("  {}", text);
     Ok(())
 }
 
@@ -1416,24 +1422,30 @@ fn request_with_token<T>(message: T, token: &str) -> tonic::Request<T> {
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
     if let Some(target) = iroh_transport::parse_iroh_target(&node) {
-        let endpoint = start_iroh_client().await?;
+        let endpoint = spinner("connecting", async {
+            start_iroh_client().await
+        })
+        .await?;
         let client = IrohSchedulerClient {
             endpoint,
             remote: target.endpoint_addr,
             token: target.token.unwrap_or_default(),
         };
-        let response: GenerateResponse = client
-            .request(
-                SCHEDULER_GENERATE,
-                &GenerateRequest {
-                    request_id: request_id(),
-                    prompt_tokens: Vec::new(),
-                    prompt: config.prompt,
-                    max_new_tokens: config.max_tokens,
-                    temperature: config.temperature.parse().unwrap_or(0.0),
-                },
-            )
-            .await?;
+        let response: GenerateResponse = spinner("generating", async {
+            client
+                .request(
+                    SCHEDULER_GENERATE,
+                    &GenerateRequest {
+                        request_id: request_id(),
+                        prompt_tokens: Vec::new(),
+                        prompt: config.prompt,
+                        max_new_tokens: config.max_tokens,
+                        temperature: config.temperature.parse().unwrap_or(0.0),
+                    },
+                )
+                .await
+        })
+        .await?;
         for token in response.tokens {
             print!("{}", token.text);
             if token.finished {
@@ -1443,17 +1455,23 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
         return Ok(());
     }
 
-    let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&node)).await?;
-    let mut stream = client
-        .generate(GenerateRequest {
-            request_id: request_id(),
-            prompt_tokens: Vec::new(),
-            prompt: config.prompt,
-            max_new_tokens: config.max_tokens,
-            temperature: config.temperature.parse().unwrap_or(0.0),
-        })
-        .await?
-        .into_inner();
+    let mut client = spinner("connecting", async {
+        CoordinatorServiceClient::connect(normalize_endpoint(&node)).await
+    })
+    .await?;
+    let mut stream = spinner("generating", async {
+        client
+            .generate(GenerateRequest {
+                request_id: request_id(),
+                prompt_tokens: Vec::new(),
+                prompt: config.prompt,
+                max_new_tokens: config.max_tokens,
+                temperature: config.temperature.parse().unwrap_or(0.0),
+            })
+            .await
+            .map(|r| r.into_inner())
+    })
+    .await?;
 
     while let Some(token) = stream.message().await? {
         print!("{}", token.text);
