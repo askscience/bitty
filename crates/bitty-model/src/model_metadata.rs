@@ -102,7 +102,7 @@ pub fn classify_architecture(arch_str: &str) -> ModelArchitecture {
         ModelArchitecture::Mistral
     } else if lower.contains("phi-3") || lower.contains("phi3") || lower.contains("phi-") {
         ModelArchitecture::Phi
-    } else if lower.contains("qwen2") || lower.contains("qwen-2") {
+    } else if lower.contains("qwen2") || lower.contains("qwen-2") || lower.contains("qwen3") || lower.contains("qwen-3") {
         ModelArchitecture::Qwen2
     } else if lower.contains("gemma-2") || lower.contains("gemma2") {
         ModelArchitecture::Gemma2
