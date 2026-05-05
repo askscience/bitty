@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-git@github.com:askscience/bitty.git}"
+BRANCH="${BRANCH:-testing}"
 INSTALL_DIR="${INSTALL_DIR:-"$HOME/bitty"}"
 BIN_DIR="${BIN_DIR:-"$HOME/.local/bin"}"
 ROLE="${ROLE:-node}"
@@ -38,6 +39,7 @@ Options:
   --role node|join|client   Which command to print after install. Default: node
   --install-dir PATH        Checkout/build directory. Default: $HOME/bitty
   --bin-dir PATH            Symlink destination. Default: $HOME/.local/bin
+  --branch BRANCH            Git branch. Default: testing
   --repo URL                Git repository. Default: git@github.com:askscience/bitty.git
   --model PATH              Local GGUF model path
   --join HOST:PORT          Existing Bitty node to join or call; accepts iroh:// invites
@@ -54,7 +56,7 @@ Options:
   -h, --help                Show this help
 
 Environment variables with the same uppercase names are also supported:
-  REPO_URL, INSTALL_DIR, BIN_DIR, ROLE, MODEL_PATH, JOIN, NODE_ID, LISTEN,
+  REPO_URL, BRANCH, INSTALL_DIR, BIN_DIR, ROLE, MODEL_PATH, JOIN, NODE_ID, LISTEN,
   WORKER_LISTEN, PUBLIC_ENDPOINT, LAYERS, CLUSTER_TOKEN, RUN_TESTS, BUILD_PROFILE,
   INSTALL_RUST, INSTALL_SYSTEM_DEPS.
 
@@ -211,6 +213,7 @@ while [ "$#" -gt 0 ]; do
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --bin-dir) BIN_DIR="$2"; shift 2 ;;
     --repo) REPO_URL="$2"; shift 2 ;;
+    --branch) BRANCH="$2"; shift 2 ;;
     --model) MODEL_PATH="$2"; shift 2 ;;
     --join|--coordinator) JOIN="$2"; shift 2 ;;
     --node-id) NODE_ID="$2"; shift 2 ;;
@@ -266,14 +269,15 @@ EOF
 fi
 
 if [ -d "$INSTALL_DIR/.git" ]; then
-  echo "Updating Bitty checkout at $INSTALL_DIR"
-  git -C "$INSTALL_DIR" pull --ff-only
+  echo "Updating Bitty checkout at $INSTALL_DIR (branch: $BRANCH)"
+  git -C "$INSTALL_DIR" checkout "$BRANCH"
+  git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
 elif [ -e "$INSTALL_DIR" ]; then
   echo "install dir exists but is not a git checkout: $INSTALL_DIR" >&2
   exit 1
 else
-  echo "Cloning $REPO_URL into $INSTALL_DIR"
-  git clone "$REPO_URL" "$INSTALL_DIR"
+  echo "Cloning $REPO_URL (branch: $BRANCH) into $INSTALL_DIR"
+  git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"
