@@ -12,7 +12,7 @@ production inference server, and APIs or commands may still change.
 Install from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/askscience/bitty/main/scripts/install_bitty.sh | bash
+curl -fsSL https://raw.githubusercontent.com/askscience/bitty/testing/scripts/install_bitty.sh | bash
 ```
 
 The normal user experience is intentionally similar to Ollama:
