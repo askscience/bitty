@@ -187,7 +187,7 @@ struct StatusConfig {
 struct ModelsConfig {
     node: Option<String>,
     data_dir: Option<String>,
-    detail: bool,
+    verbose: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -474,7 +474,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     .await
 }
 
-async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut settings = load_settings(config.data_dir.as_deref());
     logger::log(
         &settings.data_dir,
@@ -482,7 +482,14 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
     )?;
     let mut model = resolve_model(&settings, &config.model);
     if model.is_none() && config.auto_pull && settings.auto_pull {
-        model = Some(pull_model(&settings, &config.model)?);
+        model = pull_model(&settings, &config.model).ok();
+    }
+    if model.is_none() && config.prompt.is_none() && !config.model.contains('/') {
+        let default = resolve_model(&settings, &settings.default_model);
+        if let Some(default_model) = default {
+            config.prompt = Some(config.model.clone());
+            model = Some(default_model);
+        }
     }
     let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
     if !config.local && config.node.is_none() && settings.auto_start_node {
@@ -1114,7 +1121,7 @@ async fn run_cluster(config: ClusterCommand) -> Result<(), Box<dyn std::error::E
         ClusterCommand::Models(config) => {
             let models =
                 fetch_list_models(config.node.as_deref(), config.data_dir.as_deref()).await?;
-            print_list_models(&models);
+            print_list_models(&models, false);
         }
     }
     Ok(())
@@ -1219,8 +1226,8 @@ async fn run_clusters(config: DataDirConfig) -> Result<(), Box<dyn std::error::E
 
 async fn run_models(config: ModelsConfig) -> Result<(), Box<dyn std::error::Error>> {
     let response = fetch_list_models(config.node.as_deref(), config.data_dir.as_deref()).await?;
-    print_list_models(&response);
-    if config.detail {
+    print_list_models(&response, config.verbose);
+    if config.verbose {
         let status =
             fetch_cluster_status(config.node.as_deref(), config.data_dir.as_deref()).await?;
         ui::rule();
@@ -1257,19 +1264,21 @@ async fn fetch_list_models(
     Ok(response)
 }
 
-fn print_list_models(response: &ListModelsResponse) {
-    ui::header("bitty models", &PathBuf::from(""), &bitty_version());
-    let visibility = if response.visibility == "public" {
-        ui::green(&response.visibility)
-    } else {
-        ui::dim(&response.visibility)
-    };
-    println!("  {}  {}", ui::dim("cluster"), ui::bold(&response.cluster_name));
-    if !response.cluster_description.is_empty() {
-        println!("  {}  {}", ui::dim("description"), response.cluster_description);
+fn print_list_models(response: &ListModelsResponse, verbose: bool) {
+    if verbose {
+        ui::header("bitty models", &PathBuf::from(""), &bitty_version());
+        let visibility = if response.visibility == "public" {
+            ui::green(&response.visibility)
+        } else {
+            ui::dim(&response.visibility)
+        };
+        println!("  {}  {}", ui::dim("cluster"), ui::bold(&response.cluster_name));
+        if !response.cluster_description.is_empty() {
+            println!("  {}  {}", ui::dim("description"), response.cluster_description);
+        }
+        println!("  {}  {}", ui::dim("visibility"), visibility);
+        println!("  {}  {}", ui::dim("workers"), response.active_workers);
     }
-    println!("  {}  {}", ui::dim("visibility"), visibility);
-    println!("  {}  {}", ui::dim("workers"), response.active_workers);
     let model_status = if response.model_ready { ui::ready() } else { ui::not_ready() };
     println!("  {}  {}", ui::dim("model"), model_status);
     if !response.model_path.is_empty() {
@@ -1277,7 +1286,7 @@ fn print_list_models(response: &ListModelsResponse) {
     }
     println!("  {}  {}", ui::dim("layers"), response.layer_count);
     ui::rule();
-    if response.model_ready {
+    if response.model_ready && verbose {
         println!();
         println!("  run {}bitty run \"hello\"{} to generate text", ui::bold(""), ui::N);
     }
@@ -1603,60 +1612,20 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
 }
 
 async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(model) = config.model {
-        return run_model(RunConfig {
-            model,
-            prompt: config.prompt,
-            node: config.node,
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            data_dir: config.data_dir,
-            auto_pull: true,
-            local: false,
-        })
-        .await;
-    }
-
-    let node = resolve_cluster_node(
-        config.node.as_deref().unwrap_or(""),
-        config.data_dir.as_deref(),
-    )?;
-    if let Some(prompt) = config.prompt {
-        return run_generate(GenerateConfig {
-            node,
-            prompt,
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            data_dir: config.data_dir,
-        })
-        .await;
-    }
-
-    println!("Bitty chat. Type /exit to quit.");
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-        let mut prompt = String::new();
-        if io::stdin().read_line(&mut prompt)? == 0 {
-            break;
-        }
-        let prompt = prompt.trim();
-        if prompt == "/exit" || prompt == "/quit" {
-            break;
-        }
-        if prompt.is_empty() {
-            continue;
-        }
-        run_generate(GenerateConfig {
-            node: node.clone(),
-            prompt: prompt.into(),
-            max_tokens: config.max_tokens,
-            temperature: config.temperature.clone(),
-            data_dir: config.data_dir.clone(),
-        })
-        .await?;
-    }
-    Ok(())
+    let model = config.model.clone().unwrap_or_else(|| {
+        load_settings(config.data_dir.as_deref()).default_model
+    });
+    run_model(RunConfig {
+        model,
+        prompt: config.prompt,
+        node: config.node,
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        data_dir: config.data_dir,
+        auto_pull: true,
+        local: false,
+    })
+    .await
 }
 
 async fn run_status(config: StatusConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1891,13 +1860,13 @@ fn parse_models(args: &mut impl Iterator<Item = String>) -> Result<ModelsConfig,
     let mut config = ModelsConfig {
         node: None,
         data_dir: None,
-        detail: false,
+        verbose: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--node" => config.node = Some(required_next(args, "--node")?),
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
-            "--detail" => config.detail = true,
+            "--verbose" | "-v" | "--detail" => config.verbose = true,
             other => return Err(format!("unknown models argument: {other}")),
         }
     }
@@ -1936,7 +1905,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         }
     }
     if config.model.is_empty() {
-        return Err("bitty run requires MODEL".into());
+        config.model = load_settings(config.data_dir.as_deref()).default_model;
     }
     Ok(config)
 }
