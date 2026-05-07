@@ -11,13 +11,6 @@ use crate::cpu_backend::types::*;
 type Result<T> = std::result::Result<T, String>;
 
 impl CpuLayer {
-    /// Run one transformer/SSM layer forward pass.
-    ///
-    /// Standard Llama-style block:
-    ///     x1 = x + o_proj(attn(rms_norm_1(x)))
-    ///     x2 = x1 + mlp(rms_norm_2(x1))
-    /// Earlier versions incorrectly normed `o_proj(attn(...))` (without the
-    /// residual add) before the MLP, producing garbled logits.
     pub fn forward(
         &self,
         hidden: &[f32],
@@ -25,6 +18,7 @@ impl CpuLayer {
         kv_cache: &mut KvCache,
         ssm_states: &mut Vec<SsmState>,
         meta: &CpuModelMetadata,
+        rope_cache: &RopeCache,
     ) -> Result<Vec<f32>> {
         let d = meta.hidden_size;
         let inter = meta.intermediate_size;
@@ -35,7 +29,7 @@ impl CpuLayer {
         // ---- Attention or SSM block
         let block_out = match &self.kind {
             LayerKind::Attention(ref w) => {
-                attention::forward(&normed, w, pos, kv_cache, meta, self.layer_idx)?
+                attention::forward(&normed, w, pos, kv_cache, meta, self.layer_idx, rope_cache)?
             }
             LayerKind::Ssm(ref w) => {
                 let state = &mut ssm_states[self.layer_idx];

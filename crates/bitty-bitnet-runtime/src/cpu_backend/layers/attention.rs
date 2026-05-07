@@ -2,7 +2,7 @@
 
 use crate::cpu_backend::matmul;
 use crate::cpu_backend::ops;
-use crate::cpu_backend::types::{AttentionWeights, CpuModelMetadata, KvCache};
+use crate::cpu_backend::types::{AttentionWeights, CpuModelMetadata, KvCache, RopeCache};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -13,6 +13,7 @@ pub fn forward(
     cache: &mut KvCache,
     meta: &CpuModelMetadata,
     layer_idx: usize,
+    rope_cache: &RopeCache,
 ) -> Result<Vec<f32>> {
     let d = meta.hidden_size;
     let n_heads = meta.num_heads;
@@ -93,7 +94,7 @@ pub fn forward(
         actual_hd,
         n_heads,
         n_kv,
-        meta.rope_theta,
+        rope_cache,
     );
 
     // Store K,V in cache

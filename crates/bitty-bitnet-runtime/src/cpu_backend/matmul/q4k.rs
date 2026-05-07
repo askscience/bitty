@@ -1,11 +1,10 @@
 use crate::cpu_backend::dequant::{Q4KBlock, QK_K};
 use crate::cpu_backend::matmul::Result;
+use rayon::prelude::*;
 
-/// Q4_K matrix-vector multiply: `output[j] = sum_i input[i] * W[j, i]`.
-///
-/// Weight memory layout is `[out_dim, in_dim]` row-major (fastest-changing is
-/// `in_dim`, matching llama.cpp), so each 256-element Q4_K block covers 256
-/// consecutive `i` values within a single output row.
+/// Q4_K matrix-vec. Weight layout: [out_dim, in_dim] row-major.
+/// Each 256-element block covers 256 consecutive `i` values within one output row
+/// when in_dim is a multiple of 256.
 pub fn matmul(input: &[f32], data: &[u8], in_dim: usize, out_dim: usize) -> Result<Vec<f32>> {
     let mut output = vec![0f32; out_dim];
     let bs = Q4KBlock::BLOCK_SIZE;
@@ -13,40 +12,30 @@ pub fn matmul(input: &[f32], data: &[u8], in_dim: usize, out_dim: usize) -> Resu
     if total_elements == 0 {
         return Ok(output);
     }
-    let mut buf = [0f32; QK_K];
+    let blocks_per_row = (in_dim / QK_K).max(1);
 
-    // Blocks always cover exactly QK_K=256 consecutive flat elements. For
-    // standard GGUF tensors `in_dim` is a multiple of 256, so each block is
-    // fully inside one output row. The general code below handles blocks that
-    // straddle a row boundary too (no-op for typical shapes).
-    let total_blocks = total_elements.div_ceil(QK_K);
-    for blk in 0..total_blocks {
-        let off = blk * bs;
-        if off + bs > data.len() {
-            break;
-        }
-        let block = Q4KBlock::new(&data[off..off + bs]);
-        block.dequantize_into(&mut buf);
-
-        let flat_base = blk * QK_K;
-        let end = (flat_base + QK_K).min(total_elements);
-        let mut flat = flat_base;
-        while flat < end {
-            let j = flat / in_dim;
-            let i = flat % in_dim;
-            let remain_row = in_dim - i;
-            let remain_block = end - flat;
-            let n = remain_row.min(remain_block);
-            let row = &buf[flat - flat_base..flat - flat_base + n];
-            let x_row = &input[i..i + n];
+    output
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(j, out)| {
             let mut sum = 0f32;
-            for k in 0..n {
-                sum += x_row[k] * row[k];
+            let mut buf = [0f32; QK_K];
+            for bi in 0..blocks_per_row {
+                let blk = j * blocks_per_row + bi;
+                let off = blk * bs;
+                if off + bs > data.len() {
+                    break;
+                }
+                let block = Q4KBlock::new(&data[off..off + bs]);
+                block.dequantize_into(&mut buf);
+                let x_start = bi * QK_K;
+                let n = QK_K.min(in_dim - x_start);
+                for k in 0..n {
+                    sum += input[x_start + k] * buf[k];
+                }
             }
-            output[j] += sum;
-            flat += n;
-        }
-    }
+            *out = sum;
+        });
 
     Ok(output)
 }

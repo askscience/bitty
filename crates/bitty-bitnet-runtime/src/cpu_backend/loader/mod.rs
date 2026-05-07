@@ -9,6 +9,7 @@ pub mod names;
 use crate::cpu_backend::dequant::dequantize_slice;
 use crate::cpu_backend::types::*;
 use names::TensorRole;
+use bytes::Bytes;
 use oxbitnet::model::gguf::{
     self, GgufMetadata, GgufParser, GGML_TYPE_I2_S, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
     GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_K,
@@ -41,7 +42,7 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
 
         let shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
         let packed = PackedTensor {
-            data: tensor_data.to_vec(),
+            data: Bytes::copy_from_slice(tensor_data),
             ggml_type: tensor.tensor_type,
             shape,
             name: tensor.name.clone(),

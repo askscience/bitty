@@ -1,5 +1,7 @@
 //! Common Transformer and SSM operations for CPU inference.
 
+use super::types::RopeCache;
+
 /// RMS Normalization: out = (x / rms) * weight
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len().min(weight.len());
@@ -41,7 +43,7 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
-/// Apply RoPE (Rotary Position Embedding) to Q and K in-place.
+/// Apply RoPE (Rotary Position Embedding) to Q and K in-place using pre-computed cache.
 pub fn rope_apply(
     q: &mut [f32],
     k: &mut [f32],
@@ -49,7 +51,7 @@ pub fn rope_apply(
     head_dim: usize,
     num_heads: usize,
     num_kv_heads: usize,
-    rope_theta: f32,
+    rope_cache: &RopeCache,
 ) {
     if head_dim == 0 {
         return;
@@ -57,7 +59,7 @@ pub fn rope_apply(
     let half_dim = head_dim / 2;
     let groups = num_heads.max(1) / num_kv_heads.max(1);
     let max_h = (q.len() / head_dim.max(1)).min(num_heads);
-    let max_kv_h = (k.len() / head_dim.max(1)).min(num_kv_heads);
+    let _max_kv_h = (k.len() / head_dim.max(1)).min(num_kv_heads);
 
     for h in 0..max_h {
         let q_off = h * head_dim;
@@ -70,9 +72,7 @@ pub fn rope_apply(
             continue;
         }
         for i in 0..half_dim {
-            let theta = 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32);
-            let cos = (pos as f32 * theta).cos();
-            let sin = (pos as f32 * theta).sin();
+            let (cos, sin) = rope_cache.get(pos, i);
             let q0 = q[q_off + i];
             let q1 = q[q_off + i + half_dim];
             q[q_off + i] = q0 * cos - q1 * sin;

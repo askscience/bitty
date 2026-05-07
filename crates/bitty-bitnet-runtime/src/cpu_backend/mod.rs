@@ -32,31 +32,35 @@ pub struct CpuModel {
     lm_head: Option<LmHead>,
     kv_cache: KvCache,
     ssm_states: Vec<SsmState>,
+    rope_cache: RopeCache,
+    mmap: Option<memmap2::Mmap>,
 }
 
 impl CpuModel {
-    /// Load a GGUF model from disk.
+    /// Load a GGUF model from disk via memory-mapping for zero-copy weight access.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| format!("Cannot read model: {e}"))?;
-        let (metadata, tokenizer, weights) = loader::load_gguf(&data)?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Cannot open model file: {e}"))?;
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .map_err(|e| format!("Cannot mmap model: {e}"))?
+        };
+        let (metadata, tokenizer, weights) = loader::load_gguf(&mmap)?;
         let num_layers = weights.layers.len().max(1);
         let meta = loader::metadata::extract_config(&metadata, num_layers);
 
-        // Initialize KV cache
         let max_kv_dim = meta.num_kv_heads * meta.head_dim;
-        let max_seq = meta.max_seq_len;
         let mut kv_cache = KvCache::new();
-        kv_cache.reserve(meta.num_layers, max_kv_dim, max_seq);
+        kv_cache.reserve(meta.num_layers, max_kv_dim, meta.max_seq_len);
 
-        // Initialize SSM states
+        let rope_cache = RopeCache::new(meta.max_seq_len, meta.head_dim, meta.rope_theta);
+
         let ssm_states: Vec<SsmState> = weights
             .layers
             .iter()
-            .map(|layer| {
-                match &layer.kind {
-                    LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
-                    _ => SsmState::new(1, 1, 1), // dummy for non-SSM layers
-                }
+            .map(|layer| match &layer.kind {
+                LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
+                _ => SsmState::new(1, 1, 1),
             })
             .collect();
 
@@ -69,6 +73,8 @@ impl CpuModel {
             lm_head: weights.lm_head,
             kv_cache,
             ssm_states,
+            rope_cache,
+            mmap: Some(mmap),
         })
     }
 
@@ -117,7 +123,7 @@ impl CpuModel {
                 }
             }
             for layer in &self.layers {
-                h = layer.forward(&h, pos, &mut kv_cache, &mut ssm_states, m)?;
+                h = layer.forward(&h, pos, &mut kv_cache, &mut ssm_states, m, &self.rope_cache)?;
             }
             hidden = h;
             kv_cache.seq_len += 1;
@@ -130,7 +136,7 @@ impl CpuModel {
         let mut rng_state: u64 = 0xC0FFEE_u64 ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
         for _ in 0..max_tokens {
             for layer in &self.layers {
-                hidden = layer.forward(&hidden, pos, &mut kv_cache, &mut ssm_states, m)?;
+                hidden = layer.forward(&hidden, pos, &mut kv_cache, &mut ssm_states, m, &self.rope_cache)?;
             }
             kv_cache.seq_len += 1;
             let normed = ops::rms_norm(&hidden, &self.final_norm, m.rms_norm_eps);
@@ -255,20 +261,23 @@ fn compute_logits(
     d: usize,
     vocab: usize,
 ) -> std::result::Result<Vec<f32>, String> {
+    use rayon::prelude::*;
     match lm_head {
         Some(LmHead::Packed(lm)) => matmul::matmul(hidden, lm, d, vocab),
         _ => {
-            // Tied embeddings: embedding is stored as [vocab, hidden] (GGUF row-major)
             let mut logits = vec![0f32; vocab];
             if embed_tokens.len() >= d * vocab {
-                for v in 0..vocab {
-                    let mut sum = 0f32;
-                    let offset = v * d;
-                    for i in 0..d {
-                        sum += hidden[i] * embed_tokens[offset + i];
-                    }
-                    logits[v] = sum;
-                }
+                logits
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(v, out)| {
+                        let offset = v * d;
+                        let mut sum = 0f32;
+                        for i in 0..d {
+                            sum += hidden[i] * embed_tokens[offset + i];
+                        }
+                        *out = sum;
+                    });
             }
             Ok(logits)
         }

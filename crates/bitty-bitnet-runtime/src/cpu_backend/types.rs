@@ -1,5 +1,6 @@
 //! Core types for the CPU inference backend.
 
+use bytes::Bytes;
 use std::collections::HashMap;
 
 /// Model configuration extracted from GGUF metadata.
@@ -29,7 +30,7 @@ pub enum ActivationFn {
 /// A weight tensor in its native packed GGML quantization format.
 #[derive(Clone)]
 pub struct PackedTensor {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub ggml_type: u32,
     pub shape: Vec<usize>,
     pub name: String,
@@ -42,11 +43,49 @@ impl PackedTensor {
 
     pub fn dummy() -> Self {
         Self {
-            data: vec![0u8; 4],
+            data: Bytes::from(vec![0u8; 4]),
             ggml_type: 0,
             shape: vec![1, 1],
             name: "dummy".into(),
         }
+    }
+}
+
+/// Pre-computed RoPE cos/sin cache to avoid per-token trig calls.
+#[derive(Debug, Clone)]
+pub struct RopeCache {
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    max_seq: usize,
+    half_dim: usize,
+}
+
+impl RopeCache {
+    pub fn new(max_seq_len: usize, head_dim: usize, rope_theta: f32) -> Self {
+        let half_dim = head_dim / 2;
+        let total = max_seq_len * half_dim;
+        let mut cos = vec![0f32; total];
+        let mut sin = vec![0f32; total];
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
+                let theta = 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32);
+                let idx = pos * half_dim + i;
+                cos[idx] = (pos as f32 * theta).cos();
+                sin[idx] = (pos as f32 * theta).sin();
+            }
+        }
+        Self {
+            cos,
+            sin,
+            max_seq: max_seq_len,
+            half_dim,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, pos: usize, i: usize) -> (f32, f32) {
+        let idx = pos * self.half_dim + i;
+        (self.cos[idx], self.sin[idx])
     }
 }
 
