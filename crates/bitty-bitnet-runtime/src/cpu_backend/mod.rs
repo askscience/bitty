@@ -82,20 +82,24 @@ impl CpuModel {
         &self.tokenizer
     }
 
-    /// Full end-to-end generation on CPU.
-    pub fn generate(
+    /// Full end-to-end generation on CPU, streaming decoded text deltas to
+    /// `on_delta` as they become available. Returns the complete final text.
+    pub fn generate_stream<F>(
         &self,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
         top_k: usize,
         repeat_penalty: f32,
-    ) -> Result<String, String> {
+        mut on_delta: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str),
+    {
         let tokens = self
             .tokenizer
             .encode(prompt, true)
             .map_err(|e| format!("Tokenize error: {e}"))?;
-        let mut output = String::new();
         let eos = self.tokenizer.eos_token_id();
         let eot = self.tokenizer.eot_token_id();
         let im_end = self.tokenizer.im_end_token_id();
@@ -129,8 +133,9 @@ impl CpuModel {
             kv_cache.seq_len += 1;
         }
 
-        // Track recently generated tokens for repeat penalty.
         let mut recent: Vec<u32> = tokens.clone();
+        let mut generated: Vec<u32> = Vec::new();
+        let mut emitted: String = String::new();
 
         let mut pos = tokens.len();
         let mut rng_state: u64 = 0xC0FFEE_u64 ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
@@ -143,7 +148,6 @@ impl CpuModel {
             let mut logits =
                 compute_logits(&normed, &self.lm_head, &self.embed_tokens, d, m.vocab_size)?;
 
-            // Apply simple repeat penalty: divide positive logits, multiply negatives.
             if repeat_penalty > 1.0 {
                 let window = recent.len().saturating_sub(64).max(0);
                 for &tok in &recent[window..] {
@@ -162,11 +166,21 @@ impl CpuModel {
             if next_token == eos || Some(next_token) == eot || Some(next_token) == im_end {
                 break;
             }
-            let text = self
-                .tokenizer
-                .decode_one(next_token)
-                .unwrap_or_else(|_| char::REPLACEMENT_CHARACTER.to_string());
-            output.push_str(&text);
+
+            generated.push(next_token);
+            // Decode the accumulated sequence so the ByteLevel decoder can
+            // reassemble multi-byte UTF-8 correctly, then emit only the new
+            // suffix.
+            if let Ok(full) = self.tokenizer.decode(&generated) {
+                if full.len() > emitted.len() && full.starts_with(&emitted) {
+                    let tail = &full[emitted.len()..];
+                    if !tail.ends_with('\u{FFFD}') {
+                        on_delta(tail);
+                        emitted = full;
+                    }
+                }
+            }
+
             recent.push(next_token);
             if (next_token as usize) < vocab_size && self.embed_tokens.len() >= d * vocab_size {
                 for i in 0..d {
@@ -175,7 +189,25 @@ impl CpuModel {
             }
             pos += 1;
         }
-        Ok(output)
+        if let Ok(full) = self.tokenizer.decode(&generated) {
+            if full.len() > emitted.len() && full.starts_with(&emitted) {
+                on_delta(&full[emitted.len()..]);
+                emitted = full;
+            }
+        }
+        Ok(emitted)
+    }
+
+    /// Full end-to-end generation on CPU.
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        repeat_penalty: f32,
+    ) -> Result<String, String> {
+        self.generate_stream(prompt, max_tokens, temperature, top_k, repeat_penalty, |_| {})
     }
 }
 

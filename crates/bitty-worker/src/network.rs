@@ -251,7 +251,10 @@ where
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(index, _)| index as u32)
             .unwrap_or_default();
-        let text = self.executor.decode_token_text(token_id).await;
+        let text = self
+            .executor
+            .decode_token_text(&activation.request_id, token_id, request.finished)
+            .await;
         self.stats.record_token().await;
         metrics::record_generated_token(&self.node_id);
         Ok(Response::new(ProtoTokenOutput {

@@ -148,6 +148,12 @@ impl BitNet {
             // Prefill
             let mut logits = self.model.forward(&input_ids);
             let mut recent_tokens: Vec<u32> = Vec::new();
+            // Track generated-only tokens plus how much text has been yielded.
+            // The GPT-2 ByteLevel decoder only correctly reassembles multi-byte
+            // UTF-8 when the full token sequence is decoded; we decode the
+            // accumulated sequence each step and yield the delta.
+            let mut generated: Vec<u32> = Vec::new();
+            let mut emitted: String = String::new();
 
             for _ in 0..max_tokens {
                 let mut logits_data = match self.model.read_logits(&logits).await {
@@ -175,13 +181,28 @@ impl BitNet {
                 }
 
                 recent_tokens.push(next_token);
+                generated.push(next_token);
 
-                if let Ok(token_str) = self.tokenizer.decode_one(next_token) {
-                    yield token_str;
+                if let Ok(full) = self.tokenizer.decode(&generated) {
+                    if full.len() > emitted.len() && full.starts_with(&emitted) {
+                        let tail = &full[emitted.len()..];
+                        if !tail.ends_with('\u{FFFD}') {
+                            let piece = tail.to_string();
+                            emitted = full;
+                            yield piece;
+                        }
+                    }
                 }
 
                 // Decode step
                 logits = self.model.forward(&[next_token]);
+            }
+
+            // Final flush of any bytes held back by the U+FFFD guard.
+            if let Ok(full) = self.tokenizer.decode(&generated) {
+                if full.len() > emitted.len() && full.starts_with(&emitted) {
+                    yield full[emitted.len()..].to_string();
+                }
             }
         })
     }

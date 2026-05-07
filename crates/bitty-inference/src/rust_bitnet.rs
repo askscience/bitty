@@ -46,6 +46,13 @@ pub struct BitNetLayerExecutor {
     metadata: Arc<BitNetModelMetadata>,
     runtime: Option<Arc<AsyncMutex<BitNetRuntime>>>,
     kv_cache: Arc<Mutex<HashMap<KvCacheKey, Vec<u8>>>>,
+    decode_state: Arc<Mutex<HashMap<String, DecodeState>>>,
+}
+
+#[derive(Default)]
+struct DecodeState {
+    ids: Vec<u32>,
+    emitted: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +68,7 @@ impl BitNetLayerExecutor {
             metadata: Arc::new(metadata),
             runtime: None,
             kv_cache: Arc::new(Mutex::new(HashMap::new())),
+            decode_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -71,6 +79,7 @@ impl BitNetLayerExecutor {
             metadata: Arc::new(metadata),
             runtime: Some(Arc::new(AsyncMutex::new(runtime))),
             kv_cache: Arc::new(Mutex::new(HashMap::new())),
+            decode_state: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -83,6 +92,10 @@ impl BitNetLayerExecutor {
             .lock()
             .expect("kv cache poisoned")
             .retain(|key, _| key.request_id != request_id);
+        self.decode_state
+            .lock()
+            .expect("decode state poisoned")
+            .remove(request_id);
     }
 
     pub fn deterministic_tokens(
@@ -166,15 +179,75 @@ impl LayerExecutor for BitNetLayerExecutor {
         Ok(output)
     }
 
-    async fn decode_token_text(&self, token_id: u32) -> String {
+    async fn decode_token_text(
+        &self,
+        request_id: &str,
+        token_id: u32,
+        finished: bool,
+    ) -> String {
         let Some(runtime) = self.runtime.as_ref() else {
             return format!("<bitnet-rs:{token_id}>");
         };
         let runtime = runtime.lock().await;
-        match runtime.tokenizer().decode_one(token_id) {
+        let tokenizer = runtime.tokenizer();
+
+        // The GPT-2 ByteLevel decoder only correctly reassembles multi-byte
+        // UTF-8 when the full token sequence is decoded. We accumulate
+        // per-request tokens and decode the whole buffer each call, returning
+        // only the newly produced suffix.
+        let mut state_map = self.decode_state.lock().expect("decode state poisoned");
+        let state = state_map.entry(request_id.to_string()).or_default();
+        state.ids.push(token_id);
+        eprintln!(
+            "[bitty-debug] decode req={} token_id={} finished={} total_ids={}",
+            request_id,
+            token_id,
+            finished,
+            state.ids.len()
+        );
+        let full = match tokenizer.decode(&state.ids) {
             Ok(text) => text,
-            Err(_) => char::REPLACEMENT_CHARACTER.to_string(),
+            Err(e) => {
+                eprintln!("[bitty-debug] decode error: {e}");
+                if finished {
+                    state_map.remove(request_id);
+                }
+                return char::REPLACEMENT_CHARACTER.to_string();
+            }
+        };
+        eprintln!(
+            "[bitty-debug] decode full_len={} emitted_len={} full_ends_with_fffd={}",
+            full.len(),
+            state.emitted.len(),
+            full.ends_with('\u{FFFD}')
+        );
+
+        let delta = if full.len() > state.emitted.len() && full.starts_with(&state.emitted) {
+            let tail = &full[state.emitted.len()..];
+            // Hold back when the tail ends on an incomplete multi-byte UTF-8
+            // sequence (emitted as U+FFFD by the decoder) unless this is the
+            // final token, in which case we flush whatever we have.
+            if !finished && tail.ends_with('\u{FFFD}') {
+                String::new()
+            } else {
+                let piece = tail.to_string();
+                state.emitted = full;
+                piece
+            }
+        } else {
+            let tail = if full.len() > state.emitted.len() {
+                full[state.emitted.len()..].to_string()
+            } else {
+                String::new()
+            };
+            state.emitted = full;
+            tail
+        };
+
+        if finished {
+            state_map.remove(request_id);
         }
+        delta
     }
 
     async fn final_logits(

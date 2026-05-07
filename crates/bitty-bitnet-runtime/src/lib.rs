@@ -56,6 +56,20 @@ impl Default for SamplingOptions {
 
 pub type BitNetTokenizer = oxbitnet::Tokenizer;
 
+/// Load just the tokenizer from a GGUF file without initializing GPU resources
+/// or loading any weights. Useful for CLI-side prompt tokenization before
+/// sending generation requests to a remote cluster.
+pub fn load_tokenizer(path: &Path) -> Result<BitNetTokenizer> {
+    let data = std::fs::read(path)
+        .map_err(|err| BitNetRuntimeError::Backend(format!("read {}: {err}", path.display())))?;
+    let mut parser = oxbitnet::model::gguf::GgufParser::new(&data);
+    let gguf = parser
+        .parse()
+        .map_err(|err| BitNetRuntimeError::Backend(format!("gguf parse: {err}")))?;
+    oxbitnet::Tokenizer::from_gguf_metadata(&gguf.metadata)
+        .map_err(|err| BitNetRuntimeError::Backend(format!("tokenizer: {err}")))
+}
+
 impl BitNetRuntime {
     pub async fn load(path: &Path) -> Result<Self> {
         let metadata = BitNetModelMetadata::from_gguf_path(path)?;
@@ -226,12 +240,34 @@ impl BitNetRuntime {
         max_tokens: usize,
         temperature: f32,
     ) -> Result<String> {
+        self.generate_stream(prompt, max_tokens, temperature, |_| {})
+            .await
+    }
+
+    /// Generate tokens, streaming decoded text deltas to `on_delta` as they
+    /// become available. The underlying tokenizer uses a GPT-2 ByteLevel
+    /// decoder, which only correctly reassembles multi-byte UTF-8 when the
+    /// full token sequence is decoded together. We therefore decode the
+    /// accumulated sequence after every new token and emit only the newly
+    /// produced suffix. When the tail ends with U+FFFD (incomplete multi-byte
+    /// UTF-8) we hold back until the next token completes the character.
+    pub async fn generate_stream<F>(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        mut on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
         self.reset_kv_cache();
         let mut current_input = self
             .tokenizer()
             .encode(prompt, true)
             .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
-        let mut output = String::new();
+        let mut generated_ids: Vec<u32> = Vec::new();
+        let mut emitted: String = String::new();
         let mut cache = BitNetKvCache;
         let mut shard = self.load_shard(0..self.metadata.layer_count)?;
         for position in 0..max_tokens {
@@ -253,14 +289,28 @@ impl BitNetRuntime {
             }
             current_input.clear();
             current_input.push(token);
-            output.push_str(
-                &self
-                    .tokenizer()
-                    .decode_one(token)
-                    .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?,
-            );
+            generated_ids.push(token);
+
+            let full = self
+                .tokenizer()
+                .decode(&generated_ids)
+                .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
+            if full.len() > emitted.len() && full.starts_with(&emitted) {
+                let tail = &full[emitted.len()..];
+                if !tail.ends_with('\u{FFFD}') {
+                    on_delta(tail);
+                    emitted = full;
+                }
+            }
         }
-        Ok(output)
+        let final_text = self
+            .tokenizer()
+            .decode(&generated_ids)
+            .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
+        if final_text.len() > emitted.len() && final_text.starts_with(&emitted) {
+            on_delta(&final_text[emitted.len()..]);
+        }
+        Ok(final_text)
     }
 
     fn is_stop_token(&self, token: u32) -> bool {

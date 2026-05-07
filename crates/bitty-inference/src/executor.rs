@@ -18,9 +18,20 @@ pub trait LayerExecutor: Send + Sync {
         activation: ActivationTensor,
     ) -> Result<ActivationTensor, ExecutorError>;
 
-    /// Decode a token ID to text. Override in real executors with a proper tokenizer.
+    /// Decode a sampled token to the text delta that should be emitted to the
+    /// user at this point in the stream. Implementations that use byte-level
+    /// tokenizers (e.g. GPT-2 ByteLevel) MUST buffer tokens per `request_id`
+    /// and decode the accumulated sequence, returning only the new suffix, so
+    /// that multi-byte UTF-8 characters are reconstructed correctly. When
+    /// `finished` is true, any per-request state should be released.
+    ///
     /// Default fallback: interpret as a single Unicode code point if valid.
-    async fn decode_token_text(&self, token_id: u32) -> String {
+    async fn decode_token_text(
+        &self,
+        _request_id: &str,
+        token_id: u32,
+        _finished: bool,
+    ) -> String {
         char::from_u32(token_id)
             .map(|c| c.to_string())
             .unwrap_or_else(|| char::REPLACEMENT_CHARACTER.to_string())

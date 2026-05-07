@@ -162,6 +162,7 @@ struct NodeConfig {
 struct GenerateConfig {
     node: String,
     prompt: String,
+    prompt_tokens: Vec<u32>,
     max_tokens: u32,
     temperature: String,
     data_dir: Option<String>,
@@ -378,9 +379,26 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
     validate_cluster_token(&cluster_token)?;
-    let executor = Arc::new(FakeLayerExecutor);
-    let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
-        .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
+    // Load the real BitNet executor so inference produces real tokens and the
+    // per-request stateful decoder runs. Falls back to the fake executor if
+    // the model file can't be loaded (e.g. missing weights) so the node can
+    // still run for cluster topology tests.
+    let model_path = std::path::PathBuf::from(&config.model);
+    let worker: NetworkWorker<bitty_inference::BitNetLayerExecutor> =
+        match bitty_inference::BitNetLayerExecutor::load(&model_path).await {
+            Ok(bitnet) => {
+                let executor = Arc::new(bitnet);
+                NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
+                    .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()))
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to load BitNet runtime from {}: {err}",
+                    model_path.display()
+                )
+                .into());
+            }
+        };
     let worker_stats = worker.runtime_stats();
     if let Some(join) = &config.join {
         remember_active_cluster(&data_dir, join)?;
@@ -518,6 +536,29 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                 ui::dim(&format!("cluster: {}", compact_invite(&node)))
             );
         }
+        // Load the tokenizer once so we can send properly-tokenized prompts to
+        // the cluster instead of raw UTF-8 bytes (the coordinator otherwise
+        // interprets each byte as a token ID, which produces garbled output).
+        let model_path = model.model_path(&settings);
+        let tokenizer = if model_path.exists() {
+            match bitty_bitnet_runtime::load_tokenizer(&model_path) {
+                Ok(tok) => Some(tok),
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to load tokenizer ({err}); prompts will be sent unencoded"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tokenize = |text: &str| -> Vec<u32> {
+            tokenizer
+                .as_ref()
+                .and_then(|tok| tok.encode(text, true).ok())
+                .unwrap_or_default()
+        };
         if prompt.is_empty() {
             println!(
                 "  {}  {}  {}",
@@ -539,9 +580,11 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                 if line.is_empty() {
                     continue;
                 }
+                let tokens = tokenize(line);
                 run_generate(GenerateConfig {
                     node: node.clone(),
                     prompt: line.into(),
+                    prompt_tokens: tokens,
                     max_tokens: config.max_tokens,
                     temperature: config.temperature.clone(),
                     data_dir: config.data_dir.clone(),
@@ -550,9 +593,11 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
             }
             return Ok(());
         }
+        let tokens = tokenize(&prompt);
         return run_generate(GenerateConfig {
             node,
             prompt,
+            prompt_tokens: tokens,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             data_dir: config.data_dir,
@@ -620,48 +665,72 @@ async fn run_local_model(
     record_running_model(settings, &model.id())?;
     let temp = temperature.parse().unwrap_or(model.temperature);
 
+    // Helper: stream deltas to stdout with flush, prefix the first chunk.
+    struct Streamer {
+        started: bool,
+    }
+    impl Streamer {
+        fn new() -> Self {
+            Self { started: false }
+        }
+        fn emit(&mut self, delta: &str) {
+            if delta.is_empty() {
+                return;
+            }
+            if !self.started {
+                print!("  ");
+                self.started = true;
+            }
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        }
+    }
+
     // For non-BitNet models, skip GPU and go straight to CPU
     let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
-    let text: Result<String, String> = if is_bitnet {
-        async {
-            match spinner("loading model", BitNetRuntime::load(&path)).await {
-                Ok(mut runtime) => spinner(
-                    "generating",
-                    runtime.generate_full(prompt, max_tokens as usize, temp),
-                )
+    let mut streamer = Streamer::new();
+    let result: Result<(), String> = if is_bitnet {
+        match spinner("loading model", BitNetRuntime::load(&path)).await {
+            Ok(mut runtime) => runtime
+                .generate_stream(prompt, max_tokens as usize, temp, |delta| {
+                    streamer.emit(delta);
+                })
                 .await
+                .map(|_| ())
                 .map_err(|e| format!("GPU generate error: {e}")),
-                Err(gpu_err) => {
-                    eprintln!("GPU unavailable ({}), using CPU backend...", gpu_err);
-                    let cpu_model = spinner("loading model (CPU)", async {
-                        bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
-                    })
-                    .await?;
-                    spinner("generating (CPU)", async {
-                        cpu_model.generate(prompt, max_tokens as usize, temp, 40, 1.1)
-                    })
-                    .await
-                }
+            Err(gpu_err) => {
+                eprintln!("GPU unavailable ({}), using CPU backend...", gpu_err);
+                let cpu_model = spinner("loading model (CPU)", async {
+                    bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+                })
+                .await?;
+                cpu_model
+                    .generate_stream(
+                        prompt,
+                        max_tokens as usize,
+                        temp,
+                        40,
+                        1.1,
+                        |delta| streamer.emit(delta),
+                    )
+                    .map(|_| ())
             }
         }
-        .await
     } else {
         // Non-BitNet: go directly to CPU
-        async {
-            let cpu_model = spinner("loading model (CPU)", async {
-                bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
-            })
-            .await
-            .map_err(|e| format!("CPU load error: {e}"))?;
-            spinner("generating (CPU)", async {
-                cpu_model.generate(prompt, max_tokens as usize, temp, 40, 1.1)
-            })
-            .await
-        }
+        let cpu_model = spinner("loading model (CPU)", async {
+            bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+        })
         .await
+        .map_err(|e| format!("CPU load error: {e}"))?;
+        cpu_model
+            .generate_stream(prompt, max_tokens as usize, temp, 40, 1.1, |delta| {
+                streamer.emit(delta);
+            })
+            .map(|_| ())
     };
-    let text = text.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    println!("  {}", text);
+    result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    println!();
     Ok(())
 }
 
@@ -1690,6 +1759,7 @@ fn request_with_token<T>(message: T, token: &str) -> tonic::Request<T> {
 
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
+    let prompt_tokens = config.prompt_tokens.clone();
     if let Some(target) = iroh_transport::parse_iroh_target(&node) {
         let endpoint = spinner("connecting", async { start_iroh_client().await }).await?;
         let client = IrohSchedulerClient {
@@ -1703,7 +1773,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                     SCHEDULER_GENERATE,
                     &GenerateRequest {
                         request_id: request_id(),
-                        prompt_tokens: Vec::new(),
+                        prompt_tokens,
                         prompt: config.prompt,
                         max_new_tokens: config.max_tokens,
                         temperature: config.temperature.parse().unwrap_or(0.0),
@@ -1712,8 +1782,10 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                 .await
         })
         .await?;
+        print!("  ");
         for token in response.tokens {
             print!("{}", token.text);
+            let _ = io::stdout().flush();
             if token.finished {
                 println!();
             }
@@ -1729,7 +1801,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
         client
             .generate(GenerateRequest {
                 request_id: request_id(),
-                prompt_tokens: Vec::new(),
+                prompt_tokens,
                 prompt: config.prompt,
                 max_new_tokens: config.max_tokens,
                 temperature: config.temperature.parse().unwrap_or(0.0),
@@ -1739,8 +1811,11 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
     })
     .await?;
 
+    print!("  ");
+    let _ = io::stdout().flush();
     while let Some(token) = stream.message().await? {
         print!("{}", token.text);
+        let _ = io::stdout().flush();
         if token.finished {
             println!();
         }
@@ -1969,6 +2044,7 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
     let mut config = GenerateConfig {
         node: String::new(),
         prompt: String::new(),
+        prompt_tokens: Vec::new(),
         max_tokens: 32,
         temperature: "0".into(),
         data_dir: None,
@@ -2389,12 +2465,14 @@ struct IrohNode {
 }
 
 impl IrohNode {
-    fn serve_protocols(
+    fn serve_protocols<E>(
         &self,
         coordinator: Option<NetworkCoordinator>,
-        worker: NetworkWorker<FakeLayerExecutor>,
+        worker: NetworkWorker<E>,
         cluster_token: String,
-    ) {
+    ) where
+        E: bitty_inference::LayerExecutor + Clone + 'static,
+    {
         let endpoint = self.endpoint.clone();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(256));
         tokio::spawn(async move {
@@ -2459,12 +2537,15 @@ async fn start_iroh_client() -> Result<Endpoint, Box<dyn std::error::Error>> {
     Ok(endpoint)
 }
 
-async fn handle_iroh_request(
+async fn handle_iroh_request<E>(
     incoming: iroh::endpoint::Incoming,
     coordinator: Option<NetworkCoordinator>,
-    worker: NetworkWorker<FakeLayerExecutor>,
+    worker: NetworkWorker<E>,
     cluster_token: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    E: bitty_inference::LayerExecutor + Clone + 'static,
+{
     let connection = incoming.accept()?.await?;
     let alpn = connection.alpn().to_vec();
     if alpn == BITTY_WORKER_ALPN {
@@ -2574,11 +2655,14 @@ async fn handle_scheduler_frame(
     Ok(response)
 }
 
-async fn handle_worker_connection(
+async fn handle_worker_connection<E>(
     connection: iroh::endpoint::Connection,
-    worker: NetworkWorker<FakeLayerExecutor>,
+    worker: NetworkWorker<E>,
     cluster_token: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    E: bitty_inference::LayerExecutor + Clone + 'static,
+{
     let (mut send, mut recv) = connection.accept_bi().await?;
     let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
     if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
@@ -2594,11 +2678,14 @@ async fn handle_worker_connection(
     Ok(())
 }
 
-async fn handle_worker_frame(
+async fn handle_worker_frame<E>(
     frame: IrohFrame,
-    worker: NetworkWorker<FakeLayerExecutor>,
+    worker: NetworkWorker<E>,
     cluster_token: &str,
-) -> Result<IrohFrame, Box<dyn std::error::Error>> {
+) -> Result<IrohFrame, Box<dyn std::error::Error>>
+where
+    E: bitty_inference::LayerExecutor + Clone + 'static,
+{
     let response = match frame.op {
         WORKER_FORWARD_ACTIVATION => {
             let request: ProtoActivationTensor = frame.decode_message(WORKER_FORWARD_ACTIVATION)?;
