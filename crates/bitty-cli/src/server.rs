@@ -85,13 +85,15 @@ fn generate_response(settings: &BittySettings, body: &str) -> String {
     let model = json_field(body, "model").unwrap_or_else(|| settings.default_model.clone());
     let prompt = json_field(body, "prompt")
         .unwrap_or_else(|| json_field(body, "content").unwrap_or_else(|| "Hello".into()));
-    let text = std::env::current_exe()
+    let raw = std::env::current_exe()
         .ok()
         .and_then(|exe| {
             std::process::Command::new(exe)
                 .arg("run")
                 .arg(&model)
                 .arg(&prompt)
+                .arg("--local")
+                .arg("--no-daemon")
                 .arg("--data-dir")
                 .arg(settings.data_dir.as_os_str())
                 .arg("--num-predict")
@@ -100,11 +102,8 @@ fn generate_response(settings: &BittySettings, body: &str) -> String {
                 .ok()
         })
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| {
-            "Bitty generation failed; check that the model is pulled and supported.".into()
-        });
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_string());
+    let text = clean_server_output(raw);
     json!({
         "model": model,
         "created_at": "",
@@ -121,6 +120,69 @@ fn generate_response(settings: &BittySettings, body: &str) -> String {
         }]
     })
     .to_string()
+}
+
+/// Strip ANSI escape codes, spinner characters, and status lines from CLI output.
+fn clean_server_output(raw: Option<String>) -> String {
+    let text = match raw {
+        Some(s) => s.trim().to_string(),
+        None => return "Bitty generation failed; check that the model is pulled and supported.".into(),
+    };
+    if text.is_empty() {
+        return "Bitty generation failed; check that the model is pulled and supported.".into();
+    }
+    // Strip ANSI escape sequences (\x1b[...m)
+    let text = ansi_strip(&text);
+    // Strip spinner frames and status lines
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("cluster:")
+                && !trimmed.starts_with("⠋")
+                && !trimmed.starts_with("⠙")
+                && !trimmed.starts_with("⠹")
+                && !trimmed.starts_with("⠸")
+                && !trimmed.starts_with("⠼")
+                && !trimmed.starts_with("⠴")
+                && !trimmed.starts_with("⠦")
+                && !trimmed.starts_with("⠧")
+                && !trimmed.starts_with("⠇")
+                && !trimmed.starts_with("⠏")
+                && !trimmed.starts_with("connecting")
+                && !trimmed.starts_with("loading")
+                && !trimmed.starts_with("generating")
+                && !trimmed.starts_with("\u{1b}[")
+        })
+        .collect();
+    let result = lines.join("").trim().to_string();
+    if result.is_empty() {
+        "Bitty generation completed but produced no output.".into()
+    } else {
+        result
+    }
+}
+
+/// Remove ANSI escape codes (CSI sequences: ESC [ ... m).
+fn ansi_strip(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            while let Some(&ch) = chars.peek() {
+                if ch == 'm' {
+                    chars.next();
+                    break;
+                }
+                chars.next();
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn write_json(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {

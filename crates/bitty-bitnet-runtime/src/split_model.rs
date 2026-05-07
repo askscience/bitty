@@ -55,6 +55,13 @@ impl SplitBitNetModel {
         )
         .await
         .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
+        let is_ternary = result
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("general.architecture"))
+            .and_then(|v| v.as_str())
+            .map(|arch| matches!(arch, "bitnet" | "bitnet-25"))
+            .unwrap_or(false);
         let tokenizer = result
             .metadata
             .as_ref()
@@ -70,6 +77,7 @@ impl SplitBitNetModel {
             &result.weights,
             tokenizer,
             max_seq_len,
+            is_ternary,
         )?;
         Ok(model)
     }
@@ -248,6 +256,7 @@ impl SplitBitNetModel {
         weights: &WeightStore,
         tokenizer: Tokenizer,
         max_seq_len: usize,
+        ternary: bool,
     ) -> Result<Self> {
         let pipelines = PipelineManager::new(Arc::clone(&device));
         let pool = BufferPool::new(Arc::clone(&device), 256);
@@ -258,6 +267,17 @@ impl SplitBitNetModel {
                 .ok_or_else(|| BitNetRuntimeError::MissingWeight(name.to_string()))
         };
 
+        let build_linear = |prefix: &str, name: &str, in_dim: usize, out_dim: usize| -> Result<BitLinear> {
+            let key = format!("{prefix}.{name}");
+            let w = require(&format!("{key}.weight"))?;
+            if ternary {
+                let s = require(&format!("{key}.weight_scale"))?;
+                Ok(BitLinear::new(Arc::clone(&device), w, s, None, in_dim, out_dim))
+            } else {
+                Ok(BitLinear::new_f32(Arc::clone(&device), w, None, in_dim, out_dim))
+            }
+        };
+
         let embed_tokens = require("model.embed_tokens.weight")?;
         let final_norm = require("model.norm.weight")?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -266,74 +286,59 @@ impl SplitBitNetModel {
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
             let head_dim = config.head_dim();
-            let attention = Attention::new(
-                Arc::clone(&device),
-                config.clone(),
-                BitLinear::new(
-                    Arc::clone(&device),
-                    require(&format!("{prefix}.self_attn.q_proj.weight"))?,
-                    require(&format!("{prefix}.self_attn.q_proj.weight_scale"))?,
-                    None,
-                    config.hidden_size,
-                    config.num_attention_heads * head_dim,
-                ),
-                BitLinear::new(
-                    Arc::clone(&device),
-                    require(&format!("{prefix}.self_attn.k_proj.weight"))?,
-                    require(&format!("{prefix}.self_attn.k_proj.weight_scale"))?,
-                    None,
-                    config.hidden_size,
-                    config.num_key_value_heads * head_dim,
-                ),
-                BitLinear::new(
-                    Arc::clone(&device),
-                    require(&format!("{prefix}.self_attn.v_proj.weight"))?,
-                    require(&format!("{prefix}.self_attn.v_proj.weight_scale"))?,
-                    None,
-                    config.hidden_size,
-                    config.num_key_value_heads * head_dim,
-                ),
+            let o_norm = weights.get(&format!("{prefix}.self_attn.sub_norm.weight")).cloned();
+            let o_proj = if ternary {
                 BitLinear::new(
                     Arc::clone(&device),
                     require(&format!("{prefix}.self_attn.o_proj.weight"))?,
                     require(&format!("{prefix}.self_attn.o_proj.weight_scale"))?,
-                    weights
-                        .get(&format!("{prefix}.self_attn.sub_norm.weight"))
-                        .cloned(),
+                    o_norm,
                     config.num_attention_heads * head_dim,
                     config.hidden_size,
-                ),
-            );
-            let ffn = FFN::new(
+                )
+            } else {
+                BitLinear::new_f32(
+                    Arc::clone(&device),
+                    require(&format!("{prefix}.self_attn.o_proj.weight"))?,
+                    o_norm,
+                    config.num_attention_heads * head_dim,
+                    config.hidden_size,
+                )
+            };
+            let attention = Attention::new(
                 Arc::clone(&device),
                 config.clone(),
-                BitLinear::new(
-                    Arc::clone(&device),
-                    require(&format!("{prefix}.mlp.up_proj.weight"))?,
-                    require(&format!("{prefix}.mlp.up_proj.weight_scale"))?,
-                    None,
-                    config.hidden_size,
-                    config.intermediate_size,
-                ),
+                build_linear(&prefix, "self_attn.q_proj", config.hidden_size, config.num_attention_heads * head_dim)?,
+                build_linear(&prefix, "self_attn.k_proj", config.hidden_size, config.num_key_value_heads * head_dim)?,
+                build_linear(&prefix, "self_attn.v_proj", config.hidden_size, config.num_key_value_heads * head_dim)?,
+                o_proj,
+            );
+            let d_norm = weights.get(&format!("{prefix}.mlp.sub_norm.weight")).cloned();
+            let d_proj = if ternary {
                 BitLinear::new(
                     Arc::clone(&device),
                     require(&format!("{prefix}.mlp.down_proj.weight"))?,
                     require(&format!("{prefix}.mlp.down_proj.weight_scale"))?,
-                    weights
-                        .get(&format!("{prefix}.mlp.sub_norm.weight"))
-                        .cloned(),
+                    d_norm,
                     config.intermediate_size,
                     config.hidden_size,
-                ),
+                )
+            } else {
+                BitLinear::new_f32(
+                    Arc::clone(&device),
+                    require(&format!("{prefix}.mlp.down_proj.weight"))?,
+                    d_norm,
+                    config.intermediate_size,
+                    config.hidden_size,
+                )
+            };
+            let ffn = FFN::new(
+                Arc::clone(&device),
+                config.clone(),
+                build_linear(&prefix, "mlp.up_proj", config.hidden_size, config.intermediate_size)?,
+                d_proj,
                 if weights.has(&format!("{prefix}.mlp.gate_proj.weight")) {
-                    Some(BitLinear::new(
-                        Arc::clone(&device),
-                        require(&format!("{prefix}.mlp.gate_proj.weight"))?,
-                        require(&format!("{prefix}.mlp.gate_proj.weight_scale"))?,
-                        None,
-                        config.hidden_size,
-                        config.intermediate_size,
-                    ))
+                    Some(build_linear(&prefix, "mlp.gate_proj", config.hidden_size, config.intermediate_size)?)
                 } else {
                     None
                 },
@@ -353,11 +358,22 @@ impl SplitBitNetModel {
             LmHead::Tied
         } else if config.lm_head_f16 {
             LmHead::F16(require("lm_head.weight")?)
-        } else {
+        } else if ternary {
             LmHead::Separate(BitLinear::new(
                 Arc::clone(&device),
                 require("lm_head.weight")?,
                 require("lm_head.weight_scale")?,
+                weights
+                    .get("lm_head.input_norm.weight")
+                    .cloned()
+                    .or_else(|| Some(final_norm.clone())),
+                config.hidden_size,
+                config.vocab_size,
+            ))
+        } else {
+            LmHead::Separate(BitLinear::new_f32(
+                Arc::clone(&device),
+                require("lm_head.weight")?,
                 weights
                     .get("lm_head.input_norm.weight")
                     .cloned()

@@ -9,6 +9,7 @@ members = [
     "crates/bitty-worker",
     "crates/bitty-sim",
     "crates/bitty-observability",
+    "crates/oxbitnet",
 ]
 resolver = "2"
 
@@ -31,7 +32,7 @@ iroh = "0.98.2"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 memmap2 = "0.9"
-oxbitnet = "0.5.2"
+oxbitnet = { path = "crates/oxbitnet" }
 nvml-wrapper = "0.12.1"
 prost = "0.13"
 proptest = "1"

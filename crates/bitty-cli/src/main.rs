@@ -603,20 +603,41 @@ async fn run_local_model(
         .into());
     }
     record_running_model(settings, &model.id())?;
-    let runtime = spinner("loading model", async {
-        BitNetRuntime::load(&path).await
-    })
-    .await?;
-    let text = spinner("generating", async {
-        runtime
-            .generate_full(
-                prompt,
-                max_tokens as usize,
-                temperature.parse().unwrap_or(model.temperature),
-            )
-            .await
-    })
-    .await?;
+    let temp = temperature.parse().unwrap_or(model.temperature);
+
+    // For non-BitNet models, skip GPU and go straight to CPU
+    let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
+    let text: Result<String, String> = if is_bitnet {
+        async {
+            match spinner("loading model", BitNetRuntime::load(&path)).await {
+                Ok(runtime) => {
+                    spinner("generating", runtime.generate_full(prompt, max_tokens as usize, temp))
+                        .await
+                        .map_err(|e| format!("GPU generate error: {e}"))
+                }
+                Err(gpu_err) => {
+                    eprintln!("GPU unavailable ({}), using CPU backend...", gpu_err);
+                    let cpu_model = spinner("loading model (CPU)", async {
+                        bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+                    }).await?;
+                    spinner("generating (CPU)", async {
+                        cpu_model.generate(prompt, max_tokens as usize, temp, 40, 1.1)
+                    }).await
+                }
+            }
+        }.await
+    } else {
+        // Non-BitNet: go directly to CPU
+        async {
+            let cpu_model = spinner("loading model (CPU)", async {
+                bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+            }).await.map_err(|e| format!("CPU load error: {e}"))?;
+            spinner("generating (CPU)", async {
+                cpu_model.generate(prompt, max_tokens as usize, temp, 40, 1.1)
+            }).await
+        }.await
+    };
+    let text = text.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     println!("  {}", text);
     Ok(())
 }

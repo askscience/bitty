@@ -1,4 +1,5 @@
 mod split_model;
+pub mod cpu_backend;
 
 use bitty_model::{BitNetMetadataError, BitNetModelMetadata};
 use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, BitNetLogits};
