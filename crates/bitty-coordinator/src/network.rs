@@ -578,7 +578,6 @@ impl CoordinatorService for NetworkCoordinator {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,12 +77,9 @@ pub fn registry_models() -> Vec<ModelSpec> {
 pub fn find_registry_model(name: &str) -> Option<ModelSpec> {
     let (model, tag) = split_model_tag(name);
     let model_lower = model.to_lowercase();
-    registry_models()
-        .into_iter()
-        .find(|spec| {
-            spec.name.to_lowercase() == model_lower
-                && (tag.is_none() || tag == Some(spec.tag.as_str()))
-        })
+    registry_models().into_iter().find(|spec| {
+        spec.name.to_lowercase() == model_lower && (tag.is_none() || tag == Some(spec.tag.as_str()))
+    })
 }
 
 pub fn installed_models(settings: &BittySettings) -> Vec<ModelSpec> {
@@ -134,8 +131,7 @@ pub fn resolve_model(settings: &BittySettings, name_or_path: &str) -> Option<Mod
     installed_models(settings)
         .into_iter()
         .find(|spec| {
-            spec.id().to_lowercase() == name_lower
-                || spec.name.to_lowercase() == name_lower
+            spec.id().to_lowercase() == name_lower || spec.name.to_lowercase() == name_lower
         })
         .or_else(|| find_registry_model(name_or_path))
 }

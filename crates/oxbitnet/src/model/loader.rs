@@ -8,9 +8,8 @@ use tracing::{debug, info};
 use crate::error::Result;
 use crate::model::config::{Activation, ModelConfig};
 use crate::model::gguf::{
-    self, GgufMetadata, GgufParser, GgufValue, GGML_TYPE_F16, GGML_TYPE_I2_S,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K, GGML_TYPE_Q2_K,
-    GGML_TYPE_Q8_K,
+    self, GgufMetadata, GgufParser, GgufValue, GGML_TYPE_F16, GGML_TYPE_I2_S, GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_K,
 };
 use crate::model::weights::WeightStore;
 
@@ -34,7 +33,6 @@ pub struct LoadOptions {
     pub on_progress: Option<Box<dyn Fn(LoadProgress) + Send>>,
     pub cache_dir: Option<PathBuf>,
 }
-
 
 pub struct LoadResult {
     pub config: ModelConfig,
@@ -126,15 +124,27 @@ fn load_gguf(
         let data_offset = gguf.tensor_data_offset + tensor.offset as usize;
 
         let num_elements: u64 = tensor.shape.iter().product();
-        let byte_size = if tensor.tensor_type == GGML_TYPE_I2_S {
+        let mut byte_size = if tensor.tensor_type == GGML_TYPE_I2_S {
             num_elements.div_ceil(4) as usize + 32
         } else {
             let elem_size = gguf::ggml_type_size(tensor.tensor_type)?;
             let payload = (num_elements as f64 * elem_size).ceil() as usize;
-            // K-quant types include per-block header overhead (d, dmin, scales)
-            // on top of the raw quantized payload.
             payload + k_quant_overhead_bytes(tensor.tensor_type, num_elements)
         };
+
+        let end_offset = data_offset + byte_size;
+        if end_offset > data.len() {
+            byte_size = data.len().saturating_sub(data_offset);
+            if byte_size == 0 {
+                debug!(
+                    "tensor {} at offset {} exceeds file length {}, skipping",
+                    tensor.name,
+                    data_offset,
+                    data.len()
+                );
+                continue;
+            }
+        }
 
         let tensor_data = &data[data_offset..data_offset + byte_size];
         let hf_name = remap_gguf_name(&tensor.name);
@@ -255,9 +265,7 @@ fn config_from_gguf_metadata(metadata: &GgufMetadata) -> ModelConfig {
     let hidden_size = get("embedding_length")
         .and_then(|v| v.as_u32())
         .unwrap_or(2560) as usize;
-    let num_layers = get("block_count")
-        .and_then(|v| v.as_u32())
-        .unwrap_or(30) as usize;
+    let num_layers = get("block_count").and_then(|v| v.as_u32()).unwrap_or(30) as usize;
     let num_heads = get("attention.head_count")
         .and_then(|v| v.as_u32())
         .unwrap_or(20) as usize;

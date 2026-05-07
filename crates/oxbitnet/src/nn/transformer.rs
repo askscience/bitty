@@ -60,16 +60,30 @@ impl TransformerBlock {
         let hidden = self.config.hidden_size;
 
         // Self-attention with residual
-        let normed_attn = self.dispatch_rmsnorm(encoder, input, &self.input_layer_norm.clone(), n, pipelines, pool);
-        let attn_out = self.attention.forward(&normed_attn, n, kv_cache, encoder, pipelines, pool);
+        let normed_attn = self.dispatch_rmsnorm(
+            encoder,
+            input,
+            &self.input_layer_norm.clone(),
+            n,
+            pipelines,
+            pool,
+        );
+        let attn_out = self
+            .attention
+            .forward(&normed_attn, n, kv_cache, encoder, pipelines, pool);
 
         let residual1 = self.dispatch_add(encoder, input, &attn_out, n * hidden, pipelines, pool);
 
         // FFN with residual
-        let normed_ffn = self.dispatch_rmsnorm(encoder, &residual1, &self.post_attn_layer_norm.clone(), n, pipelines, pool);
+        let normed_ffn = self.dispatch_rmsnorm(
+            encoder,
+            &residual1,
+            &self.post_attn_layer_norm.clone(),
+            n,
+            pipelines,
+            pool,
+        );
         let ffn_out = self.ffn.forward(&normed_ffn, n, encoder, pipelines, pool);
-
-        
 
         self.dispatch_add(encoder, &residual1, &ffn_out, n * hidden, pipelines, pool)
     }

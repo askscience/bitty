@@ -34,10 +34,12 @@ impl PipelineManager {
             return Arc::clone(entry);
         }
 
-        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(key),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(key),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
 
         let pipeline = self
             .device

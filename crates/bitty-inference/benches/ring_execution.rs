@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_inference::{FakeLayerExecutor, LayerExecutor};
 use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, Quantization};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
 fn make_activation(payload_len: usize) -> ActivationTensor {
@@ -35,23 +35,17 @@ fn bench_fake_executor_forward(c: &mut Criterion) {
                 quantization: Quantization::Bit1,
             };
 
-            group.bench_function(
-                format!("{num_layers}layers_{size_kb}KB").as_str(),
-                |b| {
-                    b.iter(|| {
-                        rt.block_on(async {
-                            let _ = black_box(
-                                executor
-                                    .execute_range(
-                                        black_box(&range),
-                                        black_box(activation.clone()),
-                                    )
-                                    .await,
-                            );
-                        });
+            group.bench_function(format!("{num_layers}layers_{size_kb}KB").as_str(), |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let _ = black_box(
+                            executor
+                                .execute_range(black_box(&range), black_box(activation.clone()))
+                                .await,
+                        );
                     });
-                },
-            );
+                });
+            });
         }
     }
     group.finish();

@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use bitty_model::{ModelMetadata, classify_architecture};
 use bitty_model::gguf::GgufMetadataValue;
+use bitty_model::{classify_architecture, ModelMetadata};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 mod common;
 

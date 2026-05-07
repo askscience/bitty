@@ -41,7 +41,12 @@ impl PackedTensor {
     }
 
     pub fn dummy() -> Self {
-        Self { data: vec![0u8; 4], ggml_type: 0, shape: vec![1, 1], name: "dummy".into() }
+        Self {
+            data: vec![0u8; 4],
+            ggml_type: 0,
+            shape: vec![1, 1],
+            name: "dummy".into(),
+        }
     }
 }
 
@@ -118,13 +123,21 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new() -> Self {
-        Self { keys: HashMap::new(), values: HashMap::new(), seq_len: 0 }
+        Self {
+            keys: HashMap::new(),
+            values: HashMap::new(),
+            seq_len: 0,
+        }
     }
 
     pub fn reserve(&mut self, num_layers: usize, max_kv_dim: usize, max_seq: usize) {
         for layer in 0..num_layers {
-            self.keys.entry(layer).or_insert_with(|| vec![0f32; max_kv_dim * max_seq]);
-            self.values.entry(layer).or_insert_with(|| vec![0f32; max_kv_dim * max_seq]);
+            self.keys
+                .entry(layer)
+                .or_insert_with(|| vec![0f32; max_kv_dim * max_seq]);
+            self.values
+                .entry(layer)
+                .or_insert_with(|| vec![0f32; max_kv_dim * max_seq]);
         }
     }
 }

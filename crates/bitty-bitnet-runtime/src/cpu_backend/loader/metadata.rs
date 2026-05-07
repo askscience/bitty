@@ -25,8 +25,14 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
     let get_u32 = |suffix: &str| -> Option<u32> {
         meta.get(&format!("{arch}.{suffix}"))
             .and_then(|v| v.as_u32())
-            .or_else(|| meta.get(&format!("llama.{suffix}")).and_then(|v| v.as_u32()))
-            .or_else(|| meta.get(&format!("bitnet.{suffix}")).and_then(|v| v.as_u32()))
+            .or_else(|| {
+                meta.get(&format!("llama.{suffix}"))
+                    .and_then(|v| v.as_u32())
+            })
+            .or_else(|| {
+                meta.get(&format!("bitnet.{suffix}"))
+                    .and_then(|v| v.as_u32())
+            })
     };
 
     let hidden_size = get_u32("embedding_length").unwrap_or(2048) as usize;
@@ -71,7 +77,11 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
     let rope_theta = meta
         .get(&format!("{arch}.rope.freq_base"))
         .and_then(|v| v.as_f32())
-        .unwrap_or(if arch.contains("bitnet-25") { 500000.0 } else { 10000.0 });
+        .unwrap_or(if arch.contains("bitnet-25") {
+            500000.0
+        } else {
+            10000.0
+        });
 
     let max_seq_len = meta
         .get(&format!("{arch}.context_length"))

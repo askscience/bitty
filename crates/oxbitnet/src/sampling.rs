@@ -55,7 +55,6 @@ pub fn sample_token(
                 *logit = f32::NEG_INFINITY;
             }
         }
-
     }
 
     // Softmax + sample

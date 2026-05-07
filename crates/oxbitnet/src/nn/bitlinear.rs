@@ -214,12 +214,7 @@ impl BitLinear {
         pipelines: &mut PipelineManager,
     ) {
         let entry = pipelines.get_or_create_default("rmsnorm", RMSNORM_WGSL);
-        let params = create_uniform_u32_u32_f32(
-            &self.device,
-            n as u32,
-            self.in_dim as u32,
-            1e-5,
-        );
+        let params = create_uniform_u32_u32_f32(&self.device, n as u32, self.in_dim as u32, 1e-5);
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bitlinear_rmsnorm"),

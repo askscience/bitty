@@ -32,8 +32,8 @@ pub struct BitNetModel {
 }
 
 enum LmHead {
-    Tied,                    // Use embed_tokens
-    F16(GpuBuf),             // F16 untied head (e.g., Falcon-E)
+    Tied,        // Use embed_tokens
+    F16(GpuBuf), // F16 untied head (e.g., Falcon-E)
     Separate(BitLinear),
 }
 
@@ -92,45 +92,87 @@ impl BitNetModel {
             let input_ln = require(&format!("{p}.input_layernorm.weight"))?;
             let post_attn_ln = require(&format!("{p}.post_attention_layernorm.weight"))?;
 
-            let attn_sub_norm = weights.get(&format!("{p}.self_attn.sub_norm.weight")).cloned();
+            let attn_sub_norm = weights
+                .get(&format!("{p}.self_attn.sub_norm.weight"))
+                .cloned();
             let ffn_sub_norm = weights.get(&format!("{p}.mlp.sub_norm.weight")).cloned();
 
             let q_proj = build_linear(
-                &device, weights, ternary, &p, "self_attn.q_proj",
-                config.hidden_size, config.num_attention_heads * head_dim,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "self_attn.q_proj",
+                config.hidden_size,
+                config.num_attention_heads * head_dim,
             );
             let k_proj = build_linear(
-                &device, weights, ternary, &p, "self_attn.k_proj",
-                config.hidden_size, config.num_key_value_heads * head_dim,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "self_attn.k_proj",
+                config.hidden_size,
+                config.num_key_value_heads * head_dim,
             );
             let v_proj = build_linear(
-                &device, weights, ternary, &p, "self_attn.v_proj",
-                config.hidden_size, config.num_key_value_heads * head_dim,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "self_attn.v_proj",
+                config.hidden_size,
+                config.num_key_value_heads * head_dim,
             );
             let o_proj = build_linear_with_norm(
-                &device, weights, ternary, &p, "self_attn.o_proj",
-                attn_sub_norm, config.num_attention_heads * head_dim, config.hidden_size,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "self_attn.o_proj",
+                attn_sub_norm,
+                config.num_attention_heads * head_dim,
+                config.hidden_size,
             );
 
             let attention = Attention::new(
                 Arc::clone(&device),
                 config.clone(),
-                q_proj, k_proj, v_proj, o_proj,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
             );
 
             let up_proj = build_linear(
-                &device, weights, ternary, &p, "mlp.up_proj",
-                config.hidden_size, config.intermediate_size,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "mlp.up_proj",
+                config.hidden_size,
+                config.intermediate_size,
             );
             let down_proj = build_linear_with_norm(
-                &device, weights, ternary, &p, "mlp.down_proj",
-                ffn_sub_norm, config.intermediate_size, config.hidden_size,
+                &device,
+                weights,
+                ternary,
+                &p,
+                "mlp.down_proj",
+                ffn_sub_norm,
+                config.intermediate_size,
+                config.hidden_size,
             );
 
             let gate_proj = if weights.has(&format!("{p}.mlp.gate_proj.weight")) {
                 Some(build_linear(
-                    &device, weights, ternary, &p, "mlp.gate_proj",
-                    config.hidden_size, config.intermediate_size,
+                    &device,
+                    weights,
+                    ternary,
+                    &p,
+                    "mlp.gate_proj",
+                    config.hidden_size,
+                    config.intermediate_size,
                 ))
             } else {
                 None
@@ -139,7 +181,9 @@ impl BitNetModel {
             let ffn = FFN::new(
                 Arc::clone(&device),
                 config.clone(),
-                up_proj, down_proj, gate_proj,
+                up_proj,
+                down_proj,
+                gate_proj,
             );
 
             layers.push(TransformerBlock::new(
@@ -163,7 +207,10 @@ impl BitNetModel {
                 Arc::clone(&device),
                 require("lm_head.weight")?,
                 require("lm_head.weight_scale")?,
-                weights.get("lm_head.input_norm.weight").cloned().or_else(|| Some(final_norm.clone())),
+                weights
+                    .get("lm_head.input_norm.weight")
+                    .cloned()
+                    .or_else(|| Some(final_norm.clone())),
                 config.hidden_size,
                 config.vocab_size,
             ))
@@ -171,7 +218,10 @@ impl BitNetModel {
             LmHead::Separate(BitLinear::new_f32(
                 Arc::clone(&device),
                 require("lm_head.weight")?,
-                weights.get("lm_head.input_norm.weight").cloned().or_else(|| Some(final_norm.clone())),
+                weights
+                    .get("lm_head.input_norm.weight")
+                    .cloned()
+                    .or_else(|| Some(final_norm.clone())),
                 config.hidden_size,
                 config.vocab_size,
             ))
@@ -218,7 +268,14 @@ impl BitNetModel {
         for i in 0..self.layers.len() {
             let new_hidden = {
                 let kv = &mut self.kv_caches[i];
-                self.layers[i].forward(&hidden, n, kv, &mut encoder, &mut self.pipelines, &self.pool)
+                self.layers[i].forward(
+                    &hidden,
+                    n,
+                    kv,
+                    &mut encoder,
+                    &mut self.pipelines,
+                    &self.pool,
+                )
             };
             hidden = new_hidden;
             self.kv_caches[i].seq_len += n;
@@ -251,9 +308,7 @@ impl BitNetModel {
                 let w = weight.clone();
                 self.dispatch_lm_head_with(&mut encoder, &lm_input, 1, w)
             }
-            LmHead::Tied => {
-                self.dispatch_lm_head(&mut encoder, &lm_input, 1)
-            }
+            LmHead::Tied => self.dispatch_lm_head(&mut encoder, &lm_input, 1),
             LmHead::Separate(_) => {
                 if let LmHead::Separate(ref mut bl) = self.lm_head {
                     bl.forward(&lm_input, 1, &mut encoder, &mut self.pipelines, &self.pool)
@@ -282,9 +337,11 @@ impl BitNetModel {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
         let _ = self.device.poll(wgpu::PollType::Wait);
         rx.await
             .map_err(|_| BitNetError::BufferMap)?
@@ -317,13 +374,14 @@ impl BitNetModel {
         token_buffer: &wgpu::Buffer,
         n: usize,
     ) -> GpuBuf {
-        let entry = self.pipelines.get_or_create_default("embedding", EMBEDDING_WGSL);
+        let entry = self
+            .pipelines
+            .get_or_create_default("embedding", EMBEDDING_WGSL);
 
         let output_size = (n * self.config.hidden_size * 4) as u64;
-        let output = self.pool.acquire(
-            output_size,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        );
+        let output = self
+            .pool
+            .acquire(output_size, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
 
         let params_data = [
             (n as u32).to_le_bytes(),
@@ -359,7 +417,9 @@ impl BitNetModel {
         input: &wgpu::Buffer,
         n: usize,
     ) -> GpuBuf {
-        let entry = self.pipelines.get_or_create_default("rmsnorm", RMSNORM_WGSL);
+        let entry = self
+            .pipelines
+            .get_or_create_default("rmsnorm", RMSNORM_WGSL);
 
         let output = self.pool.acquire(
             (n * self.config.hidden_size * 4) as u64,
@@ -411,7 +471,9 @@ impl BitNetModel {
     ) -> GpuBuf {
         let v = self.config.vocab_size;
         let d = self.config.hidden_size;
-        let entry = self.pipelines.get_or_create_default("f32_matmul", F32_MATMUL_WGSL);
+        let entry = self
+            .pipelines
+            .get_or_create_default("f32_matmul", F32_MATMUL_WGSL);
 
         let output = self.pool.acquire(
             (n * v * 4) as u64,
@@ -460,10 +522,14 @@ fn build_linear(
     out_dim: usize,
 ) -> BitLinear {
     let key = format!("{layer_prefix}.{name}");
-    let weight = weights.get(&format!("{key}.weight")).cloned()
+    let weight = weights
+        .get(&format!("{key}.weight"))
+        .cloned()
         .expect(&format!("Missing weight: {key}.weight"));
     if ternary {
-        let scale = weights.get(&format!("{key}.weight_scale")).cloned()
+        let scale = weights
+            .get(&format!("{key}.weight_scale"))
+            .cloned()
             .expect(&format!("Missing scale: {key}.weight_scale"));
         BitLinear::new(Arc::clone(device), weight, scale, None, in_dim, out_dim)
     } else {
@@ -482,12 +548,23 @@ fn build_linear_with_norm(
     out_dim: usize,
 ) -> BitLinear {
     let key = format!("{layer_prefix}.{name}");
-    let weight = weights.get(&format!("{key}.weight")).cloned()
+    let weight = weights
+        .get(&format!("{key}.weight"))
+        .cloned()
         .expect(&format!("Missing weight: {key}.weight"));
     if ternary {
-        let scale = weights.get(&format!("{key}.weight_scale")).cloned()
+        let scale = weights
+            .get(&format!("{key}.weight_scale"))
+            .cloned()
             .expect(&format!("Missing scale: {key}.weight_scale"));
-        BitLinear::new(Arc::clone(device), weight, scale, norm_weight, in_dim, out_dim)
+        BitLinear::new(
+            Arc::clone(device),
+            weight,
+            scale,
+            norm_weight,
+            in_dim,
+            out_dim,
+        )
     } else {
         BitLinear::new_f32(Arc::clone(device), weight, norm_weight, in_dim, out_dim)
     }

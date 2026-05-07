@@ -96,9 +96,7 @@ impl BitNet {
         let tokenizer = if let Some(ref metadata) = result.metadata {
             Tokenizer::from_gguf_metadata(metadata)?
         } else {
-            return Err(BitNetError::Tokenizer(
-                "No tokenizer metadata found".into(),
-            ));
+            return Err(BitNetError::Tokenizer("No tokenizer metadata found".into()));
         };
 
         Ok(Self { model, tokenizer })

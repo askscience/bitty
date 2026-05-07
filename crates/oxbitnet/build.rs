@@ -15,8 +15,8 @@ fn main() {
     fs::create_dir_all(out_dir).expect("Failed to create shaders output dir");
 
     if shader_src.exists() {
-        for entry in glob::glob(shader_src.join("*.wgsl").to_str().unwrap())
-            .expect("Failed to glob shaders")
+        for entry in
+            glob::glob(shader_src.join("*.wgsl").to_str().unwrap()).expect("Failed to glob shaders")
         {
             let path = entry.expect("Failed to read shader path");
             let filename = path.file_name().unwrap();
@@ -27,9 +27,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     if shader_src.exists() {
-        println!(
-            "cargo:rerun-if-changed={}",
-            shader_src.to_str().unwrap()
-        );
+        println!("cargo:rerun-if-changed={}", shader_src.to_str().unwrap());
     }
 }

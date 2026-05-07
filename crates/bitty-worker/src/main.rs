@@ -1,10 +1,10 @@
 use bitty_inference::{BitNetLayerExecutor, FakeLayerExecutor};
 use bitty_protocol::cli::{parse_next_or_exit, required_next_or_exit};
 use bitty_protocol::endpoint::normalize_endpoint;
-use bitty_protocol::BITTY_PROTOCOL_VERSION;
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
 use bitty_protocol::pb::{HeartbeatRequest, RegisterWorkerRequest};
 use bitty_protocol::security::{AuthMode, BITTY_TOKEN_HEADER};
+use bitty_protocol::BITTY_PROTOCOL_VERSION;
 use bitty_protocol::{AssignedLayerRange, LayerAssignment, ModelStage, NodeId, Quantization};
 use bitty_worker::{keepalive, network::NetworkWorker, HardwareProfiler};
 use std::sync::Arc;

@@ -1,8 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use bitty_protocol::{
-    HardwareProfile, LayerMetadata, NodeId, NodeTier,
-};
+use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, NodeTier};
 use bitty_sim::SimulatedCluster;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
 fn make_profiles(count: usize) -> Vec<HardwareProfile> {
@@ -66,12 +64,10 @@ fn bench_cluster_build(c: &mut Criterion) {
     let layers_30 = make_layers(30);
     group.bench_function("4nodes_30layers", |b| {
         b.iter(|| {
-            let _ = black_box(
-                SimulatedCluster::build(
-                    black_box(profiles_4.clone()),
-                    black_box(layers_30.clone()),
-                ),
-            );
+            let _ = black_box(SimulatedCluster::build(
+                black_box(profiles_4.clone()),
+                black_box(layers_30.clone()),
+            ));
         });
     });
 
@@ -79,12 +75,10 @@ fn bench_cluster_build(c: &mut Criterion) {
     let layers_30b = make_layers(30);
     group.bench_function("8nodes_30layers", |b| {
         b.iter(|| {
-            let _ = black_box(
-                SimulatedCluster::build(
-                    black_box(profiles_8.clone()),
-                    black_box(layers_30b.clone()),
-                ),
-            );
+            let _ = black_box(SimulatedCluster::build(
+                black_box(profiles_8.clone()),
+                black_box(layers_30b.clone()),
+            ));
         });
     });
 
@@ -92,12 +86,10 @@ fn bench_cluster_build(c: &mut Criterion) {
     let layers_80 = make_layers(80);
     group.bench_function("16nodes_80layers", |b| {
         b.iter(|| {
-            let _ = black_box(
-                SimulatedCluster::build(
-                    black_box(profiles_16.clone()),
-                    black_box(layers_80.clone()),
-                ),
-            );
+            let _ = black_box(SimulatedCluster::build(
+                black_box(profiles_16.clone()),
+                black_box(layers_80.clone()),
+            ));
         });
     });
     group.finish();
@@ -117,9 +109,7 @@ fn bench_token_streaming(c: &mut Criterion) {
             SimulatedCluster::build(profiles_4.clone(), layers_30.clone()).expect("build cluster");
         b.iter(|| {
             rt.block_on(async {
-                let _ = black_box(
-                    cluster.stream_tokens("bench", 100),
-                );
+                let _ = black_box(cluster.stream_tokens("bench", 100));
             });
         });
     });
@@ -129,9 +119,7 @@ fn bench_token_streaming(c: &mut Criterion) {
             SimulatedCluster::build(profiles_4.clone(), layers_30.clone()).expect("build cluster");
         b.iter(|| {
             rt.block_on(async {
-                let _ = black_box(
-                    cluster.stream_tokens("bench", 20),
-                );
+                let _ = black_box(cluster.stream_tokens("bench", 20));
             });
         });
     });

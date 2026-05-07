@@ -12,23 +12,52 @@ pub const N: &str = "\x1b[0m";
 
 const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn ok() -> String { format!("{G}ok{N}") }
-pub fn fail() -> String { format!("{R}fail{N}") }
-pub fn ready() -> String { format!("{G}ready{N}") }
-pub fn not_ready() -> String { format!("{Y}not ready{N}") }
+pub fn ok() -> String {
+    format!("{G}ok{N}")
+}
+pub fn fail() -> String {
+    format!("{R}fail{N}")
+}
+pub fn ready() -> String {
+    format!("{G}ready{N}")
+}
+pub fn not_ready() -> String {
+    format!("{Y}not ready{N}")
+}
 
-pub fn label(text: &str) -> String { format!("  {D}{}{N}", text) }
-pub fn dim(text: &str) -> String { format!("{D}{}{N}", text) }
-pub fn bold(text: &str) -> String { format!("{B}{}{N}", text) }
-pub fn green(text: &str) -> String { format!("{G}{}{N}", text) }
-pub fn yellow(text: &str) -> String { format!("{Y}{}{N}", text) }
-pub fn cyan(text: &str) -> String { format!("{C}{}{N}", text) }
-pub fn red(text: &str) -> String { format!("{R}{}{N}", text) }
-pub fn rule() { println!("  {}", "─".repeat(50)); }
+pub fn label(text: &str) -> String {
+    format!("  {D}{}{N}", text)
+}
+pub fn dim(text: &str) -> String {
+    format!("{D}{}{N}", text)
+}
+pub fn bold(text: &str) -> String {
+    format!("{B}{}{N}", text)
+}
+pub fn green(text: &str) -> String {
+    format!("{G}{}{N}", text)
+}
+pub fn yellow(text: &str) -> String {
+    format!("{Y}{}{N}", text)
+}
+pub fn cyan(text: &str) -> String {
+    format!("{C}{}{N}", text)
+}
+pub fn red(text: &str) -> String {
+    format!("{R}{}{N}", text)
+}
+pub fn rule() {
+    println!("  {}", "─".repeat(50));
+}
 
 pub fn header(title: &str, data_dir: &Path, version: &str) {
     println!();
-    println!("  {B}{}{N}  {D}v{}  ·  {}{N}", title, version, data_dir.display());
+    println!(
+        "  {B}{}{N}  {D}v{}  ·  {}{N}",
+        title,
+        version,
+        data_dir.display()
+    );
     rule();
     println!();
 }
@@ -45,7 +74,9 @@ where
             print!(
                 "\r  {} {} {}...{}",
                 frames[tick % frames.len()],
-                D, label_owned, N
+                D,
+                label_owned,
+                N
             );
             io::stdout().flush().ok();
             tokio::time::sleep(Duration::from_millis(80)).await;

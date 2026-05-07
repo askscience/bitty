@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_worker::HardwareProfiler;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_hardware_profiler(c: &mut Criterion) {
     let profiler = HardwareProfiler::new("bench-node");

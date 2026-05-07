@@ -27,12 +27,9 @@ pub async fn init_gpu() -> Result<GpuContext> {
         adapter_limits.max_storage_buffer_binding_size;
     required_limits.max_storage_buffers_per_shader_stage =
         adapter_limits.max_storage_buffers_per_shader_stage;
-    required_limits.max_compute_workgroup_size_x =
-        adapter_limits.max_compute_workgroup_size_x;
-    required_limits.max_compute_workgroup_size_y =
-        adapter_limits.max_compute_workgroup_size_y;
-    required_limits.max_compute_workgroup_size_z =
-        adapter_limits.max_compute_workgroup_size_z;
+    required_limits.max_compute_workgroup_size_x = adapter_limits.max_compute_workgroup_size_x;
+    required_limits.max_compute_workgroup_size_y = adapter_limits.max_compute_workgroup_size_y;
+    required_limits.max_compute_workgroup_size_z = adapter_limits.max_compute_workgroup_size_z;
     required_limits.max_compute_invocations_per_workgroup =
         adapter_limits.max_compute_invocations_per_workgroup;
     required_limits.max_compute_workgroup_storage_size =

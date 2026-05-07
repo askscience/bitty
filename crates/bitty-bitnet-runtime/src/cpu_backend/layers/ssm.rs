@@ -35,7 +35,14 @@ pub fn forward(
     let (x_raw, z) = xz.split_at(d_inner);
 
     // 2. Conv1D: depthwise causal convolution over time
-    let x_conv = conv1d_step(x_raw, &w.conv1d_weight, w.conv1d_bias.as_deref(), state, d_inner, ksize);
+    let x_conv = conv1d_step(
+        x_raw,
+        &w.conv1d_weight,
+        w.conv1d_bias.as_deref(),
+        state,
+        d_inner,
+        ksize,
+    );
     let x_act: Vec<f32> = x_conv.iter().map(|&v| silu(v)).collect();
 
     // 3. Delta projection: dt = softplus(W_dt @ hidden + b_dt)
@@ -48,13 +55,25 @@ pub fn forward(
         matmul::matmul(hidden, &w.dt_proj_weight, d, d_inner)?
     } else {
         matmul::matmul(hidden, &w.dt_proj_weight, d, dt_rank)?
-            .iter().cycle().take(d_inner).copied().collect()
+            .iter()
+            .cycle()
+            .take(d_inner)
+            .copied()
+            .collect()
     };
 
-    let dt: Vec<f32> = dt_raw.iter().enumerate().map(|(i, &v)| {
-        let bias = w.dt_proj_bias.as_ref().map(|b| b.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0);
-        softplus(v + bias)
-    }).collect();
+    let dt: Vec<f32> = dt_raw
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let bias = w
+                .dt_proj_bias
+                .as_ref()
+                .map(|b| b.get(i).copied().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            softplus(v + bias)
+        })
+        .collect();
 
     // 4. Selection parameters B and C from x
     // In standard Mamba: B and C are linear projections of x_act
@@ -74,7 +93,7 @@ pub fn forward(
             let idx = di * d_state + si;
             // A_discrete = exp(dt[di] * A[di, si])
             let a_disc = (dt[di] * w.a_log[idx].exp()).exp(); // exp(dt * exp(A_log)) = exp(dt * A)
-            // B_bar = dt[di] * B[di]  (simplified: B selection same for all states)
+                                                              // B_bar = dt[di] * B[di]  (simplified: B selection same for all states)
             let b_bar = dt[di] * b[di];
             // Update state
             state.h[idx] = a_disc * state.h[idx] + b_bar * x_act[di];
@@ -151,7 +170,10 @@ fn conv1d_step(
                 sum += seq[t * d_inner + ch] * kernel_f32[ki];
             }
         }
-        out[ch] = sum + bias.map(|b| b.get(ch).copied().unwrap_or(0.0)).unwrap_or(0.0);
+        out[ch] = sum
+            + bias
+                .map(|b| b.get(ch).copied().unwrap_or(0.0))
+                .unwrap_or(0.0);
     }
 
     out

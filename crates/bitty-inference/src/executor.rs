@@ -201,7 +201,8 @@ mod tests {
             end_layer_exclusive: 1,
             quantization: Quantization::Bit1,
         };
-        let activation = ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
+        let activation =
+            ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
         let err = StubLayerExecutor
             .execute_range(&range, activation)
             .await

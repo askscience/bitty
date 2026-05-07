@@ -182,9 +182,7 @@ async fn main() -> oxbitnet::Result<()> {
         let elapsed = t0.elapsed().as_secs_f64();
         let tok_sec = token_count as f64 / elapsed;
 
-        println!(
-            "\n\n  [{token_count} tokens in {elapsed:.1}s — {tok_sec:.1} tok/s]\n"
-        );
+        println!("\n\n  [{token_count} tokens in {elapsed:.1}s — {tok_sec:.1} tok/s]\n");
 
         history.push(ChatMessage {
             role: "assistant".into(),

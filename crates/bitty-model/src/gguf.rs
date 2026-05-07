@@ -96,11 +96,12 @@ pub fn bytes_per_element(ggml_type: u32) -> f64 {
         GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K => 1.0,
         GGML_TYPE_Q6_K => 0.84375,
         GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q5_K => 0.6875,
-        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K
-        | GGML_TYPE_Q4_0_4_4 | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8 => 0.5,
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K | GGML_TYPE_Q4_0_4_4
+        | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8 => 0.5,
         GGML_TYPE_Q3_K => 0.4375,
         GGML_TYPE_Q2_K => 0.3125,
-        GGML_TYPE_I2_S | GGML_TYPE_TQ2_0 => 0.125,
+        GGML_TYPE_I2_S => 0.25,
+        GGML_TYPE_TQ2_0 => 0.125,
         GGML_TYPE_IQ1_S | GGML_TYPE_IQ1_M | GGML_TYPE_TQ1_0 => 0.15625,
         GGML_TYPE_IQ2_XXS => 0.28125,
         GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S => 0.3125,
@@ -118,20 +119,15 @@ pub fn quantization_from_ggml_type(ggml_type: u32) -> Quantization {
         GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K => Quantization::Q8,
         GGML_TYPE_Q6_K => Quantization::Q6,
         GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q5_K => Quantization::Q5,
-        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K
-        | GGML_TYPE_Q4_0_4_4 | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8
-        | GGML_TYPE_IQ4_NL | GGML_TYPE_IQ4_XS => Quantization::Q4,
-        GGML_TYPE_Q3_K | GGML_TYPE_IQ3_XXS | GGML_TYPE_IQ3_S | GGML_TYPE_IQ3_M => {
-            Quantization::Q3
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q4_K | GGML_TYPE_Q4_0_4_4
+        | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8 | GGML_TYPE_IQ4_NL | GGML_TYPE_IQ4_XS => {
+            Quantization::Q4
         }
-        GGML_TYPE_Q2_K | GGML_TYPE_IQ2_XXS | GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S => {
-            Quantization::Q2
+        GGML_TYPE_Q3_K | GGML_TYPE_IQ3_XXS | GGML_TYPE_IQ3_S | GGML_TYPE_IQ3_M => Quantization::Q3,
+        GGML_TYPE_Q2_K | GGML_TYPE_IQ2_XXS | GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S => Quantization::Q2,
+        GGML_TYPE_I2_S | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0 | GGML_TYPE_IQ1_S | GGML_TYPE_IQ1_M => {
+            Quantization::Bit1
         }
-        GGML_TYPE_I2_S
-        | GGML_TYPE_TQ1_0
-        | GGML_TYPE_TQ2_0
-        | GGML_TYPE_IQ1_S
-        | GGML_TYPE_IQ1_M => Quantization::Bit1,
         _ => Quantization::Fp16,
     }
 }

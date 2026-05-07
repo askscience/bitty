@@ -267,16 +267,30 @@ impl SplitBitNetModel {
                 .ok_or_else(|| BitNetRuntimeError::MissingWeight(name.to_string()))
         };
 
-        let build_linear = |prefix: &str, name: &str, in_dim: usize, out_dim: usize| -> Result<BitLinear> {
-            let key = format!("{prefix}.{name}");
-            let w = require(&format!("{key}.weight"))?;
-            if ternary {
-                let s = require(&format!("{key}.weight_scale"))?;
-                Ok(BitLinear::new(Arc::clone(&device), w, s, None, in_dim, out_dim))
-            } else {
-                Ok(BitLinear::new_f32(Arc::clone(&device), w, None, in_dim, out_dim))
-            }
-        };
+        let build_linear =
+            |prefix: &str, name: &str, in_dim: usize, out_dim: usize| -> Result<BitLinear> {
+                let key = format!("{prefix}.{name}");
+                let w = require(&format!("{key}.weight"))?;
+                if ternary {
+                    let s = require(&format!("{key}.weight_scale"))?;
+                    Ok(BitLinear::new(
+                        Arc::clone(&device),
+                        w,
+                        s,
+                        None,
+                        in_dim,
+                        out_dim,
+                    ))
+                } else {
+                    Ok(BitLinear::new_f32(
+                        Arc::clone(&device),
+                        w,
+                        None,
+                        in_dim,
+                        out_dim,
+                    ))
+                }
+            };
 
         let embed_tokens = require("model.embed_tokens.weight")?;
         let final_norm = require("model.norm.weight")?;
@@ -286,7 +300,9 @@ impl SplitBitNetModel {
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
             let head_dim = config.head_dim();
-            let o_norm = weights.get(&format!("{prefix}.self_attn.sub_norm.weight")).cloned();
+            let o_norm = weights
+                .get(&format!("{prefix}.self_attn.sub_norm.weight"))
+                .cloned();
             let o_proj = if ternary {
                 BitLinear::new(
                     Arc::clone(&device),
@@ -308,12 +324,29 @@ impl SplitBitNetModel {
             let attention = Attention::new(
                 Arc::clone(&device),
                 config.clone(),
-                build_linear(&prefix, "self_attn.q_proj", config.hidden_size, config.num_attention_heads * head_dim)?,
-                build_linear(&prefix, "self_attn.k_proj", config.hidden_size, config.num_key_value_heads * head_dim)?,
-                build_linear(&prefix, "self_attn.v_proj", config.hidden_size, config.num_key_value_heads * head_dim)?,
+                build_linear(
+                    &prefix,
+                    "self_attn.q_proj",
+                    config.hidden_size,
+                    config.num_attention_heads * head_dim,
+                )?,
+                build_linear(
+                    &prefix,
+                    "self_attn.k_proj",
+                    config.hidden_size,
+                    config.num_key_value_heads * head_dim,
+                )?,
+                build_linear(
+                    &prefix,
+                    "self_attn.v_proj",
+                    config.hidden_size,
+                    config.num_key_value_heads * head_dim,
+                )?,
                 o_proj,
             );
-            let d_norm = weights.get(&format!("{prefix}.mlp.sub_norm.weight")).cloned();
+            let d_norm = weights
+                .get(&format!("{prefix}.mlp.sub_norm.weight"))
+                .cloned();
             let d_proj = if ternary {
                 BitLinear::new(
                     Arc::clone(&device),
@@ -335,10 +368,20 @@ impl SplitBitNetModel {
             let ffn = FFN::new(
                 Arc::clone(&device),
                 config.clone(),
-                build_linear(&prefix, "mlp.up_proj", config.hidden_size, config.intermediate_size)?,
+                build_linear(
+                    &prefix,
+                    "mlp.up_proj",
+                    config.hidden_size,
+                    config.intermediate_size,
+                )?,
                 d_proj,
                 if weights.has(&format!("{prefix}.mlp.gate_proj.weight")) {
-                    Some(build_linear(&prefix, "mlp.gate_proj", config.hidden_size, config.intermediate_size)?)
+                    Some(build_linear(
+                        &prefix,
+                        "mlp.gate_proj",
+                        config.hidden_size,
+                        config.intermediate_size,
+                    )?)
                 } else {
                     None
                 },

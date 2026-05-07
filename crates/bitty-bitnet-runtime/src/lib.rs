@@ -1,5 +1,5 @@
-mod split_model;
 pub mod cpu_backend;
+mod split_model;
 
 use bitty_model::{BitNetMetadataError, BitNetModelMetadata};
 use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, BitNetLogits};
@@ -189,50 +189,72 @@ impl BitNetRuntime {
                 .ok_or(BitNetRuntimeError::EmptyLogits);
         }
 
-        logits
+        let mut scaled: Vec<f32> = logits
             .logits
             .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index as u32)
-            .ok_or(BitNetRuntimeError::EmptyLogits)
+            .map(|l| l / options.temperature)
+            .collect();
+        let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for val in scaled.iter_mut() {
+            *val = (*val - max_logit).exp();
+            sum += *val;
+        }
+        if sum <= 0.0 {
+            return logits
+                .logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index as u32)
+                .ok_or(BitNetRuntimeError::EmptyLogits);
+        }
+        for val in scaled.iter_mut() {
+            *val /= sum;
+        }
+
+        let dist = rand::distr::weighted::WeightedIndex::new(scaled)
+            .map_err(|_| BitNetRuntimeError::EmptyLogits)?;
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        Ok(rng.sample(&dist) as u32)
     }
 
     pub async fn generate_full(
-        &self,
+        &mut self,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
     ) -> Result<String> {
-        let mut runtime = Self::load(&self.model_path).await?;
-        let mut current_input = runtime
+        self.reset_kv_cache();
+        let mut current_input = self
             .tokenizer()
             .encode(prompt, true)
             .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
         let mut output = String::new();
         let mut cache = BitNetKvCache;
-        let mut shard = runtime.load_shard(0..runtime.metadata.layer_count)?;
+        let mut shard = self.load_shard(0..self.metadata.layer_count)?;
         for position in 0..max_tokens {
             let activation =
                 BitNetActivation::from_tokens("local", position as u32, &current_input);
-            let activation = runtime
+            let activation = self
                 .forward_layers(&mut shard, &mut cache, activation)
                 .await?;
-            let logits = runtime.final_logits(activation).await?;
-            let token = runtime.sample(
+            let logits = self.final_logits(activation).await?;
+            let token = self.sample(
                 &logits,
                 SamplingOptions {
                     temperature,
                     top_p: 1.0,
                 },
             )?;
-            if runtime.is_stop_token(token) {
+            if self.is_stop_token(token) {
                 break;
             }
             current_input.clear();
             current_input.push(token);
             output.push_str(
-                &runtime
+                &self
                     .tokenizer()
                     .decode_one(token)
                     .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?,

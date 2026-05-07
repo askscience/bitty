@@ -12,12 +12,12 @@
 //! - `dequant.rs`   — Dequant block readers (Q4K, Q6K, Q8_0)
 //! - `ops.rs`       — Shared operations (RMSNorm, SiLU, softmax, RoPE, softplus)
 
-pub mod types;
 pub mod dequant;
-pub mod ops;
-pub mod matmul;
-pub mod loader;
 pub mod layers;
+pub mod loader;
+pub mod matmul;
+pub mod ops;
+pub mod types;
 
 use std::path::Path;
 use types::*;
@@ -49,12 +49,16 @@ impl CpuModel {
         kv_cache.reserve(meta.num_layers, max_kv_dim, max_seq);
 
         // Initialize SSM states
-        let ssm_states: Vec<SsmState> = weights.layers.iter().map(|layer| {
-            match &layer.kind {
-                LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
-                _ => SsmState::new(1, 1, 1), // dummy for non-SSM layers
-            }
-        }).collect();
+        let ssm_states: Vec<SsmState> = weights
+            .layers
+            .iter()
+            .map(|layer| {
+                match &layer.kind {
+                    LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
+                    _ => SsmState::new(1, 1, 1), // dummy for non-SSM layers
+                }
+            })
+            .collect();
 
         Ok(Self {
             metadata: meta,
@@ -74,10 +78,16 @@ impl CpuModel {
 
     /// Full end-to-end generation on CPU.
     pub fn generate(
-        &self, prompt: &str, max_tokens: usize,
-        temperature: f32, top_k: usize, repeat_penalty: f32,
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        repeat_penalty: f32,
     ) -> Result<String, String> {
-        let tokens = self.tokenizer.encode(prompt, true)
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
             .map_err(|e| format!("Tokenize error: {e}"))?;
         let mut output = String::new();
         let eos = self.tokenizer.eos_token_id();
@@ -87,12 +97,14 @@ impl CpuModel {
         let d = m.hidden_size;
 
         let mut kv_cache = KvCache::new();
-        let mut ssm_states: Vec<SsmState> = self.layers.iter().map(|layer| {
-            match &layer.kind {
+        let mut ssm_states: Vec<SsmState> = self
+            .layers
+            .iter()
+            .map(|layer| match &layer.kind {
                 LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
                 _ => SsmState::new(1, 1, 1),
-            }
-        }).collect();
+            })
+            .collect();
 
         let vocab_size = m.vocab_size;
         let mut hidden = vec![0f32; d];
@@ -100,7 +112,9 @@ impl CpuModel {
             let tid = tid as usize;
             let mut h = vec![0f32; d];
             if tid < vocab_size && self.embed_tokens.len() >= d * vocab_size {
-                for i in 0..d { h[i] = self.embed_tokens[tid * d + i]; }
+                for i in 0..d {
+                    h[i] = self.embed_tokens[tid * d + i];
+                }
             }
             for layer in &self.layers {
                 h = layer.forward(&h, pos, &mut kv_cache, &mut ssm_states, m)?;
@@ -113,15 +127,15 @@ impl CpuModel {
         let mut recent: Vec<u32> = tokens.clone();
 
         let mut pos = tokens.len();
-        let mut rng_state: u64 = 0xC0FFEE_u64
-            ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        let mut rng_state: u64 = 0xC0FFEE_u64 ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
         for _ in 0..max_tokens {
             for layer in &self.layers {
                 hidden = layer.forward(&hidden, pos, &mut kv_cache, &mut ssm_states, m)?;
             }
             kv_cache.seq_len += 1;
             let normed = ops::rms_norm(&hidden, &self.final_norm, m.rms_norm_eps);
-            let mut logits = compute_logits(&normed, &self.lm_head, &self.embed_tokens, d, m.vocab_size)?;
+            let mut logits =
+                compute_logits(&normed, &self.lm_head, &self.embed_tokens, d, m.vocab_size)?;
 
             // Apply simple repeat penalty: divide positive logits, multiply negatives.
             if repeat_penalty > 1.0 {
@@ -129,20 +143,29 @@ impl CpuModel {
                 for &tok in &recent[window..] {
                     let ti = tok as usize;
                     if ti < logits.len() {
-                        if logits[ti] > 0.0 { logits[ti] /= repeat_penalty; }
-                        else                 { logits[ti] *= repeat_penalty; }
+                        if logits[ti] > 0.0 {
+                            logits[ti] /= repeat_penalty;
+                        } else {
+                            logits[ti] *= repeat_penalty;
+                        }
                     }
                 }
             }
 
             let next_token = sample(&logits, temperature, top_k, &mut rng_state);
-            if next_token == eos || Some(next_token) == eot || Some(next_token) == im_end { break; }
-            let text = self.tokenizer.decode_one(next_token)
+            if next_token == eos || Some(next_token) == eot || Some(next_token) == im_end {
+                break;
+            }
+            let text = self
+                .tokenizer
+                .decode_one(next_token)
                 .unwrap_or_else(|_| char::REPLACEMENT_CHARACTER.to_string());
             output.push_str(&text);
             recent.push(next_token);
             if (next_token as usize) < vocab_size && self.embed_tokens.len() >= d * vocab_size {
-                for i in 0..d { hidden[i] = self.embed_tokens[next_token as usize * d + i]; }
+                for i in 0..d {
+                    hidden[i] = self.embed_tokens[next_token as usize * d + i];
+                }
             }
             pos += 1;
         }
@@ -165,7 +188,9 @@ fn argmax(logits: &[f32]) -> u32 {
 
 /// Xorshift-style sampler over logits with temperature and top-k.
 fn sample(logits: &[f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {
-    if logits.is_empty() { return 0; }
+    if logits.is_empty() {
+        return 0;
+    }
     if temperature <= 0.0 || !temperature.is_finite() {
         return argmax(logits);
     }
@@ -180,12 +205,17 @@ fn sample(logits: &[f32], temperature: f32, top_k: usize, rng_state: &mut u64) -
 
     // Top-k truncation (0 = disabled).
     if top_k > 0 && top_k < scored.len() {
-        scored.select_nth_unstable_by(top_k, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.select_nth_unstable_by(top_k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
     }
 
     // Numerically stable softmax.
-    let max = scored.iter().fold(f32::NEG_INFINITY, |acc, &(_, v)| if v > acc { v } else { acc });
+    let max = scored.iter().fold(
+        f32::NEG_INFINITY,
+        |acc, &(_, v)| if v > acc { v } else { acc },
+    );
     let mut sum = 0f32;
     for e in scored.iter_mut() {
         let p = (e.1 - max).exp();
@@ -198,7 +228,9 @@ fn sample(logits: &[f32], temperature: f32, top_k: usize, rng_state: &mut u64) -
 
     // xorshift64 -> uniform in [0, 1)
     let mut s = *rng_state;
-    if s == 0 { s = 0x9E3779B97F4A7C15; }
+    if s == 0 {
+        s = 0x9E3779B97F4A7C15;
+    }
     s ^= s << 13;
     s ^= s >> 7;
     s ^= s << 17;
@@ -209,19 +241,22 @@ fn sample(logits: &[f32], temperature: f32, top_k: usize, rng_state: &mut u64) -
     let mut acc = 0f32;
     for &(i, p) in &scored {
         acc += p;
-        if acc >= target { return i as u32; }
+        if acc >= target {
+            return i as u32;
+        }
     }
     scored.last().map(|&(i, _)| i as u32).unwrap_or(0)
 }
 
 fn compute_logits(
-    hidden: &[f32], lm_head: &Option<LmHead>,
-    embed_tokens: &[f32], d: usize, vocab: usize,
+    hidden: &[f32],
+    lm_head: &Option<LmHead>,
+    embed_tokens: &[f32],
+    d: usize,
+    vocab: usize,
 ) -> std::result::Result<Vec<f32>, String> {
     match lm_head {
-        Some(LmHead::Packed(lm)) => {
-            matmul::matmul(hidden, lm, d, vocab)
-        }
+        Some(LmHead::Packed(lm)) => matmul::matmul(hidden, lm, d, vocab),
         _ => {
             // Tied embeddings: embedding is stored as [vocab, hidden] (GGUF row-major)
             let mut logits = vec![0f32; vocab];
@@ -239,5 +274,3 @@ fn compute_logits(
         }
     }
 }
-
-

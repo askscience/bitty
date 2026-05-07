@@ -58,7 +58,9 @@ pub fn classify(name: &str) -> Option<TensorRole> {
             "attn_output.weight" | "self_attn.o_proj.weight" => Some(TensorRole::OProj(layer)),
             "attn_qkv.weight" => Some(TensorRole::QkvFused(layer)),
             "attn_norm.weight" | "input_layernorm.weight" => Some(TensorRole::InputNorm(layer)),
-            "ffn_norm.weight" | "post_attention_norm.weight" => Some(TensorRole::PostAttnNorm(layer)),
+            "ffn_norm.weight" | "post_attention_norm.weight" => {
+                Some(TensorRole::PostAttnNorm(layer))
+            }
             "attn_q_norm.weight" => Some(TensorRole::QNorm(layer)),
             "attn_k_norm.weight" => Some(TensorRole::KNorm(layer)),
             "ffn_up.weight" | "mlp.up_proj.weight" => Some(TensorRole::UpProj(layer)),
@@ -77,8 +79,10 @@ pub fn classify(name: &str) -> Option<TensorRole> {
             "ssm_out.weight" => Some(TensorRole::SsmOutProj(layer)),
             "ssm_norm.weight" => Some(TensorRole::SsmNorm(layer)),
             // Sub-norms and extras — ignore
-            "attn_sub_norm.weight" | "ffn_sub_norm.weight"
-            | "self_attn.sub_norm.weight" | "mlp.sub_norm.weight"
+            "attn_sub_norm.weight"
+            | "ffn_sub_norm.weight"
+            | "self_attn.sub_norm.weight"
+            | "mlp.sub_norm.weight"
             | "attn_gate.weight" => Some(TensorRole::Ignored),
             _ => None,
         };

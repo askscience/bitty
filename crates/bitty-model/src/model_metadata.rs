@@ -102,7 +102,11 @@ pub fn classify_architecture(arch_str: &str) -> ModelArchitecture {
         ModelArchitecture::Mistral
     } else if lower.contains("phi-3") || lower.contains("phi3") || lower.contains("phi-") {
         ModelArchitecture::Phi
-    } else if lower.contains("qwen2") || lower.contains("qwen-2") || lower.contains("qwen3") || lower.contains("qwen-3") {
+    } else if lower.contains("qwen2")
+        || lower.contains("qwen-2")
+        || lower.contains("qwen3")
+        || lower.contains("qwen-3")
+    {
         ModelArchitecture::Qwen2
     } else if lower.contains("gemma-2") || lower.contains("gemma2") {
         ModelArchitecture::Gemma2
@@ -232,16 +236,11 @@ impl ModelMetadata {
         let rope_dimension_count = architecture
             .rope_dimension_key()
             .and_then(|key| metadata_u64(&gguf, &[key]))
-            .unwrap_or(hidden_size as u64 / num_attention_heads as u64) as u32;
+            .unwrap_or(hidden_size as u64 / num_attention_heads as u64)
+            as u32;
 
-        let vocab_size = metadata_u64(
-            &gguf,
-            &[
-                "llama.vocab_size",
-                "tokenizer.ggml.tokens",
-            ],
-        )
-        .unwrap_or(32_000) as u32;
+        let vocab_size = metadata_u64(&gguf, &["llama.vocab_size", "tokenizer.ggml.tokens"])
+            .unwrap_or(32_000) as u32;
 
         let context_length = metadata_u64(
             &gguf,
@@ -412,8 +411,10 @@ mod tests {
     #[test]
     fn classifies_llama_architecture() {
         let mut gguf = make_gguf("llama");
-        gguf.metadata
-            .insert("llama.embedding_length".into(), GgufMetadataValue::U64(4096));
+        gguf.metadata.insert(
+            "llama.embedding_length".into(),
+            GgufMetadataValue::U64(4096),
+        );
         let m = ModelMetadata::from_gguf(gguf, None).unwrap();
         assert_eq!(m.architecture, ModelArchitecture::Llama);
     }
@@ -439,8 +440,10 @@ mod tests {
     #[test]
     fn quantization_derived_from_tensors() {
         let mut gguf = make_gguf("llama");
-        gguf.metadata
-            .insert("llama.embedding_length".into(), GgufMetadataValue::U64(4096));
+        gguf.metadata.insert(
+            "llama.embedding_length".into(),
+            GgufMetadataValue::U64(4096),
+        );
         gguf.tensors[0].ggml_type = 1;
         gguf.tensors[1].ggml_type = 10;
         let m = ModelMetadata::from_gguf(gguf, None).unwrap();
@@ -450,8 +453,10 @@ mod tests {
     #[test]
     fn quantization_all_q2_tensors_yields_q2() {
         let mut gguf = make_gguf("llama");
-        gguf.metadata
-            .insert("llama.embedding_length".into(), GgufMetadataValue::U64(4096));
+        gguf.metadata.insert(
+            "llama.embedding_length".into(),
+            GgufMetadataValue::U64(4096),
+        );
         gguf.tensors[0].ggml_type = 10;
         gguf.tensors[1].ggml_type = 10;
         gguf.tensors[2].ggml_type = 10;
@@ -462,8 +467,10 @@ mod tests {
     #[test]
     fn quantization_mixed_tensors_yields_highest_precision() {
         let mut gguf = make_gguf("llama");
-        gguf.metadata
-            .insert("llama.embedding_length".into(), GgufMetadataValue::U64(4096));
+        gguf.metadata.insert(
+            "llama.embedding_length".into(),
+            GgufMetadataValue::U64(4096),
+        );
         gguf.tensors[0].ggml_type = 10;
         gguf.tensors[1].ggml_type = 10;
         gguf.tensors[2].ggml_type = 12;

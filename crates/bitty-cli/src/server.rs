@@ -14,7 +14,14 @@ pub fn serve(settings: BittySettings) -> Result<(), Box<dyn std::error::Error>> 
     println!("bitty serve listening on http://{}", settings.api_host);
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_stream(stream, &settings)?,
+            Ok(stream) => {
+                let settings = settings.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_stream(stream, &settings) {
+                        eprintln!("bitty serve request failed: {err}");
+                    }
+                });
+            }
             Err(err) => {
                 let _ = logger::log(&settings.data_dir, format!("api connection failed: {err}"));
                 eprintln!("bitty serve connection failed: {err}");
@@ -62,8 +69,12 @@ fn models_response(settings: &BittySettings) -> String {
 }
 
 fn show_response(settings: &BittySettings, body: &str) -> String {
-    let model_name = json_field(body, "model").unwrap_or_else(|| settings.default_model.clone());
-    match resolve_model(settings, &model_name) {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let model_name = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&settings.default_model);
+    match resolve_model(settings, model_name) {
         Some(model) => json!({
             "model": model.id(),
             "path": model.model_path(settings),
@@ -82,27 +93,42 @@ fn show_response(settings: &BittySettings, body: &str) -> String {
 }
 
 fn generate_response(settings: &BittySettings, body: &str) -> String {
-    let model = json_field(body, "model").unwrap_or_else(|| settings.default_model.clone());
-    let prompt = json_field(body, "prompt")
-        .unwrap_or_else(|| json_field(body, "content").unwrap_or_else(|| "Hello".into()));
-    let raw = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            std::process::Command::new(exe)
-                .arg("run")
-                .arg(&model)
-                .arg(&prompt)
-                .arg("--local")
-                .arg("--no-daemon")
-                .arg("--data-dir")
-                .arg(settings.data_dir.as_os_str())
-                .arg("--num-predict")
-                .arg(settings.default_num_predict.to_string())
-                .output()
-                .ok()
-        })
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_string());
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&settings.default_model);
+    let prompt = parsed
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("Hello");
+    let raw = (|| -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        let output = std::process::Command::new(exe)
+            .arg("run")
+            .arg(model)
+            .arg(prompt)
+            .arg("--local")
+            .arg("--no-daemon")
+            .arg("--data-dir")
+            .arg(settings.data_dir.as_os_str())
+            .arg("--num-predict")
+            .arg(settings.default_num_predict.to_string())
+            .output()
+            .map_err(|e| {
+                eprintln!("bitty serve: failed to spawn bitty run: {e}");
+            })
+            .ok()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "bitty serve: bitty run exited with non-zero status: {}",
+                stderr.trim()
+            );
+        }
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    })();
     let text = clean_server_output(raw);
     json!({
         "model": model,
@@ -126,7 +152,9 @@ fn generate_response(settings: &BittySettings, body: &str) -> String {
 fn clean_server_output(raw: Option<String>) -> String {
     let text = match raw {
         Some(s) => s.trim().to_string(),
-        None => return "Bitty generation failed; check that the model is pulled and supported.".into(),
+        None => {
+            return "Bitty generation failed; check that the model is pulled and supported.".into()
+        }
     };
     if text.is_empty() {
         return "Bitty generation failed; check that the model is pulled and supported.".into();
@@ -192,15 +220,6 @@ fn write_json(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
         body.len(),
         body
     )
-}
-
-fn json_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let after_key = body.split(&needle).nth(1)?;
-    let after_colon = after_key.split_once(':')?.1.trim_start();
-    let value = after_colon.strip_prefix('"')?;
-    let end = value.find('"')?;
-    Some(value[..end].to_string())
 }
 
 #[cfg(test)]

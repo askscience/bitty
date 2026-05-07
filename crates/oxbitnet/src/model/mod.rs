@@ -5,5 +5,5 @@ pub mod loader;
 pub mod weights;
 
 pub use config::ModelConfig;
-pub use loader::{LoadOptions, LoadProgress, load_model};
+pub use loader::{load_model, LoadOptions, LoadProgress};
 pub use weights::WeightStore;

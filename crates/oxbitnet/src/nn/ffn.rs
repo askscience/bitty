@@ -65,17 +65,33 @@ impl FFN {
         pipelines: &mut PipelineManager,
         pool: &BufferPool,
     ) -> GpuBuf {
-        let act_type = if self.config.activation == Activation::Relu2 { 0u32 } else { 1u32 };
+        let act_type = if self.config.activation == Activation::Relu2 {
+            0u32
+        } else {
+            1u32
+        };
 
-        let gate = self.gate_proj.as_mut().unwrap().forward(input, n, encoder, pipelines, pool);
+        let gate = self
+            .gate_proj
+            .as_mut()
+            .unwrap()
+            .forward(input, n, encoder, pipelines, pool);
         let up = self.up_proj.forward(input, n, encoder, pipelines, pool);
 
         let num_elements = n * self.config.intermediate_size;
-        let gate_activated = self.apply_activation(encoder, &gate, num_elements, act_type, pipelines, pool);
+        let gate_activated =
+            self.apply_activation(encoder, &gate, num_elements, act_type, pipelines, pool);
 
-        let gated = self.apply_elementwise(encoder, &gate_activated, &up, num_elements, 1, pipelines, pool);
+        let gated = self.apply_elementwise(
+            encoder,
+            &gate_activated,
+            &up,
+            num_elements,
+            1,
+            pipelines,
+            pool,
+        );
 
-        
         self.down_proj.forward(&gated, n, encoder, pipelines, pool)
     }
 
@@ -87,14 +103,19 @@ impl FFN {
         pipelines: &mut PipelineManager,
         pool: &BufferPool,
     ) -> GpuBuf {
-        let act_type = if self.config.activation == Activation::Relu2 { 0u32 } else { 1u32 };
+        let act_type = if self.config.activation == Activation::Relu2 {
+            0u32
+        } else {
+            1u32
+        };
 
         let up = self.up_proj.forward(input, n, encoder, pipelines, pool);
         let num_elements = n * self.config.intermediate_size;
-        let activated = self.apply_activation(encoder, &up, num_elements, act_type, pipelines, pool);
+        let activated =
+            self.apply_activation(encoder, &up, num_elements, act_type, pipelines, pool);
 
-        
-        self.down_proj.forward(&activated, n, encoder, pipelines, pool)
+        self.down_proj
+            .forward(&activated, n, encoder, pipelines, pool)
     }
 
     fn apply_activation(
@@ -158,11 +179,7 @@ impl FFN {
             BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         );
 
-        let params_data = [
-            (num_elements as u32).to_le_bytes(),
-            op.to_le_bytes(),
-        ]
-        .concat();
+        let params_data = [(num_elements as u32).to_le_bytes(), op.to_le_bytes()].concat();
         let params = create_uniform_raw(&self.device, &params_data);
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

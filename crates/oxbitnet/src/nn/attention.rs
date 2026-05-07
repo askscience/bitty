@@ -20,13 +20,8 @@ pub struct KvCache {
     pub max_seq_len: usize,
 }
 
-pub fn create_kv_cache(
-    device: &wgpu::Device,
-    config: &ModelConfig,
-    max_seq_len: usize,
-) -> KvCache {
-    let kv_size =
-        (max_seq_len * config.num_key_value_heads * config.head_dim() * 4) as u64;
+pub fn create_kv_cache(device: &wgpu::Device, config: &ModelConfig, max_seq_len: usize) -> KvCache {
+    let kv_size = (max_seq_len * config.num_key_value_heads * config.head_dim() * 4) as u64;
     let key = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("kv_key"),
         size: kv_size,
@@ -100,8 +95,24 @@ impl Attention {
         let v_buf = self.v_proj.forward(input, n, encoder, pipelines, pool);
 
         // RoPE
-        let q_roped = self.apply_rope(encoder, &q_buf, n, num_heads, kv_cache.seq_len, pipelines, pool);
-        let k_roped = self.apply_rope(encoder, &k_buf, n, num_kv_heads, kv_cache.seq_len, pipelines, pool);
+        let q_roped = self.apply_rope(
+            encoder,
+            &q_buf,
+            n,
+            num_heads,
+            kv_cache.seq_len,
+            pipelines,
+            pool,
+        );
+        let k_roped = self.apply_rope(
+            encoder,
+            &k_buf,
+            n,
+            num_kv_heads,
+            kv_cache.seq_len,
+            pipelines,
+            pool,
+        );
 
         // Update KV cache
         self.append_to_cache(encoder, &k_roped, &v_buf, kv_cache, n);
@@ -109,18 +120,35 @@ impl Attention {
         let total_seq = kv_cache.seq_len + n;
 
         // Attention scores: Q @ K^T * scale
-        let scores = self.compute_scores(encoder, &q_roped, &kv_cache.key, n, total_seq, pipelines, pool);
+        let scores = self.compute_scores(
+            encoder,
+            &q_roped,
+            &kv_cache.key,
+            n,
+            total_seq,
+            pipelines,
+            pool,
+        );
 
         // Softmax
-        let attn_weights = self.apply_softmax(encoder, &scores, num_heads * n, total_seq, pipelines, pool);
+        let attn_weights =
+            self.apply_softmax(encoder, &scores, num_heads * n, total_seq, pipelines, pool);
 
         // Attention output: weights @ V
-        let attn_output = self.compute_attn_v(encoder, &attn_weights, &kv_cache.value, n, total_seq, pipelines, pool);
+        let attn_output = self.compute_attn_v(
+            encoder,
+            &attn_weights,
+            &kv_cache.value,
+            n,
+            total_seq,
+            pipelines,
+            pool,
+        );
 
         // Output projection
-        
 
-        self.o_proj.forward(&attn_output, n, encoder, pipelines, pool)
+        self.o_proj
+            .forward(&attn_output, n, encoder, pipelines, pool)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -194,7 +222,8 @@ impl Attention {
         pipelines: &mut PipelineManager,
         pool: &BufferPool,
     ) -> GpuBuf {
-        let entry = pipelines.get_or_create("attention_scores", ATTENTION_WGSL, "compute_scores", None);
+        let entry =
+            pipelines.get_or_create("attention_scores", ATTENTION_WGSL, "compute_scores", None);
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
 
@@ -254,11 +283,7 @@ impl Attention {
             BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         );
 
-        let params_data = [
-            (n as u32).to_le_bytes(),
-            (d as u32).to_le_bytes(),
-        ]
-        .concat();
+        let params_data = [(n as u32).to_le_bytes(), (d as u32).to_le_bytes()].concat();
         let params = create_uniform_raw(&self.device, &params_data);
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

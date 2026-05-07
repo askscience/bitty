@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_model::activation_codec::{ActivationCodec, CodecKind};
 use bitty_protocol::{ActivationDType, ActivationTensor};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn make_activation(payload_len: usize) -> ActivationTensor {
     let payload: Vec<u8> = (0..payload_len)
@@ -115,5 +115,11 @@ fn bench_codec_roundtrip(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_fp8_codec, bench_sparse_topk_codec, bench_raw_codec, bench_codec_roundtrip);
+criterion_group!(
+    benches,
+    bench_fp8_codec,
+    bench_sparse_topk_codec,
+    bench_raw_codec,
+    bench_codec_roundtrip
+);
 criterion_main!(benches);

@@ -1,7 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_protocol::{
-    ActivationDType, ActivationTensor, logits_f32_le_bytes, logits_from_f32_le_bytes,
+    logits_f32_le_bytes, logits_from_f32_le_bytes, ActivationDType, ActivationTensor,
 };
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use prost::Message;
 
 fn make_activation(payload_len: usize) -> ActivationTensor {
@@ -120,8 +120,7 @@ fn bench_activation_wire_roundtrip(c: &mut Criterion) {
 
         group.bench_function(format!("to_proto_{size_kb}KB").as_str(), |b| {
             b.iter(|| {
-                let _: bitty_protocol::pb::ActivationTensor =
-                    black_box(&activation ).into();
+                let _: bitty_protocol::pb::ActivationTensor = black_box(&activation).into();
             });
         });
 
@@ -134,14 +133,17 @@ fn bench_activation_wire_roundtrip(c: &mut Criterion) {
 
         group.bench_function(format!("decode_proto_{size_kb}KB").as_str(), |b| {
             b.iter(|| {
-                let _ = bitty_protocol::pb::ActivationTensor::decode(
-                    black_box(buf.as_slice()),
-                );
+                let _ = bitty_protocol::pb::ActivationTensor::decode(black_box(buf.as_slice()));
             });
         });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_checksum, bench_logits_codec, bench_activation_wire_roundtrip);
+criterion_group!(
+    benches,
+    bench_checksum,
+    bench_logits_codec,
+    bench_activation_wire_roundtrip
+);
 criterion_main!(benches);

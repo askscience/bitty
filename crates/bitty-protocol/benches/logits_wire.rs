@@ -35,7 +35,9 @@ fn bench_logits_encode(c: &mut Criterion) {
     let logits = sample_logits(n);
     let repeated_len = encode_repeated(&logits).len();
     let packed_len = encode_f32_le(&logits).len();
-    println!("BitNetLogits encode size n={n}: repeated={repeated_len} bytes, f32_le={packed_len} bytes");
+    println!(
+        "BitNetLogits encode size n={n}: repeated={repeated_len} bytes, f32_le={packed_len} bytes"
+    );
 
     c.bench_function("bitnet_logits_encode_repeated_f32", |b| {
         b.iter(|| black_box(encode_repeated(&logits)))

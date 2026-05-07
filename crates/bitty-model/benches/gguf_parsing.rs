@@ -10,9 +10,7 @@ fn bench_parse_gguf_bytes(c: &mut Criterion) {
     let bytes_2 = common::serialize_gguf(&gguf_2);
     group.bench_function("parse_small_2layers", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_2,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_2)));
         });
     });
 
@@ -20,9 +18,7 @@ fn bench_parse_gguf_bytes(c: &mut Criterion) {
     let bytes_30 = common::serialize_gguf(&gguf_30);
     group.bench_function("parse_medium_30layers", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_30,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_30)));
         });
     });
 
@@ -30,9 +26,7 @@ fn bench_parse_gguf_bytes(c: &mut Criterion) {
     let bytes_80 = common::serialize_gguf(&gguf_80);
     group.bench_function("parse_large_80layers", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_80,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_80)));
         });
     });
     group.finish();
@@ -46,9 +40,7 @@ fn bench_parse_many_tensors(c: &mut Criterion) {
     let bytes_100 = common::serialize_gguf(&gguf_100);
     group.bench_function("100_tensors", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_100,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_100)));
         });
     });
 
@@ -56,9 +48,7 @@ fn bench_parse_many_tensors(c: &mut Criterion) {
     let bytes_1k = common::serialize_gguf(&gguf_1k);
     group.bench_function("1000_tensors", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_1k,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_1k)));
         });
     });
     group.finish();
@@ -70,27 +60,29 @@ fn bench_parse_many_metadata(c: &mut Criterion) {
 
     let mut gguf_20 = common::make_small_gguf("llama", 4, 4096);
     for i in 0..20 {
-        gguf_20.metadata.insert(format!("extra.key.{i}"), bitty_model::gguf::GgufMetadataValue::U64(i));
+        gguf_20.metadata.insert(
+            format!("extra.key.{i}"),
+            bitty_model::gguf::GgufMetadataValue::U64(i),
+        );
     }
     let bytes_20 = common::serialize_gguf(&gguf_20);
     group.bench_function("20_metadata_keys", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_20,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_20)));
         });
     });
 
     let mut gguf_100 = common::make_small_gguf("llama", 4, 4096);
     for i in 0..100 {
-        gguf_100.metadata.insert(format!("extra.key.{i}"), bitty_model::gguf::GgufMetadataValue::U64(i));
+        gguf_100.metadata.insert(
+            format!("extra.key.{i}"),
+            bitty_model::gguf::GgufMetadataValue::U64(i),
+        );
     }
     let bytes_100 = common::serialize_gguf(&gguf_100);
     group.bench_function("100_metadata_keys", |b| {
         b.iter(|| {
-            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(
-                &bytes_100,
-            )));
+            let _ = black_box(bitty_model::gguf::parse_gguf_bytes(black_box(&bytes_100)));
         });
     });
     group.finish();

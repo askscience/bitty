@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_model::ModelMetadata;
 use bitty_protocol::{AssignedLayerRange, LayerAssignment, ModelStage, NodeId, Quantization};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 mod common;
 
@@ -26,15 +26,18 @@ fn bench_shard_plan(c: &mut Criterion) {
 
     for &num_layers in &[4u32, 30, 80] {
         let gguf = common::make_small_gguf("llama", num_layers, 4096);
-        let metadata =
-            ModelMetadata::from_gguf(gguf, None).expect("extract metadata");
+        let metadata = ModelMetadata::from_gguf(gguf, None).expect("extract metadata");
 
         for &num_nodes in &[1u32, 4, 8] {
             let chunk = num_layers / num_nodes;
             let assignments: Vec<LayerAssignment> = (0..num_nodes)
                 .map(|i| {
                     let start = i * chunk;
-                    let end = if i + 1 == num_nodes { num_layers } else { (i + 1) * chunk };
+                    let end = if i + 1 == num_nodes {
+                        num_layers
+                    } else {
+                        (i + 1) * chunk
+                    };
                     make_assignment(&format!("node-{i}"), start, end)
                 })
                 .collect();

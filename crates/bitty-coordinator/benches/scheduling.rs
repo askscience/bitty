@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_coordinator::{Halda, SchedulerConfig};
 use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, NodeTier};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn make_profiles(count: usize) -> Vec<HardwareProfile> {
     (0..count)
@@ -65,40 +65,28 @@ fn bench_halda_assign(c: &mut Criterion) {
             let profiles = make_profiles(4);
             let layers = make_layers(30);
             b.iter(|| {
-                let _ = black_box(halda.assign(
-                    black_box(&profiles),
-                    black_box(&layers),
-                ));
+                let _ = black_box(halda.assign(black_box(&profiles), black_box(&layers)));
             });
         })
         .bench_function("16nodes_30layers", |b| {
             let profiles = make_profiles(16);
             let layers = make_layers(30);
             b.iter(|| {
-                let _ = black_box(halda.assign(
-                    black_box(&profiles),
-                    black_box(&layers),
-                ));
+                let _ = black_box(halda.assign(black_box(&profiles), black_box(&layers)));
             });
         })
         .bench_function("64nodes_80layers", |b| {
             let profiles = make_profiles(64);
             let layers = make_layers(80);
             b.iter(|| {
-                let _ = black_box(halda.assign(
-                    black_box(&profiles),
-                    black_box(&layers),
-                ));
+                let _ = black_box(halda.assign(black_box(&profiles), black_box(&layers)));
             });
         })
         .bench_function("256nodes_120layers", |b| {
             let profiles = make_profiles(256);
             let layers = make_layers(120);
             b.iter(|| {
-                let _ = black_box(halda.assign(
-                    black_box(&profiles),
-                    black_box(&layers),
-                ));
+                let _ = black_box(halda.assign(black_box(&profiles), black_box(&layers)));
             });
         });
 }

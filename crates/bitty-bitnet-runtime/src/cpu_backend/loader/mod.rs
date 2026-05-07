@@ -10,15 +10,17 @@ use crate::cpu_backend::dequant::dequantize_slice;
 use crate::cpu_backend::types::*;
 use names::TensorRole;
 use oxbitnet::model::gguf::{
-    self, GgufMetadata, GgufParser, GGML_TYPE_I2_S,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q2_K, GGML_TYPE_Q8_K,
+    self, GgufMetadata, GgufParser, GGML_TYPE_I2_S, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_K,
 };
 use std::collections::HashMap;
 
 /// Load a GGUF file and return metadata, tokenizer, and weights.
 pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuWeights), String> {
     let mut parser = GgufParser::new(data);
-    let gguf = parser.parse().map_err(|e| format!("GGUF parse error: {e}"))?;
+    let gguf = parser
+        .parse()
+        .map_err(|e| format!("GGUF parse error: {e}"))?;
 
     let tokenizer = oxbitnet::Tokenizer::from_gguf_metadata(&gguf.metadata)
         .map_err(|e| format!("Tokenizer error: {e}"))?;
@@ -57,16 +59,22 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
                     lm_head = Some(LmHead::Packed(packed));
                 }
                 TensorRole::InputNorm(l) => {
-                    layer_builders.entry(l).or_default()
-                        .input_ln = dequant_to_f32(tensor_data, tensor.tensor_type, num_elements);
+                    layer_builders.entry(l).or_default().input_ln =
+                        dequant_to_f32(tensor_data, tensor.tensor_type, num_elements);
                 }
                 TensorRole::PostAttnNorm(l) => {
-                    layer_builders.entry(l).or_default()
-                        .post_attn_ln = dequant_to_f32(tensor_data, tensor.tensor_type, num_elements);
+                    layer_builders.entry(l).or_default().post_attn_ln =
+                        dequant_to_f32(tensor_data, tensor.tensor_type, num_elements);
                 }
-                TensorRole::QProj(l) => { layer_builders.entry(l).or_default().q_proj = Some(packed); }
-                TensorRole::KProj(l) => { layer_builders.entry(l).or_default().k_proj = Some(packed); }
-                TensorRole::VProj(l) => { layer_builders.entry(l).or_default().v_proj = Some(packed); }
+                TensorRole::QProj(l) => {
+                    layer_builders.entry(l).or_default().q_proj = Some(packed);
+                }
+                TensorRole::KProj(l) => {
+                    layer_builders.entry(l).or_default().k_proj = Some(packed);
+                }
+                TensorRole::VProj(l) => {
+                    layer_builders.entry(l).or_default().v_proj = Some(packed);
+                }
                 TensorRole::QkvFused(l) => {
                     let b = layer_builders.entry(l).or_default();
                     b.q_proj = Some(packed.clone());
@@ -80,16 +88,28 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
                     layer_builders.entry(l).or_default().has_attention = true;
                 }
                 TensorRole::QNorm(l) => {
-                    layer_builders.entry(l).or_default().q_norm
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().q_norm = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::KNorm(l) => {
-                    layer_builders.entry(l).or_default().k_norm
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().k_norm = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
-                TensorRole::UpProj(l) => { layer_builders.entry(l).or_default().up_proj = Some(packed); }
-                TensorRole::GateProj(l) => { layer_builders.entry(l).or_default().gate_proj = Some(packed); }
-                TensorRole::DownProj(l) => { layer_builders.entry(l).or_default().down_proj = Some(packed); }
+                TensorRole::UpProj(l) => {
+                    layer_builders.entry(l).or_default().up_proj = Some(packed);
+                }
+                TensorRole::GateProj(l) => {
+                    layer_builders.entry(l).or_default().gate_proj = Some(packed);
+                }
+                TensorRole::DownProj(l) => {
+                    layer_builders.entry(l).or_default().down_proj = Some(packed);
+                }
                 // SSM tensors
                 TensorRole::SsmInProj(l) => {
                     layer_builders.entry(l).or_default().ssm_in_proj = Some(packed);
@@ -100,36 +120,51 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
                     layer_builders.entry(l).or_default().has_ssm = true;
                 }
                 TensorRole::SsmConv1dBias(l) => {
-                    layer_builders.entry(l).or_default().ssm_conv1d_bias
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().ssm_conv1d_bias = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::SsmDtProjWeight(l) => {
                     layer_builders.entry(l).or_default().ssm_dt_proj_weight = Some(packed);
                     layer_builders.entry(l).or_default().has_ssm = true;
                 }
                 TensorRole::SsmDtProjBias(l) => {
-                    layer_builders.entry(l).or_default().ssm_dt_proj_bias
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().ssm_dt_proj_bias = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::SsmA(l) => {
-                    layer_builders.entry(l).or_default().ssm_a_log
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().ssm_a_log = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::SsmAlphaWeight(l) | TensorRole::SsmBetaWeight(l) => {
                     // alpha/beta are auxiliary SSM params — store or ignore
                     layer_builders.entry(l).or_default().has_ssm = true;
                 }
                 TensorRole::SsmDParam(l) => {
-                    layer_builders.entry(l).or_default().ssm_d_param
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().ssm_d_param = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::SsmOutProj(l) => {
                     layer_builders.entry(l).or_default().ssm_out_proj = Some(packed);
                     layer_builders.entry(l).or_default().has_ssm = true;
                 }
                 TensorRole::SsmNorm(l) => {
-                    layer_builders.entry(l).or_default().ssm_norm
-                        = Some(dequant_to_f32(tensor_data, tensor.tensor_type, num_elements));
+                    layer_builders.entry(l).or_default().ssm_norm = Some(dequant_to_f32(
+                        tensor_data,
+                        tensor.tensor_type,
+                        num_elements,
+                    ));
                 }
                 TensorRole::Ignored => {}
             }
@@ -156,23 +191,38 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
             ssm_count += 1;
             eprintln!("info: layer {i} uses SSM");
             // For Qwen-style SSM, the QKV fused tensor serves as in_proj
-            let proj = builder.ssm_in_proj
+            let proj = builder
+                .ssm_in_proj
                 .or(builder.q_proj.clone())
                 .unwrap_or_else(PackedTensor::dummy);
             let d_inner = proj.shape.last().copied().unwrap_or(1) / 2;
-            let d_state = builder.ssm_a_log.as_ref().map(|a| a.len() / d_inner.max(1)).unwrap_or(16);
-            let kernel_size = builder.ssm_conv1d_weight.as_ref()
+            let d_state = builder
+                .ssm_a_log
+                .as_ref()
+                .map(|a| a.len() / d_inner.max(1))
+                .unwrap_or(16);
+            let kernel_size = builder
+                .ssm_conv1d_weight
+                .as_ref()
                 .map(|w| w.shape.last().copied().unwrap_or(4))
                 .unwrap_or(4);
 
             LayerKind::Ssm(SsmWeights {
                 in_proj: proj,
-                conv1d_weight: builder.ssm_conv1d_weight.unwrap_or_else(PackedTensor::dummy),
+                conv1d_weight: builder
+                    .ssm_conv1d_weight
+                    .unwrap_or_else(PackedTensor::dummy),
                 conv1d_bias: builder.ssm_conv1d_bias,
-                dt_proj_weight: builder.ssm_dt_proj_weight.unwrap_or_else(PackedTensor::dummy),
+                dt_proj_weight: builder
+                    .ssm_dt_proj_weight
+                    .unwrap_or_else(PackedTensor::dummy),
                 dt_proj_bias: builder.ssm_dt_proj_bias,
-                a_log: builder.ssm_a_log.unwrap_or_else(|| vec![0.0f32; d_inner * d_state]),
-                d_param: builder.ssm_d_param.unwrap_or_else(|| vec![0.0f32; d_inner * d_state]),
+                a_log: builder
+                    .ssm_a_log
+                    .unwrap_or_else(|| vec![0.0f32; d_inner * d_state]),
+                d_param: builder
+                    .ssm_d_param
+                    .unwrap_or_else(|| vec![0.0f32; d_inner * d_state]),
                 out_proj: builder.ssm_out_proj.unwrap_or_else(PackedTensor::dummy),
                 ssm_norm: builder.ssm_norm.unwrap_or_else(|| vec![1.0f32; d_inner]),
                 d_state,
@@ -197,8 +247,16 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
 
         layers.push(CpuLayer {
             kind,
-            input_ln: if builder.input_ln.is_empty() { vec![1.0f32; 1] } else { builder.input_ln },
-            post_attn_ln: if builder.post_attn_ln.is_empty() { vec![1.0f32; 1] } else { builder.post_attn_ln },
+            input_ln: if builder.input_ln.is_empty() {
+                vec![1.0f32; 1]
+            } else {
+                builder.input_ln
+            },
+            post_attn_ln: if builder.post_attn_ln.is_empty() {
+                vec![1.0f32; 1]
+            } else {
+                builder.post_attn_ln
+            },
             mlp,
             layer_idx: i,
         });
@@ -208,7 +266,12 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufMetadata, oxbitnet::Tokenizer, CpuW
         eprintln!("info: {} SSM layers loaded", ssm_count);
     }
 
-    let weights = CpuWeights { embed_tokens, final_norm, layers, lm_head };
+    let weights = CpuWeights {
+        embed_tokens,
+        final_norm,
+        layers,
+        lm_head,
+    };
     Ok((metadata, tokenizer, weights))
 }
 

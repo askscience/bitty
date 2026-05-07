@@ -146,8 +146,8 @@ impl<'a> Q5KBlock<'a> {
 // ============================================================================
 pub struct Q6KBlock<'a> {
     pub d: f32,
-    pub ql: &'a [u8],    // 128, low-4 bits
-    pub qh: &'a [u8],    // 64,  high-2 bits (2 bits per element)
+    pub ql: &'a [u8],     // 128, low-4 bits
+    pub qh: &'a [u8],     // 64,  high-2 bits (2 bits per element)
     pub scales: &'a [i8], // 16 signed 8-bit per-sub-block scales
 }
 
@@ -159,7 +159,8 @@ impl<'a> Q6KBlock<'a> {
         let qh = &data[128..192];
         let sc_bytes = &data[192..208];
         // Safety: &[i8] reinterpretation of &[u8] of same length
-        let scales: &[i8] = unsafe { std::slice::from_raw_parts(sc_bytes.as_ptr() as *const i8, 16) };
+        let scales: &[i8] =
+            unsafe { std::slice::from_raw_parts(sc_bytes.as_ptr() as *const i8, 16) };
         let d = f16_to_f32(&data[208..210]);
         Self { d, ql, qh, scales }
     }
@@ -302,21 +303,35 @@ pub fn dequantize_slice(data: &[u8], ggml_type: u32, num_elements: usize) -> Vec
         GGML_TYPE_F32 => {
             let n = num_elements.min(data.len() / 4);
             (0..n)
-                .map(|i| f32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]))
+                .map(|i| {
+                    f32::from_le_bytes([
+                        data[i * 4],
+                        data[i * 4 + 1],
+                        data[i * 4 + 2],
+                        data[i * 4 + 3],
+                    ])
+                })
                 .collect()
         }
         GGML_TYPE_F16 | GGML_TYPE_BF16 => {
             let n = num_elements.min(data.len() / 2);
-            (0..n).map(|i| f16_to_f32(&data[i * 2..i * 2 + 2])).collect()
+            (0..n)
+                .map(|i| f16_to_f32(&data[i * 2..i * 2 + 2]))
+                .collect()
         }
         GGML_TYPE_Q4_K => dequant_q4k(data, num_elements),
         GGML_TYPE_Q5_K => dequant_q5k(data, num_elements),
         GGML_TYPE_Q6_K => dequant_q6k(data, num_elements),
         GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 => dequant_q8_0(data, num_elements),
         _ => {
-            eprintln!("dequantize_slice: unknown GGML type {}, using F16 fallback", ggml_type);
+            eprintln!(
+                "dequantize_slice: unknown GGML type {}, using F16 fallback",
+                ggml_type
+            );
             let n = num_elements.min(data.len() / 2);
-            (0..n).map(|i| f16_to_f32(&data[i * 2..i * 2 + 2])).collect()
+            (0..n)
+                .map(|i| f16_to_f32(&data[i * 2..i * 2 + 2]))
+                .collect()
         }
     }
 }

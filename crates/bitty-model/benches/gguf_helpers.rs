@@ -1,13 +1,13 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_model::gguf::{
     bytes_per_element, decode_i2_s_block, ggml_type_name, layer_id_from_tensor_name,
     quantization_from_ggml_type, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I2_S,
     GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_M,
     GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1,
-    GGML_TYPE_Q8_K, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
+    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K,
+    GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
 };
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_layer_id_extraction(c: &mut Criterion) {
     c.benchmark_group("layer_id_from_tensor_name")
@@ -33,8 +33,7 @@ fn bench_layer_id_extraction(c: &mut Criterion) {
         })
         .bench_function("no_layer_id_embedding", |b| {
             b.iter(|| {
-                let _ =
-                    black_box(layer_id_from_tensor_name(black_box("token_embd.weight")));
+                let _ = black_box(layer_id_from_tensor_name(black_box("token_embd.weight")));
             });
         })
         .bench_function("no_layer_id_output", |b| {
@@ -46,18 +45,44 @@ fn bench_layer_id_extraction(c: &mut Criterion) {
 
 fn bench_ggml_type_name(c: &mut Criterion) {
     let all_types: &[u32] = &[
-        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,
-        GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_K, GGML_TYPE_IQ2_XXS,
-        GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S,
-        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_M, GGML_TYPE_IQ4_XS, GGML_TYPE_BF16, GGML_TYPE_I2_S,
-        GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q8_1,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K,
+        GGML_TYPE_Q8_K,
+        GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_IQ2_XS,
+        GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ3_S,
+        GGML_TYPE_IQ2_S,
+        GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ4_NL,
+        GGML_TYPE_IQ3_M,
+        GGML_TYPE_IQ4_XS,
+        GGML_TYPE_BF16,
+        GGML_TYPE_I2_S,
+        GGML_TYPE_TQ1_0,
+        GGML_TYPE_TQ2_0,
     ];
 
     c.benchmark_group("ggml_type_name")
         .sample_size(200)
         .bench_function("lookup_hot_types", |b| {
-            let hot: &[u32] = &[GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K];
+            let hot: &[u32] = &[
+                GGML_TYPE_F16,
+                GGML_TYPE_Q4_K,
+                GGML_TYPE_Q8_0,
+                GGML_TYPE_Q2_K,
+            ];
             b.iter(|| {
                 for &t in hot {
                     let _ = black_box(ggml_type_name(black_box(t)));
@@ -75,8 +100,13 @@ fn bench_ggml_type_name(c: &mut Criterion) {
 
 fn bench_bytes_per_element(c: &mut Criterion) {
     let hot: &[u32] = &[
-        GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_I2_S, GGML_TYPE_BF16,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_I2_S,
+        GGML_TYPE_BF16,
     ];
 
     c.benchmark_group("bytes_per_element")
@@ -102,9 +132,18 @@ fn bench_bytes_per_element(c: &mut Criterion) {
 
 fn bench_quantization_from_ggml_type(c: &mut Criterion) {
     let all_common: &[u32] = &[
-        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_I2_S, GGML_TYPE_IQ2_XXS,
-        GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q6_K,
+        GGML_TYPE_Q5_K,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_I2_S,
+        GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ4_XS,
     ];
 
     c.benchmark_group("quantization_from_ggml_type")

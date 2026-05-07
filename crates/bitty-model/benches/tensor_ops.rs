@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bitty_model::tensor::{LowBitTensor, TensorShape};
 use bitty_protocol::Quantization;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_packed_len_for(c: &mut Criterion) {
     let sizes: &[usize] = &[1024, 65536, 1048576];
@@ -31,16 +31,18 @@ fn bench_packed_len_for(c: &mut Criterion) {
         ];
         b.iter(|| {
             for &q in all {
-                let _ = black_box(LowBitTensor::packed_len_for(
-                    black_box(65536),
-                    black_box(q),
-                ));
+                let _ = black_box(LowBitTensor::packed_len_for(black_box(65536), black_box(q)));
             }
         });
     });
 
     for &size in sizes {
-        for quant in &[Quantization::F32, Quantization::Fp16, Quantization::Q4, Quantization::Bit1] {
+        for quant in &[
+            Quantization::F32,
+            Quantization::Fp16,
+            Quantization::Q4,
+            Quantization::Bit1,
+        ] {
             let name = format!("{}_{}", quant.as_str(), size);
             group.bench_function(name.as_str(), |b| {
                 b.iter(|| {

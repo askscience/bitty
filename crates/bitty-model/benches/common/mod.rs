@@ -23,18 +23,14 @@ pub fn make_small_gguf(architecture: &str, num_layers: u32, hidden_size: u64) ->
         "llama.embedding_length".into(),
         GgufMetadataValue::U64(hidden_size),
     );
-    gguf.metadata.insert(
-        "llama.vocab_size".into(),
-        GgufMetadataValue::U64(32000),
-    );
+    gguf.metadata
+        .insert("llama.vocab_size".into(), GgufMetadataValue::U64(32000));
     gguf.metadata.insert(
         "llama.attention.head_count".into(),
         GgufMetadataValue::U64(32),
     );
-    gguf.metadata.insert(
-        "llama.context_length".into(),
-        GgufMetadataValue::U64(4096),
-    );
+    gguf.metadata
+        .insert("llama.context_length".into(), GgufMetadataValue::U64(4096));
 
     let vocab_size = 32000;
 

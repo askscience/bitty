@@ -48,7 +48,7 @@ impl Halda {
             .cloned()
             .collect::<Vec<_>>();
         if ranked.is_empty() {
-            ranked = nodes.to_vec();
+            return Err(HaldaError::NoEligibleNodes { total: nodes.len() });
         }
         ranked.sort_by(|a, b| {
             b.effective_compute_score()
@@ -63,7 +63,7 @@ impl Halda {
             });
         }
         if ranked.is_empty() {
-            ranked = nodes.to_vec();
+            return Err(HaldaError::NoEligibleNodes { total: nodes.len() });
         }
 
         let total_score = ranked
@@ -244,6 +244,8 @@ impl Halda {
 pub enum HaldaError {
     #[error("cannot assign layers without nodes")]
     NoNodes,
+    #[error("no eligible nodes among {total} total nodes (all have max_layers=0 or layer_eligible=false)")]
+    NoEligibleNodes { total: usize },
     #[error("node {node_id} needs {required} bytes but only {available} bytes are available")]
     InsufficientMemory {
         node_id: NodeId,

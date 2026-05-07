@@ -72,9 +72,9 @@ impl Tokenizer {
         ));
 
         // Byte-level decoder
-        tokenizer.with_decoder(Some(
-            tokenizers::decoders::byte_level::ByteLevel::new(false, true, false),
-        ));
+        tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::new(
+            false, true, false,
+        )));
 
         // Find special stop tokens
         let eot_id = tokenizer.token_to_id("<|eot_id|>");
@@ -172,7 +172,11 @@ impl Tokenizer {
 
         // Fallback to plain encoding if special tokens missing
         if start_header.is_none() || end_header.is_none() || eot.is_none() {
-            let text: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+            let text: String = messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             return self.encode(&text, true);
         }
 
@@ -201,7 +205,12 @@ impl Tokenizer {
 
     /// Apply the ChatML template (used by Falcon-E and similar models).
     /// Format: <|im_start|>role\ncontent<|im_end|>\n
-    fn apply_chatml(&self, messages: &[ChatMessage], im_start: u32, im_end: u32) -> Result<Vec<u32>> {
+    fn apply_chatml(
+        &self,
+        messages: &[ChatMessage],
+        im_start: u32,
+        im_end: u32,
+    ) -> Result<Vec<u32>> {
         let mut tokens = vec![self.bos_id];
         for msg in messages {
             tokens.push(im_start);

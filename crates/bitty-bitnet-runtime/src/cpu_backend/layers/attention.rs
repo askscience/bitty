@@ -86,14 +86,28 @@ pub fn forward(
     let actual_k_dim = k.len();
 
     // Apply RoPE — use actual dims
-    ops::rope_apply(&mut q, &mut k, pos, actual_hd, n_heads, n_kv, meta.rope_theta);
+    ops::rope_apply(
+        &mut q,
+        &mut k,
+        pos,
+        actual_hd,
+        n_heads,
+        n_kv,
+        meta.rope_theta,
+    );
 
     // Store K,V in cache
     {
         let kd = actual_k_dim;
         let max_seq = meta.max_seq_len;
-        let key_buf = cache.keys.entry(layer_idx).or_insert_with(|| vec![0f32; kd * max_seq.max(4096)]);
-        let val_buf = cache.values.entry(layer_idx).or_insert_with(|| vec![0f32; kd * max_seq.max(4096)]);
+        let key_buf = cache
+            .keys
+            .entry(layer_idx)
+            .or_insert_with(|| vec![0f32; kd * max_seq.max(4096)]);
+        let val_buf = cache
+            .values
+            .entry(layer_idx)
+            .or_insert_with(|| vec![0f32; kd * max_seq.max(4096)]);
         let off = cache.seq_len * kd;
         if off + k.len() > key_buf.len() || off + v.len() > val_buf.len() {
             return Err(format!("KV cache overflow at layer {layer_idx}"));
@@ -107,18 +121,30 @@ pub fn forward(
     let cur_len = cache.seq_len + 1;
     let mut out = vec![0f32; actual_q_dim];
     let kd = actual_k_dim;
-    let key_cache = cache.keys.get(&layer_idx).map(|v| v.as_slice()).unwrap_or(&[]);
-    let val_cache = cache.values.get(&layer_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+    let key_cache = cache
+        .keys
+        .get(&layer_idx)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let val_cache = cache
+        .values
+        .get(&layer_idx)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
 
     for h in 0..n_heads {
         let kv_h = h / groups.max(1);
         let q_start = h * actual_hd;
         let o_start = h * actual_hd;
-        if q_start + actual_hd > actual_q_dim { continue; }
+        if q_start + actual_hd > actual_q_dim {
+            continue;
+        }
         let mut scores = vec![0f32; cur_len];
         for kj in 0..cur_len {
             let k_start = kv_h * actual_kv_hd + kj * kd;
-            if k_start + actual_hd > key_cache.len() { continue; }
+            if k_start + actual_hd > key_cache.len() {
+                continue;
+            }
             let mut dot = 0f32;
             for d in 0..actual_hd.min(actual_kv_hd) {
                 dot += q[q_start + d] * key_cache[k_start + d];
