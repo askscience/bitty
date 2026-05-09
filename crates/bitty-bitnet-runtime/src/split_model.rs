@@ -15,12 +15,12 @@ pub struct GpuActivation {
 }
 
 impl SplitBitNetModel {
-    pub async fn load(source: &str, _max_seq_len: usize) -> Result<Self> {
+    pub async fn load(source: &str, _max_seq_len: usize, hf_model_id: Option<&str>) -> Result<Self> {
         let device = bitty_candle_runtime::auto_device();
         let model = CandleModel::load(source, &device)
             .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
         let config = model.config.clone();
-        let tokenizer = Tokenizer::from_gguf_path(std::path::Path::new(source))
+        let tokenizer = Tokenizer::from_gguf_path(std::path::Path::new(source), hf_model_id)
             .map_err(|err| BitNetRuntimeError::Backend(format!("tokenizer: {err}")))?;
 
         Ok(Self { model, config, tokenizer })

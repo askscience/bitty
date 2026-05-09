@@ -6,7 +6,7 @@ const DEFAULT_MODEL_PATH: &str = "external/BitNet/models/BitNet-b1.58-2B-4T/ggml
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = RustBitNetConfig::from_env();
-    let mut runtime = BitNetRuntime::load(Path::new(&config.model)).await?;
+    let mut runtime = BitNetRuntime::load(Path::new(&config.model), None).await?;
     let output = runtime
         .generate_full(&config.prompt, config.max_tokens, config.temperature)
         .await?;

@@ -70,7 +70,7 @@ impl BitNetLayerExecutor {
     }
 
     pub async fn load(model_path: impl AsRef<Path>) -> Result<Self, RustBitNetError> {
-        let runtime = BitNetRuntime::load(model_path.as_ref()).await?;
+        let runtime = BitNetRuntime::load(model_path.as_ref(), None).await?;
         let metadata = runtime.metadata();
         Ok(Self {
             metadata: Arc::new(metadata),

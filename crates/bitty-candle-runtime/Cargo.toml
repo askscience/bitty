@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 bitty-model.workspace = true
-bitty-protocol.workspace = true
 candle-core = { workspace = true, default-features = false }
 candle-nn.workspace = true
 bytemuck = "1"
@@ -15,10 +14,7 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-sha2.workspace = true
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-ahash = "0.8"
-memmap2.workspace = true
+tokenizers = { workspace = true }
 rand = "0.9"
 
 [features]

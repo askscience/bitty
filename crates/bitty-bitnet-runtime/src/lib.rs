@@ -56,16 +56,16 @@ impl Default for SamplingOptions {
 
 pub type BitNetTokenizer = bitty_candle_runtime::Tokenizer;
 
-pub fn load_tokenizer(path: &Path) -> Result<BitNetTokenizer> {
-    bitty_candle_runtime::Tokenizer::from_gguf_path(path)
+pub fn load_tokenizer(path: &Path, hf_model_id: Option<&str>) -> Result<BitNetTokenizer> {
+    bitty_candle_runtime::Tokenizer::from_gguf_path(path, hf_model_id)
         .map_err(|err| BitNetRuntimeError::Backend(format!("tokenizer: {err}")))
 }
 
 impl BitNetRuntime {
-    pub async fn load(path: &Path) -> Result<Self> {
+    pub async fn load(path: &Path, hf_model_id: Option<&str>) -> Result<Self> {
         let metadata = BitNetModelMetadata::from_gguf_path(path)?;
         let source = path.to_string_lossy().to_string();
-        let model = SplitBitNetModel::load(&source, 4096).await?;
+        let model = SplitBitNetModel::load(&source, 4096, hf_model_id).await?;
         Ok(Self {
             model_path: path.to_path_buf(),
             metadata,
@@ -395,8 +395,8 @@ mod tests {
         let model_path = std::env::var("BITTY_GGUF_MODEL").expect("BITTY_GGUF_MODEL must be set");
         let path = Path::new(&model_path);
 
-        let mut full = BitNetRuntime::load(path).await.unwrap();
-        let mut split = BitNetRuntime::load(path).await.unwrap();
+        let mut full = BitNetRuntime::load(path, None).await.unwrap();
+        let mut split = BitNetRuntime::load(path, None).await.unwrap();
         let tokens = full.tokenizer().encode("Hello", true).unwrap();
 
         let mut full_cache = BitNetKvCache;

@@ -37,7 +37,7 @@ pub struct CpuModel {
 
 impl CpuModel {
     /// Load a GGUF model from disk via memory-mapping for zero-copy weight access.
-    pub fn load(path: &Path) -> Result<Self, String> {
+    pub fn load(path: &Path, hf_model_id: Option<&str>) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("Cannot open model file: {e}"))?;
         let mmap = unsafe {
@@ -45,7 +45,7 @@ impl CpuModel {
                 .map_err(|e| format!("Cannot mmap model: {e}"))?
         };
         let (metadata, weights) = loader::load_gguf(&mmap)?;
-        let tokenizer = bitty_candle_runtime::Tokenizer::from_gguf_path(path)
+        let tokenizer = bitty_candle_runtime::Tokenizer::from_gguf_path(path, hf_model_id)
             .map_err(|e| format!("tokenizer error: {e}"))?;
         let num_layers = weights.layers.len().max(1);
         let meta = loader::metadata::extract_config(&metadata, num_layers);

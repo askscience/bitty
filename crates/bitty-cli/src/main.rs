@@ -604,8 +604,9 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         // the cluster instead of raw UTF-8 bytes (the coordinator otherwise
         // interprets each byte as a token ID, which produces garbled output).
         let model_path = model.model_path(&settings);
+        let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
         let tokenizer = if model_path.exists() {
-            match bitty_bitnet_runtime::load_tokenizer(&model_path) {
+            match bitty_bitnet_runtime::load_tokenizer(&model_path, hf_source) {
                 Ok(tok) => Some(tok),
                 Err(err) => {
                     eprintln!(
@@ -752,9 +753,10 @@ async fn run_local_model(
 
     // For non-BitNet models, skip GPU and go straight to CPU
     let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
+    let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
     let mut streamer = Streamer::new();
     let result: Result<(), String> = if is_bitnet {
-        match spinner("loading model", BitNetRuntime::load(&path)).await {
+        match spinner("loading model", BitNetRuntime::load(&path, hf_source)).await {
             Ok(mut runtime) => runtime
                 .generate_stream(prompt, max_tokens as usize, temp, |delta| {
                     streamer.emit(delta);
@@ -765,7 +767,7 @@ async fn run_local_model(
             Err(gpu_err) => {
                 eprintln!("GPU unavailable ({}), using CPU backend...", gpu_err);
                 let cpu_model = spinner("loading model (CPU)", async {
-                    bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+                    bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
                 })
                 .await?;
                 cpu_model
@@ -783,7 +785,7 @@ async fn run_local_model(
     } else {
         // Non-BitNet: go directly to CPU
         let cpu_model = spinner("loading model (CPU)", async {
-            bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path)
+            bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
         })
         .await
         .map_err(|e| format!("CPU load error: {e}"))?;

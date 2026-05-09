@@ -28,7 +28,31 @@ impl Tokenizer {
     pub fn from_file(path: &str) -> Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer: {e}")))?;
+        Self::from_hf_tokenizer(tokenizer)
+    }
 
+    pub fn from_pretrained(model_id: &str) -> Result<Self> {
+        let tokenizer = tokenizers::Tokenizer::from_pretrained(model_id, None)
+            .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer from HF: {e}")))?;
+        Self::from_hf_tokenizer(tokenizer)
+    }
+
+    pub fn from_gguf_path(model_path: &Path, hf_model_id: Option<&str>) -> Result<Self> {
+        let parent = model_path.parent().unwrap_or(Path::new("."));
+        let json_path = parent.join("tokenizer.json");
+        if json_path.exists() {
+            return Self::from_file(&json_path.to_string_lossy());
+        }
+        if let Some(model_id) = hf_model_id {
+            return Self::from_pretrained(model_id);
+        }
+        Err(TokenizerError::Tokenizer(format!(
+            "No tokenizer.json found next to {} and no HuggingFace model ID provided",
+            model_path.display()
+        )))
+    }
+
+    fn from_hf_tokenizer(tokenizer: tokenizers::Tokenizer) -> Result<Self> {
         let vocab_size = tokenizer.get_vocab_size(true);
         let token_strings: Vec<String> = (0..vocab_size)
             .map(|i| {
@@ -56,18 +80,6 @@ impl Tokenizer {
             token_strings,
             raw_decode,
         })
-    }
-
-    pub fn from_gguf_path(model_path: &Path) -> Result<Self> {
-        let parent = model_path.parent().unwrap_or(Path::new("."));
-        let tokenizer_path = parent.join("tokenizer.json");
-        if tokenizer_path.exists() {
-            return Self::from_file(&tokenizer_path.to_string_lossy());
-        }
-        Err(TokenizerError::Tokenizer(format!(
-            "No tokenizer.json found next to {}",
-            model_path.display()
-        )))
     }
 
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
