@@ -55,6 +55,7 @@ impl Default for SamplingOptions {
 }
 
 pub type BitNetTokenizer = bitty_candle_runtime::Tokenizer;
+pub use bitty_candle_runtime::tokenizer::ChatMessage;
 
 pub fn load_tokenizer(path: &Path, hf_model_id: Option<&str>) -> Result<BitNetTokenizer> {
     bitty_candle_runtime::Tokenizer::from_gguf_path(path, hf_model_id)
@@ -231,7 +232,7 @@ impl BitNetRuntime {
         max_tokens: usize,
         temperature: f32,
     ) -> Result<String> {
-        self.generate_stream(prompt, max_tokens, temperature, |_| {})
+        self.generate_stream_raw(prompt, max_tokens, temperature, true, |_| {})
             .await
     }
 
@@ -245,7 +246,23 @@ impl BitNetRuntime {
     where
         F: FnMut(&str),
     {
-        self.reset_kv_cache();
+        self.generate_stream_raw(prompt, max_tokens, temperature, true, on_delta).await
+    }
+
+    pub async fn generate_stream_raw<F>(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        reset_cache: bool,
+        mut on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        if reset_cache {
+            self.reset_kv_cache();
+        }
         let mut current_input = self
             .tokenizer()
             .encode(prompt, true)

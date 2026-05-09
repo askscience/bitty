@@ -676,6 +676,37 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
             ui::bold(&model.id()),
             ui::dim("type /exit to quit")
         );
+        let path = model.model_path(&settings);
+        let temp = config.temperature.parse().unwrap_or(model.temperature);
+        let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
+        let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
+
+        // Load model once, keep alive across turns
+        let mut bitnet_runtime: Option<BitNetRuntime> = None;
+        let mut cpu_model: Option<bitty_bitnet_runtime::cpu_backend::CpuModel> = None;
+        let mut messages: Vec<bitty_bitnet_runtime::ChatMessage> = Vec::new();
+        let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
+            .expect("failed to load tokenizer");
+
+        if is_bitnet {
+            match BitNetRuntime::load(&path, hf_source).await {
+                Ok(rt) => bitnet_runtime = Some(rt),
+                Err(e) => {
+                    eprintln!("GPU unavailable ({}), using CPU backend...", e);
+                    cpu_model = Some(
+                        bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
+                            .map_err(|e| format!("CPU load error: {e}"))?
+                    );
+                }
+            }
+        } else {
+            cpu_model = Some(
+                bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
+                    .map_err(|e| format!("CPU load error: {e}"))?
+            );
+        }
+
+        let mut reset_cache = true;
         loop {
             print!("  {}›{} ", ui::C, ui::N);
             io::stdout().flush()?;
@@ -690,14 +721,48 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
             if line.is_empty() {
                 continue;
             }
-            run_local_model(
-                &settings,
-                &model,
-                line,
-                config.max_tokens,
-                &config.temperature,
-            )
-            .await?;
+
+            // Apply chat template
+            messages.push(bitty_bitnet_runtime::ChatMessage {
+                role: "user".into(),
+                content: line.to_string(),
+            });
+            let prompt_ids = tok.apply_chat_template(&messages)
+                .unwrap_or_else(|_| tok.encode(line, true).unwrap_or_default());
+
+            // Build prompt from template (decode template tokens back to text)
+            let prompt_text = tok.decode(&prompt_ids).unwrap_or_else(|_| line.to_string());
+
+            struct Streamer { started: bool }
+            impl Streamer {
+                fn new() -> Self { Self { started: false } }
+                fn emit(&mut self, delta: &str) {
+                    if delta.is_empty() { return; }
+                    if !self.started { print!("  "); self.started = true; }
+                    print!("{delta}");
+                    let _ = io::stdout().flush();
+                }
+            }
+            let mut streamer = Streamer::new();
+            let max_t = config.max_tokens as usize;
+
+            let response: String = if let Some(ref mut rt) = bitnet_runtime {
+                rt.generate_stream_raw(&prompt_text, max_t, temp, reset_cache, |d| streamer.emit(d))
+                    .await
+                    .map_err(|e| format!("generate error: {e}"))?
+            } else if let Some(ref cpu) = cpu_model {
+                cpu.generate_chat_stream(&messages, reset_cache, max_t, temp, 40, 1.1, |d| streamer.emit(d))
+                    .map_err(|e| format!("CPU generate error: {e}"))?
+            } else {
+                break;
+            };
+
+            println!();
+            messages.push(bitty_bitnet_runtime::ChatMessage {
+                role: "assistant".into(),
+                content: response,
+            });
+            reset_cache = false;
         }
         return Ok(());
     }

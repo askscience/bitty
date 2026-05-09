@@ -75,6 +75,30 @@ impl CpuModel {
         &self.tokenizer
     }
 
+    pub fn generate_chat_stream<F>(
+        &self,
+        messages: &[bitty_candle_runtime::tokenizer::ChatMessage],
+        _reset_cache: bool,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        repeat_penalty: f32,
+        on_delta: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str),
+    {
+        let prompt_ids = self
+            .tokenizer
+            .apply_chat_template(messages)
+            .map_err(|e| format!("chat template error: {e}"))?;
+        let prompt = self
+            .tokenizer
+            .decode(&prompt_ids)
+            .map_err(|e| format!("decode error: {e}"))?;
+        self.generate_stream(&prompt, max_tokens, temperature, top_k, repeat_penalty, on_delta)
+    }
+
     /// Full end-to-end generation on CPU, streaming decoded text deltas to
     /// `on_delta` as they become available. Returns the complete final text.
     pub fn generate_stream<F>(
