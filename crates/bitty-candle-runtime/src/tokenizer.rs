@@ -31,12 +31,6 @@ impl Tokenizer {
         Self::from_hf_tokenizer(tokenizer)
     }
 
-    pub fn from_pretrained(model_id: &str) -> Result<Self> {
-        let tokenizer = tokenizers::Tokenizer::from_pretrained(model_id, None)
-            .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer from HF: {e}")))?;
-        Self::from_hf_tokenizer(tokenizer)
-    }
-
     pub fn from_gguf_path(model_path: &Path, hf_model_id: Option<&str>) -> Result<Self> {
         let parent = model_path.parent().unwrap_or(Path::new("."));
         let json_path = parent.join("tokenizer.json");
@@ -44,7 +38,11 @@ impl Tokenizer {
             return Self::from_file(&json_path.to_string_lossy());
         }
         if let Some(model_id) = hf_model_id {
-            return Self::from_pretrained(model_id);
+            let tokenizer = tokenizers::Tokenizer::from_pretrained(model_id, None)
+                .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer from HF: {e}")))?;
+            // Save locally so subsequent runs skip the network
+            let _ = tokenizer.save(&json_path, false);
+            return Self::from_hf_tokenizer(tokenizer);
         }
         Err(TokenizerError::Tokenizer(format!(
             "No tokenizer.json found next to {} and no HuggingFace model ID provided",
