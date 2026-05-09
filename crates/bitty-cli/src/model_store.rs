@@ -132,24 +132,41 @@ pub fn pull_model(
     let spec = find_registry_model(model).ok_or_else(|| format!("unknown model: {model}"))?;
     let model_path = spec.model_path(settings);
     ensure_parent(&model_path)?;
-    if model_path.exists() {
-        write_manifest(settings, &spec, &model_path)?;
-        return Ok(spec);
+
+    // Download tokenizer.json alongside the GGUF model (always)
+    let tokenizer_url = derive_tokenizer_url(&spec.url);
+    let tokenizer_path = model_path.parent().map(|p| p.join("tokenizer.json"));
+    if let (Some(tokenizer_path), Some(tokenizer_url)) = (tokenizer_path, tokenizer_url) {
+        if !tokenizer_path.exists() {
+            let _ = std::process::Command::new("curl")
+                .arg("-L")
+                .arg("--fail")
+                .arg("--progress-bar")
+                .arg("-o")
+                .arg(&tokenizer_path)
+                .arg(&tokenizer_url)
+                .status();
+        }
     }
-    if spec.url.is_empty() {
-        return Err(format!("model {} has no download URL", spec.id()).into());
+
+    // Download the GGUF if not present
+    if !model_path.exists() {
+        if spec.url.is_empty() {
+            return Err(format!("model {} has no download URL", spec.id()).into());
+        }
+        let status = std::process::Command::new("curl")
+            .arg("-L")
+            .arg("--fail")
+            .arg("--progress-bar")
+            .arg("-o")
+            .arg(&model_path)
+            .arg(&spec.url)
+            .status()?;
+        if !status.success() {
+            return Err(format!("download failed for {}", spec.id()).into());
+        }
     }
-    let status = std::process::Command::new("curl")
-        .arg("-L")
-        .arg("--fail")
-        .arg("--progress-bar")
-        .arg("-o")
-        .arg(&model_path)
-        .arg(&spec.url)
-        .status()?;
-    if !status.success() {
-        return Err(format!("download failed for {}", spec.id()).into());
-    }
+
     write_manifest(settings, &spec, &model_path)?;
     Ok(spec)
 }
@@ -251,6 +268,17 @@ fn split_model_tag(name: &str) -> (&str, Option<&str>) {
 
 fn esc(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Derive the tokenizer.json URL from the model GGUF URL by replacing
+/// the filename portion with "tokenizer.json".
+fn derive_tokenizer_url(model_url: &str) -> Option<String> {
+    if model_url.is_empty() {
+        return None;
+    }
+    let last_slash = model_url.rfind('/')?;
+    let base = &model_url[..last_slash];
+    Some(format!("{base}/tokenizer.json"))
 }
 
 /// Properties extracted from a quick GGUF header probe.
