@@ -1,6 +1,5 @@
 use rand::Rng;
 
-/// Sample a token from logits with temperature, top-k, and repetition penalty.
 pub fn sample_token(
     logits: &mut [f32],
     temperature: f32,
@@ -10,7 +9,6 @@ pub fn sample_token(
 ) -> u32 {
     let vocab_size = logits.len();
 
-    // Repetition penalty (llama.cpp style)
     if repeat_penalty != 1.0 && !recent_tokens.is_empty() {
         for &token_id in recent_tokens {
             let idx = token_id as usize;
@@ -24,7 +22,6 @@ pub fn sample_token(
         }
     }
 
-    // Temperature
     if temperature != 1.0 {
         let inv_temp = 1.0 / temperature;
         for logit in logits.iter_mut() {
@@ -32,16 +29,13 @@ pub fn sample_token(
         }
     }
 
-    // Top-K via min-heap (O(V) instead of O(V log V) sort)
     if top_k > 0 && top_k < vocab_size {
         let mut heap: Vec<usize> = (0..top_k).collect();
 
-        // Build initial min-heap
         for i in (0..(top_k / 2)).rev() {
             sift_down(&mut heap, i, top_k, logits);
         }
 
-        // Process remaining
         for i in top_k..vocab_size {
             if logits[i] > logits[heap[0]] {
                 heap[0] = i;
@@ -57,7 +51,6 @@ pub fn sample_token(
         }
     }
 
-    // Softmax + sample
     let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for logit in logits.iter_mut() {

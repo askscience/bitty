@@ -18,6 +18,7 @@ pub struct ModelSpec {
     pub num_predict: u32,
     pub num_ctx: u32,
     pub path: Option<PathBuf>,
+    pub status: String,
 }
 
 impl ModelSpec {
@@ -52,7 +53,7 @@ impl ModelSpec {
 
     pub fn to_manifest(&self, model_path: &Path) -> String {
         format!(
-            "name = \"{}\"\ntag = \"{}\"\ndisplay_name = \"{}\"\nbackend = \"{}\"\nquantization = \"{}\"\nfilename = \"{}\"\nlayers = {}\nurl = \"{}\"\nsource = \"{}\"\ntemperature = {}\nnum_predict = {}\nnum_ctx = {}\npath = \"{}\"\n",
+            "name = \"{}\"\ntag = \"{}\"\ndisplay_name = \"{}\"\nbackend = \"{}\"\nquantization = \"{}\"\nfilename = \"{}\"\nlayers = {}\nurl = \"{}\"\nsource = \"{}\"\ntemperature = {}\nnum_predict = {}\nnum_ctx = {}\nstatus = \"{}\"\npath = \"{}\"\n",
             esc(&self.name),
             esc(if self.tag.is_empty() { "latest" } else { &self.tag }),
             esc(&self.display_name),
@@ -65,6 +66,7 @@ impl ModelSpec {
             self.temperature,
             self.num_predict,
             self.num_ctx,
+            esc(&self.status),
             esc(&model_path.display().to_string())
         )
     }
@@ -104,28 +106,15 @@ pub fn installed_models(settings: &BittySettings) -> Vec<ModelSpec> {
 pub fn resolve_model(settings: &BittySettings, name_or_path: &str) -> Option<ModelSpec> {
     let path = PathBuf::from(name_or_path);
     if path.exists() {
-        return Some(ModelSpec {
-            name: path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("local-model")
-                .into(),
-            tag: "local".into(),
-            display_name: "Local GGUF model".into(),
-            backend: "bitnet-i2s".into(),
-            quantization: "i2_s".into(),
-            filename: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("model.gguf")
-                .into(),
-            layers: 30,
-            temperature: settings.default_temperature,
-            num_predict: settings.default_num_predict,
-            num_ctx: settings.default_num_ctx,
-            path: Some(path),
-            ..Default::default()
-        });
+        let mut spec = local_model_spec(&path, settings);
+        // For local GGUF files, probe architecture to set the correct backend.
+        // BitNet models can use the GPU backend; everything else goes to CPU.
+        if let Ok(gguf_meta) = peek_gguf_properties(&path) {
+            spec.backend = gguf_meta.backend;
+            spec.quantization = gguf_meta.quantization;
+            spec.layers = gguf_meta.layers;
+        }
+        return Some(spec);
     }
     let name_lower = name_or_path.to_lowercase();
     installed_models(settings)
@@ -248,6 +237,7 @@ fn set_spec_value(spec: &mut ModelSpec, key: &str, value: &str) {
         "temperature" => spec.temperature = value.parse().unwrap_or(0.7),
         "num_predict" => spec.num_predict = value.parse().unwrap_or(128),
         "num_ctx" => spec.num_ctx = value.parse().unwrap_or(2048),
+        "status" => spec.status = value.into(),
         "path" => spec.path = Some(PathBuf::from(unquote(value))),
         _ => {}
     }
@@ -261,6 +251,106 @@ fn split_model_tag(name: &str) -> (&str, Option<&str>) {
 
 fn esc(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Properties extracted from a quick GGUF header probe.
+struct GgufProperties {
+    backend: String,
+    quantization: String,
+    layers: u32,
+}
+
+/// Create a default `ModelSpec` for a local GGUF file path.
+fn local_model_spec(path: &Path, settings: &BittySettings) -> ModelSpec {
+    let layers = peek_gguf_layers(path);
+    ModelSpec {
+        name: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local-model")
+            .into(),
+        tag: "local".into(),
+        display_name: "Local GGUF model".into(),
+        backend: "bitnet-i2s".into(),
+        quantization: "i2_s".into(),
+        filename: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model.gguf")
+            .into(),
+        layers,
+        url: String::new(),
+        source: String::new(),
+        temperature: settings.default_temperature,
+        num_predict: settings.default_num_predict,
+        num_ctx: settings.default_num_ctx,
+        path: Some(path.to_path_buf()),
+        status: "stable".into(),
+    }
+}
+
+/// Public helper: probe a GGUF file for its layer count without reading tensor data.
+pub fn peek_gguf_layers(path: &Path) -> u32 {
+    bitty_model::gguf::parse_gguf_file(path)
+        .map(|gguf| {
+            gguf.tensors
+                .iter()
+                .filter_map(|t| bitty_model::gguf::layer_id_from_tensor_name(&t.name))
+                .max()
+                .map(|id| id + 1)
+                .unwrap_or(1)
+        })
+        .unwrap_or(1)
+}
+
+/// Quick probe of a GGUF file header for architecture, quantization, and layers.
+/// Reads the full file header (metadata + tensor infos) but not the tensor data.
+fn peek_gguf_properties(path: &Path) -> Result<GgufProperties, String> {
+    let gguf = bitty_model::gguf::parse_gguf_file(path)
+        .map_err(|e| format!("GGUF parse: {e}"))?;
+
+    let arch_str = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| match v {
+            bitty_model::gguf::GgufMetadataValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or("unknown");
+
+    let arch = bitty_model::model_metadata::classify_architecture(arch_str);
+
+    let is_bitnet = matches!(
+        arch,
+        bitty_model::model_metadata::ModelArchitecture::BitNetB158
+            | bitty_model::model_metadata::ModelArchitecture::OneBit
+    );
+
+    let quantization = gguf
+        .tensors
+        .iter()
+        .map(|t| bitty_model::gguf::quantization_from_ggml_type(t.ggml_type))
+        .max_by(|a, b| {
+            a.bytes_per_weight()
+                .partial_cmp(&b.bytes_per_weight())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|q| q.as_str().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    let layers = gguf
+        .tensors
+        .iter()
+        .filter_map(|t| bitty_model::gguf::layer_id_from_tensor_name(&t.name))
+        .max()
+        .map(|id| id + 1)
+        .unwrap_or(1);
+
+    Ok(GgufProperties {
+        backend: if is_bitnet { "bitnet-i2s".into() } else { "cpu".into() },
+        quantization,
+        layers,
+    })
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ struct RuntimeStatsInner {
     activation_bytes: u64,
     forward_latency_us: u128,
     started: Option<Instant>,
+    rng_state: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,6 +66,22 @@ impl RuntimeStats {
             inner.started = Some(Instant::now());
         }
         inner.generated_tokens += 1;
+    }
+
+    fn next_rng_state(&self) -> u64 {
+        let mut inner = self.inner.try_lock().expect("rng stats poisoned");
+        let mut state = inner.rng_state;
+        if state == 0 {
+            state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1);
+        }
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        inner.rng_state = state;
+        state
     }
 
     pub async fn snapshot(&self) -> RuntimeStatsSnapshot {
@@ -244,13 +261,21 @@ where
         if !logits.verify_checksum() {
             return Err(Status::internal("worker returned invalid logits checksum"));
         }
-        let token_id = logits
-            .logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index as u32)
-            .unwrap_or_default();
+        let temperature = if request.temperature > 0.0 {
+            request.temperature
+        } else {
+            0.0
+        };
+        let token_id = if temperature > 0.0 {
+            bitty_inference::sampling::sample_with_temperature(
+                &logits.logits,
+                temperature,
+                0,
+                &mut self.stats.next_rng_state(),
+            )
+        } else {
+            bitty_inference::sampling::argmax(&logits.logits)
+        };
         let text = self
             .executor
             .decode_token_text(&activation.request_id, token_id, request.finished)

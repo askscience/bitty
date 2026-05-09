@@ -56,7 +56,8 @@ pub fn rope_apply(
     if head_dim == 0 {
         return;
     }
-    let half_dim = head_dim / 2;
+    // Partial RoPE: `rope_cache` holds `rope_dim/2` pairs; rotate dims `i` and `i + rp`.
+    let rp = rope_cache.rope_pair_count().min(head_dim / 2);
     let groups = num_heads.max(1) / num_kv_heads.max(1);
     let max_h = (q.len() / head_dim.max(1)).min(num_heads);
     let _max_kv_h = (k.len() / head_dim.max(1)).min(num_kv_heads);
@@ -68,20 +69,20 @@ pub fn rope_apply(
         } else {
             0
         };
-        if q_off + half_dim * 2 > q.len() || k_off + half_dim * 2 > k.len() {
+        if q_off + rp * 2 > q.len() || k_off + rp * 2 > k.len() {
             continue;
         }
-        for i in 0..half_dim {
+        for i in 0..rp {
             let (cos, sin) = rope_cache.get(pos, i);
             let q0 = q[q_off + i];
-            let q1 = q[q_off + i + half_dim];
+            let q1 = q[q_off + i + rp];
             q[q_off + i] = q0 * cos - q1 * sin;
-            q[q_off + i + half_dim] = q0 * sin + q1 * cos;
-            if k_off + i + half_dim < k.len() {
+            q[q_off + i + rp] = q0 * sin + q1 * cos;
+            if k_off + i + rp < k.len() {
                 let k0 = k[k_off + i];
-                let k1 = k[k_off + i + half_dim];
+                let k1 = k[k_off + i + rp];
                 k[k_off + i] = k0 * cos - k1 * sin;
-                k[k_off + i + half_dim] = k0 * sin + k1 * cos;
+                k[k_off + i + rp] = k0 * sin + k1 * cos;
             }
         }
     }

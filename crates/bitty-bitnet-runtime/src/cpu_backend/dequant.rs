@@ -4,7 +4,7 @@
 //! `ggml-quants.c`. The key-quant (`Q4_K`, `Q5_K`, `Q6_K`) layouts have some
 //! non-obvious packing details; see the comments on each `*Block` struct.
 
-use oxbitnet::model::gguf::{
+use bitty_model::gguf::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0, GGML_TYPE_Q8_1,
 };

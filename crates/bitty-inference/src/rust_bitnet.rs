@@ -13,9 +13,6 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
-#[cfg(feature = "oxbitnet-backend")]
-use futures::StreamExt;
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BitNetBackendProbe {
     pub metadata: BitNetModelMetadata,
@@ -191,42 +188,22 @@ impl LayerExecutor for BitNetLayerExecutor {
         let runtime = runtime.lock().await;
         let tokenizer = runtime.tokenizer();
 
-        // The GPT-2 ByteLevel decoder only correctly reassembles multi-byte
-        // UTF-8 when the full token sequence is decoded. We accumulate
-        // per-request tokens and decode the whole buffer each call, returning
-        // only the newly produced suffix.
         let mut state_map = self.decode_state.lock().expect("decode state poisoned");
         let state = state_map.entry(request_id.to_string()).or_default();
         state.ids.push(token_id);
-        eprintln!(
-            "[bitty-debug] decode req={} token_id={} finished={} total_ids={}",
-            request_id,
-            token_id,
-            finished,
-            state.ids.len()
-        );
+
         let full = match tokenizer.decode(&state.ids) {
             Ok(text) => text,
-            Err(e) => {
-                eprintln!("[bitty-debug] decode error: {e}");
+            Err(_) => {
                 if finished {
                     state_map.remove(request_id);
                 }
                 return char::REPLACEMENT_CHARACTER.to_string();
             }
         };
-        eprintln!(
-            "[bitty-debug] decode full_len={} emitted_len={} full_ends_with_fffd={}",
-            full.len(),
-            state.emitted.len(),
-            full.ends_with('\u{FFFD}')
-        );
 
         let delta = if full.len() > state.emitted.len() && full.starts_with(&state.emitted) {
             let tail = &full[state.emitted.len()..];
-            // Hold back when the tail ends on an incomplete multi-byte UTF-8
-            // sequence (emitted as U+FFFD by the decoder) unless this is the
-            // final token, in which case we flush whatever we have.
             if !finished && tail.ends_with('\u{FFFD}') {
                 String::new()
             } else {
@@ -279,46 +256,6 @@ pub enum RustBitNetError {
     Metadata(#[from] BitNetMetadataError),
     #[error(transparent)]
     Runtime(#[from] BitNetRuntimeError),
-    #[cfg(feature = "oxbitnet-backend")]
-    #[error("oxbitnet backend failed: {0}")]
-    OxBitNet(String),
-}
-
-#[cfg(feature = "oxbitnet-backend")]
-pub struct OxBitNetGenerator {
-    inner: oxbitnet::BitNet,
-}
-
-#[cfg(feature = "oxbitnet-backend")]
-impl OxBitNetGenerator {
-    pub async fn load(model_path: impl AsRef<Path>) -> Result<Self, RustBitNetError> {
-        let source = model_path.as_ref().to_string_lossy().to_string();
-        let inner = oxbitnet::BitNet::load(&source, Default::default())
-            .await
-            .map_err(|err| RustBitNetError::OxBitNet(err.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub async fn generate(
-        &mut self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-    ) -> Result<String, RustBitNetError> {
-        let mut stream = self.inner.generate(
-            prompt,
-            oxbitnet::GenerateOptions {
-                max_tokens,
-                temperature,
-                ..Default::default()
-            },
-        );
-        let mut output = String::new();
-        while let Some(piece) = stream.next().await {
-            output.push_str(&piece);
-        }
-        Ok(output)
-    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,8 @@ pub fn forward(
     let q_dim = n_heads * hd;
     let k_dim = n_kv * hd;
 
+    let mut q_fused_gate: Option<Vec<f32>> = None;
+
     // Project to Q, K, V
     let (q, k, v) = if w.is_fused_qkv {
         let fused_out = *w.q_proj.shape.last().unwrap_or(&(q_dim + k_dim * 2));
@@ -38,9 +40,16 @@ pub fn forward(
         let q_out = *w.q_proj.shape.last().unwrap_or(&q_dim);
         let k_out = *w.k_proj.shape.last().unwrap_or(&k_dim);
         let v_out = *w.v_proj.shape.last().unwrap_or(&k_dim);
-        let q = matmul::matmul(hidden, &w.q_proj, d, q_out)?;
         let k = matmul::matmul(hidden, &w.k_proj, d, k_out)?;
         let v = matmul::matmul(hidden, &w.v_proj, d, v_out)?;
+        let q_full = matmul::matmul(hidden, &w.q_proj, d, q_out)?;
+        let q = if q_full.len() == 2 * n_heads * hd {
+            let half = n_heads * hd;
+            q_fused_gate = Some(q_full[half..].to_vec());
+            q_full[..half].to_vec()
+        } else {
+            q_full
+        };
         (q, k, v)
     };
 
@@ -164,5 +173,21 @@ pub fn forward(
             out[o_start + d] = sum;
         }
     }
+
+    // Qwen3.5 MHSA: gate from second half of fused `attn_q` or separate `attn_gate` matmul
+    if let Some(ref gate_sl) = q_fused_gate {
+        for i in 0..actual_q_dim.min(gate_sl.len()) {
+            out[i] *= 1.0 / (1.0 + (-gate_sl[i]).exp());
+        }
+    } else if let Some(ref gate_weight) = w.attn_gate {
+        let gate_dim = gate_weight.shape.last().copied().unwrap_or(0);
+        if gate_dim == actual_q_dim {
+            let gate_out = matmul::matmul(hidden, gate_weight, d, gate_dim)?;
+            for i in 0..actual_q_dim.min(gate_out.len()) {
+                out[i] *= 1.0 / (1.0 + (-gate_out[i]).exp());
+            }
+        }
+    }
+
     Ok(out)
 }

@@ -9,15 +9,15 @@ rust-version.workspace = true
 [dependencies]
 bitty-model.workspace = true
 bitty-protocol.workspace = true
+bitty-candle-runtime.workspace = true
+candle-core.workspace = true
 bytemuck = "1"
 bytes.workspace = true
 futures.workspace = true
 half = "2"
 memmap2.workspace = true
-oxbitnet.workspace = true
 rand = "0.9"
 rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-wgpu = "26"

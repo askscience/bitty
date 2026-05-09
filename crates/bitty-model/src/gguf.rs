@@ -171,6 +171,46 @@ pub enum GgufMetadataValue {
     Bool(bool),
     String(String),
     ArrayLen(u64),
+    StringArray(Vec<String>),
+}
+
+impl GgufMetadataValue {
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            Self::U64(v) => Some(*v as u32),
+            Self::I64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::U64(v) => Some(*v),
+            Self::I64(v) => Some(*v as u64),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::F64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_string_array(&self) -> Option<&[String]> {
+        match self {
+            Self::StringArray(arr) => Some(arr.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -380,10 +420,18 @@ impl<'a> Reader<'a> {
             9 => {
                 let item_type = self.read_u32()?;
                 let len = self.read_u64()?;
-                for _ in 0..len {
-                    self.skip_metadata_value(item_type)?;
+                if item_type == 8 && len > 0 {
+                    let mut strings = Vec::with_capacity(len as usize);
+                    for _ in 0..len {
+                        strings.push(self.read_string()?);
+                    }
+                    Ok(GgufMetadataValue::StringArray(strings))
+                } else {
+                    for _ in 0..len {
+                        self.skip_metadata_value(item_type)?;
+                    }
+                    Ok(GgufMetadataValue::ArrayLen(len))
                 }
-                Ok(GgufMetadataValue::ArrayLen(len))
             }
             10 => Ok(GgufMetadataValue::U64(self.read_u64()?)),
             11 => Ok(GgufMetadataValue::I64(self.read_i64()?)),

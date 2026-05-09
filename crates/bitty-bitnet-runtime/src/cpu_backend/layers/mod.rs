@@ -1,12 +1,13 @@
 //! Layer dispatcher. Routes each layer's forward pass to the correct implementation.
 
 pub mod attention;
+pub mod linear_attn;
 pub mod mlp;
 pub mod ssm;
 
 use crate::cpu_backend::matmul;
 use crate::cpu_backend::ops;
-use crate::cpu_backend::types::*;
+use crate::cpu_backend::types::{CpuLayer, CpuModelMetadata, KvCache, LayerKind, RecurrentState, RopeCache};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -16,7 +17,7 @@ impl CpuLayer {
         hidden: &[f32],
         pos: usize,
         kv_cache: &mut KvCache,
-        ssm_states: &mut Vec<SsmState>,
+        recurrent: &mut Vec<RecurrentState>,
         meta: &CpuModelMetadata,
         rope_cache: &RopeCache,
     ) -> Result<Vec<f32>> {
@@ -32,18 +33,32 @@ impl CpuLayer {
                 attention::forward(&normed, w, pos, kv_cache, meta, self.layer_idx, rope_cache)?
             }
             LayerKind::Ssm(ref w) => {
-                let state = &mut ssm_states[self.layer_idx];
+                let RecurrentState::Mamba(state) = &mut recurrent[self.layer_idx] else {
+                    return Err(format!(
+                        "layer {}: expected Mamba recurrent state",
+                        self.layer_idx
+                    ));
+                };
                 ssm::forward(&normed, w, pos, state, meta)?
+            }
+            LayerKind::LinearAttn(ref w) => {
+                let RecurrentState::QwenLinear(state) = &mut recurrent[self.layer_idx] else {
+                    return Err(format!(
+                        "layer {}: expected Qwen linear recurrent state",
+                        self.layer_idx
+                    ));
+                };
+                linear_attn::forward(&normed, w, meta, state)?
             }
         };
 
-        // ---- O projection (only for attention layers; SSM already fused)
+        // ---- O projection (only for attention layers; SSM / linear already fused)
         let block_proj = match &self.kind {
             LayerKind::Attention(_) => {
                 let actual_dim = block_out.len();
                 matmul::matmul(&block_out, self.attn_o_proj(), actual_dim, d)?
             }
-            LayerKind::Ssm(_) => block_out,
+            LayerKind::Ssm(_) | LayerKind::LinearAttn(_) => block_out,
         };
 
         // ---- First residual: x1 = x + block_proj

@@ -16,6 +16,7 @@ pub enum ModelArchitecture {
     Mistral,
     Phi,
     Qwen2,
+    Qwen35,
     Gemma,
     Gemma2,
     Falcon,
@@ -34,6 +35,7 @@ impl ModelArchitecture {
             Self::Mistral => "mistral",
             Self::Phi => "phi",
             Self::Qwen2 => "qwen2",
+            Self::Qwen35 => "qwen35",
             Self::Gemma => "gemma",
             Self::Gemma2 => "gemma2",
             Self::Falcon => "falcon",
@@ -50,6 +52,7 @@ impl ModelArchitecture {
             Self::Mistral => &["mistral.dim"],
             Self::Phi => &["phi.hidden_size"],
             Self::Qwen2 => &["qwen2.embedding_length"],
+            Self::Qwen35 => &["qwen35.embedding_length"],
             Self::Gemma | Self::Gemma2 => &["gemma.embedding_length"],
             Self::Falcon => &["falcon.hidden_size"],
             Self::StableLM => &["stablelm.embedding_length"],
@@ -65,6 +68,7 @@ impl ModelArchitecture {
             Self::Mistral => Some("mistral.attention.head_count"),
             Self::Phi => Some("phi.num_attention_heads"),
             Self::Qwen2 => Some("qwen2.attention.head_count"),
+            Self::Qwen35 => Some("qwen35.attention.head_count"),
             Self::Gemma | Self::Gemma2 => Some("gemma.attention.head_count"),
             Self::Falcon => Some("falcon.num_attention_heads"),
             Self::StableLM => Some("stablelm.attention.head_count"),
@@ -78,6 +82,7 @@ impl ModelArchitecture {
             Self::Llama => Some("llama.rope.dimension_count"),
             Self::Mistral => Some("mistral.rope.dimension_count"),
             Self::Qwen2 => Some("qwen2.rope.dimension_count"),
+            Self::Qwen35 => Some("qwen35.rope.dimension_sections"),
             Self::Gemma | Self::Gemma2 => Some("gemma.rope.dimension_count"),
             _ => None,
         }
@@ -102,6 +107,8 @@ pub fn classify_architecture(arch_str: &str) -> ModelArchitecture {
         ModelArchitecture::Mistral
     } else if lower.contains("phi-3") || lower.contains("phi3") || lower.contains("phi-") {
         ModelArchitecture::Phi
+    } else if lower.contains("qwen35") || lower.contains("qwen3.5") || lower.contains("qwen-3.5") {
+        ModelArchitecture::Qwen35
     } else if lower.contains("qwen2")
         || lower.contains("qwen-2")
         || lower.contains("qwen3")

@@ -10,6 +10,7 @@ rust-version.workspace = true
 bitty-bitnet-runtime.workspace = true
 bitty-coordinator.workspace = true
 bitty-inference.workspace = true
+bitty-model.workspace = true
 bitty-protocol.workspace = true
 bitty-worker.workspace = true
 futures.workspace = true

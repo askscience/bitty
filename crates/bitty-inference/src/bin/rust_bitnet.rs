@@ -75,7 +75,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: cargo run -p bitty-inference --features oxbitnet-backend --bin bitty-rust-bitnet -- [--model PATH] [--prompt TEXT] [--max-tokens N]"
+        "Usage: cargo run -p bitty-inference --bin bitty-rust-bitnet -- [--model PATH] [--prompt TEXT] [--max-tokens N]"
     );
     println!("Default model: {DEFAULT_MODEL_PATH}");
 }

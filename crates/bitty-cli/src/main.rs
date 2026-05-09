@@ -30,13 +30,13 @@ use bitty_protocol::pb::{
 use bitty_protocol::security::{
     constant_time_eq, validate_cluster_token, AuthMode, BITTY_TOKEN_HEADER,
 };
-use bitty_protocol::{HardwareProfile, LayerMetadata, NodeId, BITTY_PROTOCOL_VERSION};
+use bitty_protocol::{HardwareProfile, NodeId, BITTY_PROTOCOL_VERSION};
 use bitty_worker::{
     network::{NetworkWorker, RuntimeStats},
     HardwareProfiler,
 };
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
-use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
+use model_store::{copy_model, installed_models, pull_model, registry_models, remove_model, resolve_model};
 use settings::BittySettings;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -148,7 +148,7 @@ struct NodeConfig {
     worker_listen: Option<String>,
     public_endpoint: Option<String>,
     join: Option<String>,
-    layers: u32,
+    layers: Option<u32>,
     heartbeat_interval_ms: u64,
     iroh: bool,
     data_dir: Option<String>,
@@ -379,11 +379,58 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
     validate_cluster_token(&cluster_token)?;
+    let model_path = std::path::PathBuf::from(&config.model);
+
+    // Load model metadata to derive real layer count from the GGUF
+    let model_metadata = match bitty_inference::BitNetBackendProbe::load(&model_path) {
+        Ok(probe) => probe.metadata,
+        Err(err) => {
+            return Err(format!("failed to read model metadata from {}: {err}", model_path.display()).into());
+        }
+    };
+    let layer_metadata = model_metadata.layer_metadata();
+    if let Some(cli_layers) = config.layers {
+        if cli_layers != model_metadata.layer_count {
+            eprintln!(
+                "warning: --layers {cli_layers} overrides GGUF layer count {}; using GGUF value",
+                model_metadata.layer_count
+            );
+        }
+    }
+    eprintln!(
+        "info: model has {} layers, hidden_size={}, quant={}, arch={}",
+        model_metadata.layer_count,
+        model_metadata.hidden_size,
+        model_metadata.quantization.as_str(),
+        model_metadata.architecture.as_str(),
+    );
+
+    // Check whether the model is a BitNet variant (supports GPU sharded execution).
+    // Non-BitNet models (llama, gemma, qwen, etc.) require --local for now.
+    let is_bitnet_model = matches!(
+        model_metadata.architecture,
+        bitty_model::BitNetModelFamily::BitNetB158
+    );
+    if !is_bitnet_model && config.join.is_none() {
+        return Err(format!(
+            "model {} (arch={}, quant={}) is not a BitNet model.\n\
+             Distributed (iroh) mode currently only supports BitNet i2_s or F16 models.\n\
+             For llama / gemma / qwen / mistral / phi, run with --local:\n\
+             \n  bitty run {} --local \"your prompt\"\n\n\
+             or if starting a node:\n\
+             \n  bitty run {} --local\n",
+            model_metadata.architecture.as_str(),
+            model_metadata.architecture.as_str(),
+            model_metadata.quantization.as_str(),
+            config.model,
+            config.model,
+        ).into());
+    }
+
     // Load the real BitNet executor so inference produces real tokens and the
     // per-request stateful decoder runs. Falls back to the fake executor if
     // the model file can't be loaded (e.g. missing weights) so the node can
     // still run for cluster topology tests.
-    let model_path = std::path::PathBuf::from(&config.model);
     let worker: NetworkWorker<bitty_inference::BitNetLayerExecutor> =
         match bitty_inference::BitNetLayerExecutor::load(&model_path).await {
             Ok(bitnet) => {
@@ -438,7 +485,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         resolve_scheduler_target(&join, iroh_node.as_ref(), &cluster_token).await?
     } else {
         let leader = listen_as_connect_endpoint(&config.listen);
-        let mut coordinator = NetworkCoordinator::new(demo_layers(config.layers))
+        let mut coordinator = NetworkCoordinator::new(layer_metadata)
             .with_model_path(&config.model)
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()))
             .with_visibility(&config.visibility)
@@ -512,6 +559,23 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         }
     }
     let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
+    // Warn or refuse on experimental/unsupported models
+    match model.status.as_str() {
+        "unsupported" => {
+            return Err(format!(
+                "model {} is unsupported: {}. Try a different model with `bitty run MODEL`.",
+                model.id(),
+                model.display_name
+            ).into());
+        }
+        "experimental" => {
+            eprintln!(
+                "warning: model {} is experimental and may produce incorrect output.",
+                model.id()
+            );
+        }
+        _ => {}
+    }
     if !config.local && config.node.is_none() && settings.auto_start_node {
         let model_path = model.model_path(&settings);
         if !model_path.exists() && settings.auto_pull {
@@ -752,27 +816,47 @@ async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
 
 async fn run_list(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
-    let models = installed_models(&settings);
-    if models.is_empty() {
-        println!("  {}no models installed{}", ui::Y, ui::N);
+    let installed = installed_models(&settings);
+    let registry = registry_models();
+
+    if installed.is_empty() && registry.is_empty() {
+        println!("  {}no models available{}", ui::Y, ui::N);
         return Ok(());
     }
+
     println!(
-        "  {}  {:<20} {}  {}",
+        "  {:<24} {:<12} {:<14} {}",
         ui::dim("name"),
         ui::dim("backend"),
         ui::dim("quantization"),
-        ui::dim("path")
+        ui::dim("status")
     );
-    for model in models {
+
+    let installed_ids: std::collections::HashSet<String> =
+        installed.iter().map(|m| m.id()).collect();
+
+    for model in &installed {
         println!(
-            "  {}  {:<20} {}  {}",
+            "  {:<24} {:<12} {:<14} {}",
             ui::bold(&model.id()),
             ui::dim(&model.backend),
             model.quantization,
-            ui::dim(&model.model_path(&settings).display().to_string())
+            ui::green("installed")
         );
     }
+
+    for model in &registry {
+        if !installed_ids.contains(&model.id()) {
+            println!(
+                "  {:<24} {:<12} {:<14} {}",
+                ui::dim(&model.id()),
+                ui::dim(&model.backend),
+                model.quantization,
+                ui::dim("available")
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -927,6 +1011,7 @@ async fn setup_model(settings: &BittySettings) -> Result<(), Box<dyn std::error:
     let spec = model_store::find_registry_model(&model_name).or_else(|| {
         let path = std::path::Path::new(&model_name);
         if path.exists() {
+            let layers = model_store::peek_gguf_layers(path);
             Some(model_store::ModelSpec {
                 name: model_name.clone(),
                 tag: "local".into(),
@@ -938,13 +1023,14 @@ async fn setup_model(settings: &BittySettings) -> Result<(), Box<dyn std::error:
                     .and_then(|n| n.to_str())
                     .unwrap_or("model.gguf")
                     .into(),
-                layers: 30,
+                layers,
                 url: String::new(),
                 source: String::new(),
                 temperature: settings.default_temperature,
                 num_predict: settings.default_num_predict,
                 num_ctx: settings.default_num_ctx,
                 path: Some(path.to_path_buf()),
+                status: "stable".into(),
             })
         } else {
             None
@@ -1327,7 +1413,7 @@ async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> 
         worker_listen: None,
         public_endpoint: None,
         join: Some(invite),
-        layers: 30,
+        layers: None,
         heartbeat_interval_ms: 1000,
         iroh: true,
         data_dir: config.data_dir,
@@ -1998,7 +2084,7 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
         worker_listen: None,
         public_endpoint: None,
         join: None,
-        layers: 30,
+        layers: None,
         heartbeat_interval_ms: 1000,
         iroh: true,
         data_dir: None,
@@ -2019,7 +2105,10 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
                 config.public_endpoint = Some(required_next(args, "--public-endpoint")?)
             }
             "--join" => config.join = Some(required_next(args, "--join")?),
-            "--layers" => config.layers = parse_next(args, "--layers")?,
+            "--layers" => {
+                let raw: String = required_next(args, "--layers")?;
+                config.layers = Some(raw.parse::<u32>().map_err(|_| format!("invalid --layers value: {raw}"))?);
+            }
             "--heartbeat-interval-ms" => {
                 config.heartbeat_interval_ms = parse_next(args, "--heartbeat-interval-ms")?
             }
@@ -3341,18 +3430,6 @@ fn request_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("bitty-{nanos:x}")
-}
-
-fn demo_layers(count: u32) -> Vec<LayerMetadata> {
-    (0..count)
-        .map(|layer_id| LayerMetadata {
-            layer_id,
-            weight_bytes: 512_000,
-            activation_bytes: 4096,
-            estimated_flops: 1e9,
-            precision_critical: layer_id == 0 || layer_id + 1 == count,
-        })
-        .collect()
 }
 
 fn bitty_version() -> String {

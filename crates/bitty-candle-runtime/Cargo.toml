@@ -1,0 +1,29 @@
+[package]
+name = "bitty-candle-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitty-model.workspace = true
+bitty-protocol.workspace = true
+candle-core = { workspace = true, default-features = false }
+candle-nn.workspace = true
+bytemuck = "1"
+half = { version = "2", features = ["bytemuck"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ahash = "0.8"
+memmap2.workspace = true
+rand = "0.9"
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+cpu-mkl = ["candle-core/mkl"]
+cpu-accelerate = ["candle-core/accelerate"]

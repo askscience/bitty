@@ -25,13 +25,12 @@ use types::*;
 /// CPU-loaded GGUF model ready for inference.
 pub struct CpuModel {
     pub metadata: CpuModelMetadata,
-    tokenizer: oxbitnet::Tokenizer,
+    tokenizer: bitty_candle_runtime::Tokenizer,
     embed_tokens: Vec<f32>,
     final_norm: Vec<f32>,
     layers: Vec<CpuLayer>,
     lm_head: Option<LmHead>,
     kv_cache: KvCache,
-    ssm_states: Vec<SsmState>,
     rope_cache: RopeCache,
     mmap: Option<memmap2::Mmap>,
 }
@@ -45,7 +44,9 @@ impl CpuModel {
             memmap2::Mmap::map(&file)
                 .map_err(|e| format!("Cannot mmap model: {e}"))?
         };
-        let (metadata, tokenizer, weights) = loader::load_gguf(&mmap)?;
+        let (metadata, weights) = loader::load_gguf(&mmap)?;
+        let tokenizer = bitty_candle_runtime::Tokenizer::from_gguf_path(path)
+            .map_err(|e| format!("tokenizer error: {e}"))?;
         let num_layers = weights.layers.len().max(1);
         let meta = loader::metadata::extract_config(&metadata, num_layers);
 
@@ -53,16 +54,9 @@ impl CpuModel {
         let mut kv_cache = KvCache::new();
         kv_cache.reserve(meta.num_layers, max_kv_dim, meta.max_seq_len);
 
-        let rope_cache = RopeCache::new(meta.max_seq_len, meta.head_dim, meta.rope_theta);
-
-        let ssm_states: Vec<SsmState> = weights
-            .layers
-            .iter()
-            .map(|layer| match &layer.kind {
-                LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
-                _ => SsmState::new(1, 1, 1),
-            })
-            .collect();
+        let rope_d = meta.rope_dim.max(2);
+        let rope_d = if rope_d % 2 == 1 { rope_d + 1 } else { rope_d };
+        let rope_cache = RopeCache::new(meta.max_seq_len, rope_d, meta.rope_theta);
 
         Ok(Self {
             metadata: meta,
@@ -72,13 +66,12 @@ impl CpuModel {
             layers: weights.layers,
             lm_head: weights.lm_head,
             kv_cache,
-            ssm_states,
             rope_cache,
             mmap: Some(mmap),
         })
     }
 
-    pub fn tokenizer(&self) -> &oxbitnet::Tokenizer {
+    pub fn tokenizer(&self) -> &bitty_candle_runtime::Tokenizer {
         &self.tokenizer
     }
 
@@ -107,14 +100,7 @@ impl CpuModel {
         let d = m.hidden_size;
 
         let mut kv_cache = KvCache::new();
-        let mut ssm_states: Vec<SsmState> = self
-            .layers
-            .iter()
-            .map(|layer| match &layer.kind {
-                LayerKind::Ssm(w) => SsmState::new(w.d_inner, w.d_state, w.kernel_size),
-                _ => SsmState::new(1, 1, 1),
-            })
-            .collect();
+        let mut recurrent = init_recurrent_states(&self.layers, m);
 
         let vocab_size = m.vocab_size;
         let mut hidden = vec![0f32; d];
@@ -127,7 +113,7 @@ impl CpuModel {
                 }
             }
             for layer in &self.layers {
-                h = layer.forward(&h, pos, &mut kv_cache, &mut ssm_states, m, &self.rope_cache)?;
+                h = layer.forward(&h, pos, &mut kv_cache, &mut recurrent, m, &self.rope_cache)?;
             }
             hidden = h;
             kv_cache.seq_len += 1;
@@ -141,7 +127,8 @@ impl CpuModel {
         let mut rng_state: u64 = 0xC0FFEE_u64 ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
         for _ in 0..max_tokens {
             for layer in &self.layers {
-                hidden = layer.forward(&hidden, pos, &mut kv_cache, &mut ssm_states, m, &self.rope_cache)?;
+                hidden =
+                    layer.forward(&hidden, pos, &mut kv_cache, &mut recurrent, m, &self.rope_cache)?;
             }
             kv_cache.seq_len += 1;
             let normed = ops::rms_norm(&hidden, &self.final_norm, m.rms_norm_eps);
@@ -209,6 +196,31 @@ impl CpuModel {
     ) -> Result<String, String> {
         self.generate_stream(prompt, max_tokens, temperature, top_k, repeat_penalty, |_| {})
     }
+}
+
+fn init_recurrent_states(layers: &[CpuLayer], meta: &CpuModelMetadata) -> Vec<RecurrentState> {
+    let max_idx = layers.iter().map(|l| l.layer_idx).max().unwrap_or(0);
+    let mut recurrent = vec![RecurrentState::None; max_idx + 1];
+    for layer in layers {
+        recurrent[layer.layer_idx] = match &layer.kind {
+            LayerKind::Ssm(w) => {
+                RecurrentState::new_mamba(w.d_inner, w.d_state, w.kernel_size)
+            }
+            LayerKind::LinearAttn(_) => {
+                let num_v = meta.ssm_dt_rank.max(1);
+                let head_v = meta.ssm_d_inner / num_v;
+                let head_k = meta.ssm_d_state;
+                let num_k = meta.ssm_n_group;
+                let key_dim = head_k * num_k;
+                let value_dim = head_v * num_v;
+                let conv_dim = key_dim * 2 + value_dim;
+                let d_conv = meta.ssm_d_conv.max(1);
+                RecurrentState::new_qwen_linear(d_conv, conv_dim, head_v, num_v)
+            }
+            _ => RecurrentState::None,
+        };
+    }
+    recurrent
 }
 
 /// Argmax over logits (used at temperature 0 or as a safe fallback).

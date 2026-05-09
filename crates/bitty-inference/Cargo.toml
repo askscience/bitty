@@ -11,9 +11,7 @@ async-trait.workspace = true
 bitty-model.workspace = true
 bitty-bitnet-runtime.workspace = true
 bitty-protocol.workspace = true
-futures = { workspace = true, optional = true }
 metrics.workspace = true
-oxbitnet = { workspace = true, optional = true }
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -22,10 +20,6 @@ tonic.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-
-[features]
-default = []
-oxbitnet-backend = ["dep:futures", "dep:oxbitnet"]
 
 [[bench]]
 name = "ring_execution"

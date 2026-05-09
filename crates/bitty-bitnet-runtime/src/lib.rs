@@ -54,19 +54,10 @@ impl Default for SamplingOptions {
     }
 }
 
-pub type BitNetTokenizer = oxbitnet::Tokenizer;
+pub type BitNetTokenizer = bitty_candle_runtime::Tokenizer;
 
-/// Load just the tokenizer from a GGUF file without initializing GPU resources
-/// or loading any weights. Useful for CLI-side prompt tokenization before
-/// sending generation requests to a remote cluster.
 pub fn load_tokenizer(path: &Path) -> Result<BitNetTokenizer> {
-    let data = std::fs::read(path)
-        .map_err(|err| BitNetRuntimeError::Backend(format!("read {}: {err}", path.display())))?;
-    let mut parser = oxbitnet::model::gguf::GgufParser::new(&data);
-    let gguf = parser
-        .parse()
-        .map_err(|err| BitNetRuntimeError::Backend(format!("gguf parse: {err}")))?;
-    oxbitnet::Tokenizer::from_gguf_metadata(&gguf.metadata)
+    bitty_candle_runtime::Tokenizer::from_gguf_path(path)
         .map_err(|err| BitNetRuntimeError::Backend(format!("tokenizer: {err}")))
 }
 
@@ -229,7 +220,7 @@ impl BitNetRuntime {
 
         let dist = rand::distr::weighted::WeightedIndex::new(scaled)
             .map_err(|_| BitNetRuntimeError::EmptyLogits)?;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         use rand::Rng;
         Ok(rng.sample(&dist) as u32)
     }
@@ -244,13 +235,6 @@ impl BitNetRuntime {
             .await
     }
 
-    /// Generate tokens, streaming decoded text deltas to `on_delta` as they
-    /// become available. The underlying tokenizer uses a GPT-2 ByteLevel
-    /// decoder, which only correctly reassembles multi-byte UTF-8 when the
-    /// full token sequence is decoded together. We therefore decode the
-    /// accumulated sequence after every new token and emit only the newly
-    /// produced suffix. When the tail ends with U+FFFD (incomplete multi-byte
-    /// UTF-8) we hold back until the next token completes the character.
     pub async fn generate_stream<F>(
         &mut self,
         prompt: &str,
@@ -406,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires BITTY_GGUF_MODEL=/path/to/ggml-model-i2_s.gguf and a wgpu device"]
+    #[ignore = "requires BITTY_GGUF_MODEL=/path/to/ggml-model-i2_s.gguf and a compatible device"]
     async fn split_local_logits_match_full_local_logits_for_temperature_zero() {
         let model_path = std::env::var("BITTY_GGUF_MODEL").expect("BITTY_GGUF_MODEL must be set");
         let path = Path::new(&model_path);

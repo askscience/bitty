@@ -33,6 +33,8 @@ pub enum TensorRole {
     SsmDParam(usize),
     SsmOutProj(usize),
     SsmNorm(usize),
+    /// Qwen3.5 gated attention gate weight
+    AttnGate(usize),
     Ignored,
 }
 
@@ -78,12 +80,12 @@ pub fn classify(name: &str) -> Option<TensorRole> {
             "ssm_d.weight" | "ssm_d_param" => Some(TensorRole::SsmDParam(layer)),
             "ssm_out.weight" => Some(TensorRole::SsmOutProj(layer)),
             "ssm_norm.weight" => Some(TensorRole::SsmNorm(layer)),
+            "attn_gate.weight" => Some(TensorRole::AttnGate(layer)),
             // Sub-norms and extras — ignore
             "attn_sub_norm.weight"
             | "ffn_sub_norm.weight"
             | "self_attn.sub_norm.weight"
-            | "mlp.sub_norm.weight"
-            | "attn_gate.weight" => Some(TensorRole::Ignored),
+            | "mlp.sub_norm.weight" => Some(TensorRole::Ignored),
             _ => None,
         };
     }

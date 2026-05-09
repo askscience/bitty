@@ -7,30 +7,34 @@
 //! dims so they stopped matching tensor shapes. Fall back with `unwrap_or` only.
 
 use crate::cpu_backend::types::{ActivationFn, CpuModelMetadata};
-use oxbitnet::model::gguf::GgufMetadata;
+use bitty_model::gguf::GgufFileMetadata;
 
 /// Detect model architecture from GGUF metadata.
-pub fn detect_architecture(meta: &GgufMetadata) -> String {
-    meta.get("general.architecture")
+pub fn detect_architecture(meta: &GgufFileMetadata) -> String {
+    meta.metadata
+        .get("general.architecture")
         .and_then(|v| v.as_str())
         .unwrap_or("llama")
         .to_string()
 }
 
 /// Extract model hyperparameters from GGUF metadata.
-pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadata {
+pub fn extract_config(meta: &GgufFileMetadata, num_layers: usize) -> CpuModelMetadata {
     let arch = detect_architecture(meta);
 
     // Lookup helper: try architecture-specific key, then llama fallback, then bitnet.
     let get_u32 = |suffix: &str| -> Option<u32> {
-        meta.get(&format!("{arch}.{suffix}"))
+        meta.metadata
+            .get(&format!("{arch}.{suffix}"))
             .and_then(|v| v.as_u32())
             .or_else(|| {
-                meta.get(&format!("llama.{suffix}"))
+                meta.metadata
+                    .get(&format!("llama.{suffix}"))
                     .and_then(|v| v.as_u32())
             })
             .or_else(|| {
-                meta.get(&format!("bitnet.{suffix}"))
+                meta.metadata
+                    .get(&format!("bitnet.{suffix}"))
                     .and_then(|v| v.as_u32())
             })
     };
@@ -44,7 +48,8 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
     let num_kv_heads = get_u32("attention.head_count_kv")
         .or_else(|| {
             // Older key spelling some converters emit.
-            meta.get("llama.attention.key_value_head_count")
+            meta.metadata
+                .get("llama.attention.key_value_head_count")
                 .and_then(|v| v.as_u32())
         })
         .unwrap_or(num_heads as u32) as usize;
@@ -64,19 +69,24 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
     let intermediate_size = get_u32("feed_forward_length").unwrap_or(8192) as usize;
 
     let vocab_size = meta
+        .metadata
         .get("tokenizer.ggml.tokens")
         .and_then(|v| v.as_string_array())
         .map(|a| a.len())
         .unwrap_or(128256);
 
     let rms_eps = meta
+        .metadata
         .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
-        .and_then(|v| v.as_f32())
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
         .unwrap_or(1e-5);
 
     let rope_theta = meta
+        .metadata
         .get(&format!("{arch}.rope.freq_base"))
-        .and_then(|v| v.as_f32())
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
         .unwrap_or(if arch.contains("bitnet-25") {
             500000.0
         } else {
@@ -84,10 +94,12 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
         });
 
     let max_seq_len = meta
+        .metadata
         .get(&format!("{arch}.context_length"))
         .and_then(|v| v.as_u32())
         .unwrap_or(
-            meta.get("llama.context_length")
+            meta.metadata
+                .get("llama.context_length")
                 .and_then(|v| v.as_u32())
                 .unwrap_or(4096),
         ) as usize;
@@ -98,6 +110,27 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
         ActivationFn::Silu
     };
 
+    let is_qwen35 = arch == "qwen35"
+        || meta
+            .metadata
+            .keys()
+            .any(|k| k.starts_with("qwen35.") || k.starts_with("Qwen35."));
+
+    let rope_dim = get_u32("rope.dimension_count")
+        .map(|v| v as usize)
+        .unwrap_or(head_dim);
+
+    let default_mrope: [u32; 4] = [11, 11, 10, 0];
+    let rope_sections = default_mrope;
+
+    let full_attention_interval = get_u32("attention.full_attention_interval").unwrap_or(4);
+
+    let ssm_d_conv = get_u32("ssm.conv_kernel").unwrap_or(0) as usize;
+    let ssm_d_inner = get_u32("ssm.inner_size").unwrap_or(0) as usize;
+    let ssm_d_state = get_u32("ssm.state_size").unwrap_or(0) as usize;
+    let ssm_dt_rank = get_u32("ssm.time_step_rank").unwrap_or(0) as usize;
+    let ssm_n_group = get_u32("ssm.group_count").unwrap_or(0) as usize;
+
     CpuModelMetadata {
         architecture: arch,
         hidden_size,
@@ -105,11 +138,20 @@ pub fn extract_config(meta: &GgufMetadata, num_layers: usize) -> CpuModelMetadat
         num_heads,
         num_kv_heads,
         head_dim,
+        rope_dim,
         intermediate_size,
         vocab_size,
         max_seq_len,
         rms_norm_eps: rms_eps,
         rope_theta,
         activation,
+        is_qwen35,
+        full_attention_interval,
+        rope_sections,
+        ssm_d_conv,
+        ssm_d_inner,
+        ssm_d_state,
+        ssm_dt_rank,
+        ssm_n_group,
     }
 }
