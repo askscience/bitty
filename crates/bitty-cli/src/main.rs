@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Models(config)) => run_models(config).await,
         Ok(CliCommand::Clean(config)) => run_clean(config).await,
         Ok(CliCommand::Reset(config)) => run_reset(config).await,
+        Ok(CliCommand::Hardware(config)) => run_hardware(config).await,
         Ok(CliCommand::Help) => {
             print_help();
             Ok(())
@@ -137,6 +138,7 @@ enum CliCommand {
     Models(ModelsConfig),
     Clean(DataDirConfig),
     Reset(DataDirConfig),
+    Hardware(DataDirConfig),
     Help,
     Version,
 }
@@ -355,6 +357,7 @@ impl Cli {
             "models" => parse_models(&mut args).map(CliCommand::Models),
             "clean" => parse_data_dir(&mut args).map(CliCommand::Clean),
             "reset" => parse_data_dir(&mut args).map(CliCommand::Reset),
+            "hardware" => parse_data_dir(&mut args).map(CliCommand::Hardware),
             "-h" | "--help" | "help" => Ok(CliCommand::Help),
             "-V" | "--version" | "version" => Ok(CliCommand::Version),
             other => Err(format!("unknown command: {other}")),
@@ -1440,6 +1443,64 @@ async fn run_reset(config: DataDirConfig) -> Result<(), Box<dyn std::error::Erro
         ui::B,
         ui::N
     );
+    Ok(())
+}
+
+async fn run_hardware(config: DataDirConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let _settings = load_settings(config.data_dir.as_deref());
+    println!("  bitty hardware");
+    println!();
+    println!("  CPU:");
+    let cpu_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let os = std::env::consts::OS;
+    println!("    platform:     {os}");
+    println!("    cpu threads:  {cpu_count}");
+
+    // wgpu probe
+    print!("    wgpu:         ");
+    #[cfg(feature = "gpu-wgpu")]
+    {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all());
+        if adapters.is_empty() {
+            println!("no adapters found");
+        } else {
+            println!("{} adapter(s)", adapters.len());
+            for a in &adapters {
+                let info = a.get_info();
+                println!("      - {} ({:?}, {:?})", info.name, info.backend, info.device_type);
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    {
+        println!("not compiled (enable --features gpu-wgpu)");
+    }
+
+    // candle backends
+    println!();
+    println!("  Available backends:");
+    println!("    cpu:           always available");
+    #[cfg(feature = "gpu-cuda")] { println!("    cuda:          compiled"); }
+    #[cfg(not(feature = "gpu-cuda"))] { println!("    cuda:          not compiled"); }
+    #[cfg(feature = "gpu-rocm")] { println!("    rocm:          compiled (experimental)"); }
+    #[cfg(not(feature = "gpu-rocm"))] { println!("    rocm:          not compiled"); }
+    #[cfg(feature = "gpu-metal")] { println!("    metal:         compiled"); }
+    #[cfg(not(feature = "gpu-metal"))] { println!("    metal:         not compiled (enable --features gpu-metal)"); }
+
+    // CUDA probe
+    let has_cuda = std::process::Command::new("nvidia-smi")
+        .arg("-L").output().map(|o| o.status.success()).unwrap_or(false);
+    if has_cuda { println!("    cuda runtime:  detected (nvidia-smi)"); }
+
+    println!();
+    println!("  Auto-selection order (default):");
+    if cfg!(feature = "gpu-cuda") && has_cuda { println!("    1. candle-cuda"); }
+    if cfg!(feature = "gpu-metal") && os == "macos" { println!("    2. candle-metal"); }
+    if cfg!(feature = "gpu-rocm") && os == "linux" { println!("    3. candle-rocm"); }
+    if cfg!(feature = "gpu-wgpu") { println!("    4. wgpu (Vulkan/Metal/DX12)"); }
+    println!("    fallback: CPU");
+
     Ok(())
 }
 
