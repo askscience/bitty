@@ -204,6 +204,7 @@ struct RunConfig {
     local: bool,
     gpu: bool,
     gpu_backend: Option<String>,
+    force_cpu: bool,
     seed: Option<u64>,
     debug_tokens: bool,
 }
@@ -685,7 +686,8 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         let temp = config.temperature.parse().unwrap_or(model.temperature);
         let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
         let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
-        let use_gpu = config.gpu && !config.local;
+        // Default: auto-detect GPU. --cpu forces CPU-only. Explicit backend flags (--cuda etc.) override auto-detect.
+        let use_gpu = !config.force_cpu || config.gpu_backend.is_some();
 
         // Load model once, keep alive across turns
         let mut bitnet_runtime: Option<BitNetRuntime> = None;
@@ -696,84 +698,35 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
             .expect("failed to load tokenizer");
 
-        if use_gpu {
+        if use_gpu && !is_bitnet {
             let requested = config.gpu_backend.as_deref()
                 .map(gpu_select::GpuBackendKind::from_cli_flag);
             let kind = gpu_select::select_backend(requested);
-            eprintln!("  {}  {}", ui::dim("GPU backend:"), ui::dim(kind.name()));
 
-            match kind {
-                gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm => {
-                    let device = bitty_candle_runtime::auto_device();
-                    match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
-                        Ok(m) => {
-                            eprintln!("  {}  {}", ui::dim("loaded on"), ui::dim(&format!("{device:?}")));
-                            candle_model = Some(m);
-                            gpu_backend_kind = Some(kind);
-                        }
-                        Err(e) => {
-                            eprintln!("  {} ({})", ui::dim("GPU unavailable, falling back to CPU"), e);
-                        }
-                    }
+            // Try candle GPU backends (CUDA / Metal / ROCm)
+            if matches!(kind, gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm | gpu_select::GpuBackendKind::Auto) {
+                let device = bitty_candle_runtime::auto_device();
+                if let Ok(m) = bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                    eprintln!("  {}  {}", ui::dim("running on"), ui::dim(&kind.name()));
+                    candle_model = Some(m);
+                    gpu_backend_kind = Some(kind);
                 }
-                gpu_select::GpuBackendKind::Vulkan | gpu_select::GpuBackendKind::Dx12 | gpu_select::GpuBackendKind::MetalWgpu => {
-                    #[cfg(feature = "gpu-wgpu")]
-                    {
-                        match bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto) {
-                            Ok(dev) => {
-                                eprintln!("  {}  {}", ui::dim("wgpu device:"), ui::dim(&dev.adapter_info));
-                                gpu_backend_kind = Some(kind);
-                            }
-                            Err(e) => {
-                                eprintln!("  {} ({})", ui::dim("wgpu unavailable, falling back to CPU"), e);
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "gpu-wgpu"))]
-                    {
-                        eprintln!("  {} (compile with --features gpu-wgpu)", ui::dim("wgpu not compiled in"));
-                    }
-                }
-                gpu_select::GpuBackendKind::Auto => {
-                    // Try each backend
-                    if cfg!(feature = "gpu-metal") && cfg!(target_os = "macos") {
-                        let device = bitty_candle_runtime::auto_device();
-                        match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
-                            Ok(m) => {
-                                candle_model = Some(m);
-                                gpu_backend_kind = Some(gpu_select::GpuBackendKind::Metal);
-                            }
-                            Err(e) => eprintln!("  {} ({})", ui::dim("Metal GPU load failed"), e),
-                        }
-                    }
-                    if cfg!(feature = "gpu-cuda") && gpu_select::has_cuda_device() {
-                        let device = bitty_candle_runtime::auto_device();
-                        match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
-                            Ok(m) => {
-                                candle_model = Some(m);
-                                gpu_backend_kind = Some(gpu_select::GpuBackendKind::Cuda);
-                            }
-                            Err(e) => eprintln!("  {} ({})", ui::dim("CUDA GPU load failed"), e),
-                        }
-                    }
-                    #[cfg(feature = "gpu-wgpu")]
-                    {
-                        if candle_model.is_none() {
-                            match bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto) {
-                                Ok(_dev) => {
-                                    // TODO: full WgpuModel load, not just device probe
-                                    gpu_backend_kind = Some(gpu_select::GpuBackendKind::Vulkan);
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                }
-                gpu_select::GpuBackendKind::Cpu => {}
             }
+            // Try wgpu backends (Vulkan / DX12 / wgpu-Metal)
+            if candle_model.is_none() && matches!(kind, gpu_select::GpuBackendKind::Vulkan | gpu_select::GpuBackendKind::Dx12 | gpu_select::GpuBackendKind::MetalWgpu | gpu_select::GpuBackendKind::Auto) {
+                #[cfg(feature = "gpu-wgpu")]
+                if let Ok(dev) = bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto) {
+                    eprintln!("  {}  {}", ui::dim("running on"), ui::dim(&dev.adapter_info));
+                    gpu_backend_kind = Some(kind);
+                }
+            }
+            // If nothing worked, fall through to CPU silently
         }
 
         if gpu_backend_kind.is_none() {
+            if !config.force_cpu && !config.local {
+                eprintln!("  {}", ui::dim("running on CPU"));
+            }
             if is_bitnet {
                 match BitNetRuntime::load(&path, hf_source).await {
                     Ok(rt) => bitnet_runtime = Some(rt),
@@ -898,7 +851,7 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         &prompt,
         config.max_tokens,
         &config.temperature,
-        config.gpu,
+        !config.force_cpu,
         config.gpu_backend.as_deref(),
     )
     .await
@@ -954,56 +907,46 @@ async fn run_local_model(
     let gpu_tried = if use_gpu && !is_bitnet {
         let requested = gpu_backend.map(gpu_select::GpuBackendKind::from_cli_flag);
         let kind = gpu_select::select_backend(requested);
-        eprintln!("  {}  {}", ui::dim("GPU backend:"), ui::dim(kind.name()));
-        match kind {
-            gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm => {
-                let device = bitty_candle_runtime::auto_device();
-                match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
-                    Ok(mut candle) => {
-                        // Simple one-shot generation via candle
-                        let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
-                            .expect("tokenizer");
-                        let mut generated = Vec::new();
-                        let mut emitted = String::new();
-                        let prompt_ids = tok.encode(prompt, true).unwrap_or_default();
-                        let mut current = prompt_ids;
-                        let eos = tok.eos_token_id();
-                        let eot = tok.eot_token_id();
-                        let im_end = tok.im_end_token_id();
-                        for _step in 0..max_tokens as usize {
-                            let logits = candle.forward(&current)
-                                .map_err(|e| format!("candle forward error: {e}"))?;
-                            let next = bitty_candle_runtime::sample_token(
-                                &mut logits.clone(), temp, 40, 1.0, 1.1, &generated,
-                            );
-                            if next == eos || Some(next) == eot || Some(next) == im_end {
-                                break;
+
+        let mut worked = false;
+        if matches!(kind, gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm | gpu_select::GpuBackendKind::Auto) {
+            let device = bitty_candle_runtime::auto_device();
+            if let Ok(mut candle) = bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                eprintln!("  {}  {}", ui::dim("running on"), ui::dim(kind.name()));
+                let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
+                    .expect("tokenizer");
+                let mut generated = Vec::new();
+                let mut emitted = String::new();
+                let prompt_ids = tok.encode(prompt, true).unwrap_or_default();
+                let mut current = prompt_ids;
+                let eos = tok.eos_token_id();
+                let eot = tok.eot_token_id();
+                let im_end = tok.im_end_token_id();
+                for _step in 0..max_tokens as usize {
+                    let logits = candle.forward(&current)
+                        .map_err(|e| format!("candle forward error: {e}"))?;
+                    let next = bitty_candle_runtime::sample_token(
+                        &mut logits.clone(), temp, 40, 1.0, 1.1, &generated,
+                    );
+                    if next == eos || Some(next) == eot || Some(next) == im_end {
+                        break;
+                    }
+                    generated.push(next);
+                    if let Ok(full) = tok.decode(&generated) {
+                        if full.len() > emitted.len() && full.starts_with(&emitted) {
+                            let tail = &full[emitted.len()..];
+                            if !tail.ends_with('\u{FFFD}') {
+                                streamer.emit(tail);
                             }
-                            generated.push(next);
-                            if let Ok(full) = tok.decode(&generated) {
-                                if full.len() > emitted.len() && full.starts_with(&emitted) {
-                                    let tail = &full[emitted.len()..];
-                                    if !tail.ends_with('\u{FFFD}') {
-                                        streamer.emit(tail);
-                                    }
-                                    emitted = full;
-                                }
-                            }
-                            current = vec![next];
+                            emitted = full;
                         }
-                        true
                     }
-                    Err(e) => {
-                        eprintln!("  {} ({})", ui::dim("GPU load failed, falling back to CPU"), e);
-                        false
-                    }
+                    current = vec![next];
                 }
-            }
-            _ => {
-                eprintln!("  {} (backend not yet wired for one-shot)", ui::dim("GPU"));
-                false
+                worked = true;
             }
         }
+        worked
     } else {
         false
     };
@@ -2182,6 +2125,7 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
         local: false,
         gpu: false,
         gpu_backend: None,
+        force_cpu: false,
         seed: None,
         debug_tokens: false,
     })
@@ -2482,6 +2426,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         local: false,
         gpu: false,
         gpu_backend: None,
+        force_cpu: false,
         seed: None,
         debug_tokens: false,
     };
@@ -2496,6 +2441,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             "--no-auto-pull" => config.auto_pull = false,
             "--local" => config.local = true,
+            "--cpu" => config.force_cpu = true,
             "--gpu" => config.gpu = true,
             "--vulkan" => {
                 config.gpu = true;

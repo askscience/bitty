@@ -1,4 +1,3 @@
-use crate::ui;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,14 +135,8 @@ fn try_wgpu_gpu(
 ) -> Result<String, String> {
     #[cfg(feature = "gpu-wgpu")]
     {
-        let wgpu_backend = bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto)
+        let _wgpu_backend = bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto)
             .map_err(|e| format!("wgpu device: {e}"))?;
-        eprintln!(
-            "  {}  {}",
-            ui::dim("wgpu device:"),
-            ui::dim(&wgpu_backend.adapter_info)
-        );
-        // TODO: wire WgpuModel::load + generate loop
         Err("wgpu GPU path: device created, but generate loop not yet wired".to_string())
     }
     #[cfg(not(feature = "gpu-wgpu"))]
