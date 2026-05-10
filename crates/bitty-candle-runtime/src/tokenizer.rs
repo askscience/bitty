@@ -92,6 +92,7 @@ impl Tokenizer {
                     .token_to_id("<s>")
                     .or_else(|| tokenizer.token_to_id("<|begin_of_text|>"))
                     .or_else(|| tokenizer.token_to_id("<bos>"))
+                    .or_else(|| tokenizer.token_to_id("<｜begin▁of▁sentence｜>"))
             })
             .unwrap_or(1);
 
@@ -103,6 +104,7 @@ impl Tokenizer {
                     .or_else(|| tokenizer.token_to_id("<|end_of_text|>"))
                     .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
                     .or_else(|| tokenizer.token_to_id("<eos>"))
+                    .or_else(|| tokenizer.token_to_id("<｜end▁of▁sentence｜>"))
             })
             .unwrap_or(2);
 
@@ -120,7 +122,7 @@ impl Tokenizer {
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(text, true)
+            .encode(text, false)
             .map_err(|e| TokenizerError::Tokenizer(format!("Encode failed: {e}")))?;
 
         let mut ids: Vec<u32> = Vec::new();
