@@ -201,6 +201,8 @@ struct RunConfig {
     data_dir: Option<String>,
     auto_pull: bool,
     local: bool,
+    gpu: bool,
+    gpu_backend: Option<String>,
     seed: Option<u64>,
     debug_tokens: bool,
 }
@@ -2001,6 +2003,8 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
         data_dir: config.data_dir,
         auto_pull: true,
         local: false,
+        gpu: false,
+        gpu_backend: None,
         seed: None,
         debug_tokens: false,
     })
@@ -2299,6 +2303,8 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         data_dir: None,
         auto_pull: true,
         local: false,
+        gpu: false,
+        gpu_backend: None,
         seed: None,
         debug_tokens: false,
     };
@@ -2313,6 +2319,31 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             "--no-auto-pull" => config.auto_pull = false,
             "--local" => config.local = true,
+            "--gpu" => config.gpu = true,
+            "--vulkan" => {
+                config.gpu = true;
+                config.gpu_backend = Some("vulkan".into());
+            }
+            "--metal-gpu" => {
+                config.gpu = true;
+                config.gpu_backend = Some("metal".into());
+            }
+            "--dx12" => {
+                config.gpu = true;
+                config.gpu_backend = Some("dx12".into());
+            }
+            "--cuda" => {
+                config.gpu = true;
+                config.gpu_backend = Some("cuda".into());
+            }
+            "--rocm" => {
+                config.gpu = true;
+                config.gpu_backend = Some("rocm".into());
+            }
+            "--backend" => {
+                config.gpu = true;
+                config.gpu_backend = Some(required_next(args, "--backend")?);
+            }
             "--debug-tokens" => config.debug_tokens = true,
             "--no-daemon" => {}
             "--join" => config.node = Some(required_next(args, "--join")?),
