@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-git@github.com:askscience/bitty.git}"
-BRANCH="${BRANCH:-testing}"
+BRANCH="${BRANCH:-gpu-vulkan}"
 INSTALL_DIR="${INSTALL_DIR:-"$HOME/bitty"}"
 BIN_DIR="${BIN_DIR:-"$HOME/.local/bin"}"
 ROLE="${ROLE:-node}"
@@ -282,11 +282,27 @@ fi
 
 cd "$INSTALL_DIR"
 
+# Auto-detect GPU features for the host hardware
+detect_gpu_features() {
+  case "$(uname -s)" in
+    Darwin) echo "--features gpu-metal" ;;
+    Linux)
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "--features gpu-cuda"
+      else
+        echo ""
+      fi
+      ;;
+    *) echo "" ;;
+  esac
+}
+GPU_FEATURES="${GPU_FEATURES:-$(detect_gpu_features)}"
+
 if [ "$BUILD_PROFILE" = "release" ]; then
-  cargo build --release --workspace --bins
+  cargo build --release --workspace --bins $GPU_FEATURES
   TARGET_DIR="$INSTALL_DIR/target/release"
 else
-  cargo build --workspace --bins
+  cargo build --workspace --bins $GPU_FEATURES
   TARGET_DIR="$INSTALL_DIR/target/debug"
 fi
 
