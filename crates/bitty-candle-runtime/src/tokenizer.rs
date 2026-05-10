@@ -21,7 +21,6 @@ pub struct Tokenizer {
     eot_id: Option<u32>,
     im_end_id: Option<u32>,
     token_strings: Vec<String>,
-    raw_decode: bool,
 }
 
 impl Tokenizer {
@@ -55,12 +54,12 @@ impl Tokenizer {
         let token_strings: Vec<String> = (0..vocab_size)
             .map(|i| {
                 tokenizer
-                    .decode(&[i as u32], true)
-                    .unwrap_or_else(|_| char::REPLACEMENT_CHARACTER.to_string())
+                    .id_to_token(i as u32)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| char::REPLACEMENT_CHARACTER.to_string())
             })
             .collect();
 
-        let raw_decode = tokenizer.token_to_id("<|im_start|>").is_some();
         let bos_id = tokenizer.token_to_id("<s>")
             .or_else(|| tokenizer.token_to_id("<|begin_of_text|>"))
             .unwrap_or(1);
@@ -76,7 +75,6 @@ impl Tokenizer {
             bos_id,
             eos_id,
             token_strings,
-            raw_decode,
         })
     }
 
@@ -103,33 +101,21 @@ impl Tokenizer {
             })
             .collect();
 
-        if self.raw_decode {
-            let mut text = String::new();
-            for &id in &filtered {
-                if let Some(s) = self.token_strings.get(id as usize) {
-                    text.push_str(s);
-                }
-            }
-            Ok(text)
-        } else {
-            self.inner
-                .decode(&filtered, true)
-                .map_err(|e| TokenizerError::Tokenizer(format!("Decode failed: {e}")))
-        }
+        self.inner
+            .decode(&filtered, true)
+            .map_err(|e| TokenizerError::Tokenizer(format!("Decode failed: {e}")))
     }
 
     pub fn decode_one(&self, id: u32) -> Result<String> {
-        if self.raw_decode {
-            Ok(self
-                .token_strings
-                .get(id as usize)
-                .cloned()
-                .unwrap_or_else(|| char::REPLACEMENT_CHARACTER.to_string()))
-        } else {
-            self.inner
-                .decode(&[id], true)
-                .map_err(|e| TokenizerError::Tokenizer(format!("Decode failed: {e}")))
+        if is_pad_token(id, &self.token_strings)
+            || id == self.bos_id
+            || id == self.eos_id
+        {
+            return Ok(String::new());
         }
+        self.inner
+            .decode(&[id], true)
+            .map_err(|e| TokenizerError::Tokenizer(format!("Decode failed: {e}")))
     }
 
     pub fn eos_token_id(&self) -> u32 {
@@ -146,10 +132,6 @@ impl Tokenizer {
 
     pub fn im_end_token_id(&self) -> Option<u32> {
         self.im_end_id
-    }
-
-    pub fn is_raw_decode(&self) -> bool {
-        self.raw_decode
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
