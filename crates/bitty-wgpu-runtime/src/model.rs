@@ -81,17 +81,14 @@ struct GpuPipelines {
     matmul_q4k: wgpu::ComputePipeline,
     matmul_q6k: wgpu::ComputePipeline,
     matmul_q8_0: wgpu::ComputePipeline,
+    matmul_f16: wgpu::ComputePipeline,
+    rope: wgpu::ComputePipeline,
+    add_bias: wgpu::ComputePipeline,
+    softcap: wgpu::ComputePipeline,
 }
 
 impl GpuPipelines {
     fn create(device: &wgpu::Device) -> Self {
-        let rmsnorm_src = include_str!("shaders/rmsnorm.wgsl");
-        let embedding_src = include_str!("shaders/embedding.wgsl");
-        let matmul_f32_src = include_str!("shaders/matmul_f32.wgsl");
-        let matmul_q4k_src = include_str!("shaders/matmul_q4k.wgsl");
-        let matmul_q6k_src = include_str!("shaders/matmul_q6k.wgsl");
-        let matmul_q8_0_src = include_str!("shaders/matmul_q8_0.wgsl");
-
         let make = |label: &str, src: &str| -> wgpu::ComputePipeline {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
@@ -108,12 +105,16 @@ impl GpuPipelines {
         };
 
         Self {
-            rmsnorm: make("rmsnorm", rmsnorm_src),
-            embedding: make("embedding", embedding_src),
-            matmul_f32: make("matmul_f32", matmul_f32_src),
-            matmul_q4k: make("matmul_q4k", matmul_q4k_src),
-            matmul_q6k: make("matmul_q6k", matmul_q6k_src),
-            matmul_q8_0: make("matmul_q8_0", matmul_q8_0_src),
+            rmsnorm:    make("rmsnorm",    include_str!("shaders/rmsnorm.wgsl")),
+            embedding:  make("embedding",  include_str!("shaders/embedding.wgsl")),
+            matmul_f32: make("matmul_f32", include_str!("shaders/matmul_f32.wgsl")),
+            matmul_q4k: make("matmul_q4k", include_str!("shaders/matmul_q4k.wgsl")),
+            matmul_q6k: make("matmul_q6k", include_str!("shaders/matmul_q6k.wgsl")),
+            matmul_q8_0:make("matmul_q8_0",include_str!("shaders/matmul_q8_0.wgsl")),
+            matmul_f16: make("matmul_f16", include_str!("shaders/matmul_f16.wgsl")),
+            rope:       make("rope",       include_str!("shaders/rope.wgsl")),
+            add_bias:   make("add_bias",   include_str!("shaders/add_bias.wgsl")),
+            softcap:    make("softcap",    include_str!("shaders/softcap.wgsl")),
         }
     }
 }
@@ -215,8 +216,18 @@ impl WgpuModel {
         let mut q = if let Some(ref qn) = layer.q_norm { apply_norm_on_cpu(&q, qn, eps) } else { q };
         let mut k = if let Some(ref kn) = layer.k_norm { apply_norm_on_cpu(&k, kn, eps) } else { k };
 
-        // 3. RoPE + KV cache + attention (CPU)
-        apply_rope(&mut q, &mut k, pos, hd, nh, nk, meta.rope_theta, meta.rope_style);
+        // 3. RoPE on GPU (Q and K concatenated, dispatched once)
+        let mut qk = q.clone();
+        qk.extend_from_slice(&k);
+        let num_heads = nh as u32;
+        let num_kv_heads = nk as u32;
+        let rope_style = match meta.rope_style { RopeStyle::Neox => 0u32, RopeStyle::Interleaved => 1u32 };
+        gpu_rope_inplace(&self.device, &self.pipelines.rope, &mut qk, hd, num_heads, num_kv_heads, pos, meta.rope_theta, rope_style)?;
+        let q_len = num_heads as usize * hd;
+        q = qk[..q_len].to_vec();
+        k = qk[q_len..].to_vec();
+
+        // 4. KV cache + attention (CPU)
         let kv_pos = pos * nk * hd;
         if kv_pos + k.len() > k_cache.len() { k_cache.resize(kv_pos + k.len(), 0.0); }
         if kv_pos + v.len() > v_cache.len() { v_cache.resize(kv_pos + v.len(), 0.0); }
@@ -342,6 +353,7 @@ fn gpu_matmul(
 
     let pipeline = match weight.ggml_type {
         0 => &pipelines.matmul_f32,
+        1 => &pipelines.matmul_f16,  // F16
         10 => &pipelines.matmul_q4k,  // Q4_K
         15 => &pipelines.matmul_q6k,  // Q6_K
         16 => &pipelines.matmul_q8_0, // Q8_0
@@ -450,6 +462,79 @@ fn upload_f32(device: &wgpu::Device, data: &[f32], label: &str) -> wgpu::Buffer 
     })
 }
 
+fn gpu_rope_inplace(
+    gpu: &WgpuDevice, pipeline: &wgpu::ComputePipeline,
+    qk: &mut Vec<f32>, head_dim: usize, num_q_heads: u32, num_kv_heads: u32,
+    pos: usize, theta: f32, style: u32,
+) -> Result<(), String> {
+    let rp = head_dim / 2;
+    // Precompute cos/sin for this position
+    let mut cos_sin = vec![0f32; rp * 2];
+    for i in 0..rp {
+        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        cos_sin[i * 2] = (pos as f32 * freq).cos();
+        cos_sin[i * 2 + 1] = (pos as f32 * freq).sin();
+    }
+
+    let qk_len = qk.len();
+    let qk_buf = upload_f32(&gpu.device, qk, "rope_qk");
+    let cs_buf = upload_f32(&gpu.device, &cos_sin, "rope_cos_sin");
+    let config_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rope_cfg"),
+        contents: bytemuck::cast_slice(&[head_dim as u32, num_q_heads, num_kv_heads, style]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rope_out"),
+        size: (qk_len * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: qk_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cs_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: config_buf.as_entire_binding() },
+        ],
+    });
+
+    // Copy input → output in a single dispatch
+    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encoder.copy_buffer_to_buffer(&qk_buf, 0, &out_buf, 0, (qk_len * 4) as u64);
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipeline);
+        // need to bind output buffer instead — let me rework this
+    }
+
+    // Since the shader reads from binding 0 and writes back, I need a different approach.
+    // For now: upload, dispatch in-place (binding 0 is read_write), then read back.
+    // The shader writes directly to binding 0.
+    let bind_group2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: qk_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cs_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: config_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group2, &[]);
+        let pairs = (num_q_heads + num_kv_heads) as usize * rp;
+        pass.dispatch_workgroups(pairs.div_ceil(64).max(1) as u32, 1, 1);
+    }
+    gpu.queue.submit(std::iter::once(enc.finish()));
+
+    let result = readback_f32(gpu, &qk_buf, qk_len)?;
+    qk.copy_from_slice(&result[..qk_len]);
+    Ok(())
+}
+
 fn upload_u32(device: &wgpu::Device, data: &[u32], label: &str) -> wgpu::Buffer {
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
@@ -472,66 +557,6 @@ fn apply_norm_on_cpu(x: &[f32], _weight_buf: &wgpu::Buffer, _eps: f32) -> Vec<f3
     // Weight is on GPU. For now, just pass through (norm weights are small).
     // Proper implementation would read weight from buffer.
     x.to_vec()
-}
-
-fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, hd: usize, nh: usize, nk: usize, theta: f32, style: RopeStyle) {
-    let rp = hd / 2;
-    match style {
-        RopeStyle::Neox => {
-            for h in 0..nh {
-                let q_off = h * hd;
-                for i in 0..rp {
-                    let freq = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let cos = (pos as f32 * freq).cos();
-                    let sin = (pos as f32 * freq).sin();
-                    let q0 = q[q_off + i];
-                    let q1 = q[q_off + i + rp];
-                    q[q_off + i] = q0 * cos - q1 * sin;
-                    q[q_off + i + rp] = q0 * sin + q1 * cos;
-                }
-            }
-            let kv_h = nk.min(k.len() / hd);
-            for h in 0..kv_h {
-                let k_off = h * hd;
-                for i in 0..rp {
-                    let freq = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let cos = (pos as f32 * freq).cos();
-                    let sin = (pos as f32 * freq).sin();
-                    let k0 = k[k_off + i];
-                    let k1 = k[k_off + i + rp];
-                    k[k_off + i] = k0 * cos - k1 * sin;
-                    k[k_off + i + rp] = k0 * sin + k1 * cos;
-                }
-            }
-        }
-        RopeStyle::Interleaved => {
-            for h in 0..nh {
-                let q_off = h * hd;
-                for i in 0..rp {
-                    let freq = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let cos = (pos as f32 * freq).cos();
-                    let sin = (pos as f32 * freq).sin();
-                    let q0 = q[q_off + 2 * i];
-                    let q1 = q[q_off + 2 * i + 1];
-                    q[q_off + 2 * i] = q0 * cos - q1 * sin;
-                    q[q_off + 2 * i + 1] = q0 * sin + q1 * cos;
-                }
-            }
-            let kv_h = nk.min(k.len() / hd);
-            for h in 0..kv_h {
-                let k_off = h * hd;
-                for i in 0..rp {
-                    let freq = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let cos = (pos as f32 * freq).cos();
-                    let sin = (pos as f32 * freq).sin();
-                    let k0 = k[k_off + 2 * i];
-                    let k1 = k[k_off + 2 * i + 1];
-                    k[k_off + 2 * i] = k0 * cos - k1 * sin;
-                    k[k_off + 2 * i + 1] = k0 * sin + k1 * cos;
-                }
-            }
-        }
-    }
 }
 
 fn compute_attention_on_cpu(
