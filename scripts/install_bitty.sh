@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-git@github.com:askscience/bitty.git}"
+REPO_URL="${REPO_URL:-https://github.com/askscience/bitty.git}"
 BRANCH="${BRANCH:-gpu-vulkan}"
 INSTALL_DIR="${INSTALL_DIR:-"$HOME/bitty"}"
 BIN_DIR="${BIN_DIR:-"$HOME/.local/bin"}"
