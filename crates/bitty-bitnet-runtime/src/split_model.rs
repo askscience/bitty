@@ -67,7 +67,6 @@ impl SplitBitNetModel {
             }
             let out = layers[layer_id].forward(&hidden, n, &mut caches[layer_id])
                 .expect("layer forward failed");
-            caches[layer_id].seq_len += n;
             hidden = out;
         }
         GpuActivation { buffer: hidden, tokens: activation.tokens }

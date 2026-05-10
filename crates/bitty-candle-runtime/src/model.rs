@@ -222,7 +222,6 @@ impl CandleModel {
 
         for i in 0..self.layers.len() {
             let out = self.layers[i].forward(&hidden, n, &mut self.kv_caches[i])?;
-            self.kv_caches[i].seq_len += n;
             hidden = out;
         }
 

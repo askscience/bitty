@@ -59,6 +59,8 @@ fn precompute_freqs_cis(
 
     let cos = freqs.cos()?;
     let sin = freqs.sin()?;
+    let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?;
+    let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?;
     Ok((cos, sin))
 }
 
@@ -181,24 +183,18 @@ impl Attention {
         let sin_k = sin.narrow(0, k_seq_start, n_tokens)?;
         let k = apply_rotary_emb(&k, &cos_k, &sin_k)?;
 
-        let k_for_full = if let Some(ref ck) = cache.cache_k {
-            Tensor::cat(&[ck, &k], 2)?
-        } else {
-            k.clone()
-        };
-        let v_for_full = if let Some(ref cv) = cache.cache_v {
-            Tensor::cat(&[cv, &v], 2)?
-        } else {
-            v.clone()
-        };
+        cache.append(&k, &v)?;
+
+        let k_full = cache.cache_k.as_ref().unwrap();
+        let v_full = cache.cache_v.as_ref().unwrap();
 
         // GQA: repeat K/V to match number of query heads
         let (k_expanded, v_expanded) = if self.gqa_group_size > 1 {
-            let k = k_for_full.repeat((1, self.gqa_group_size, 1, 1))?;
-            let v = v_for_full.repeat((1, self.gqa_group_size, 1, 1))?;
+            let k = k_full.repeat((1, self.gqa_group_size, 1, 1))?;
+            let v = v_full.repeat((1, self.gqa_group_size, 1, 1))?;
             (k, v)
         } else {
-            (k_for_full, v_for_full)
+            (k_full.clone(), v_full.clone())
         };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -211,16 +207,46 @@ impl Attention {
 
         let output = attn_output.matmul(&self.o_proj_w.t()?)?;
 
-        cache.cache_k = Some(k_expanded);
-        cache.cache_v = Some(v_expanded);
-        cache.seq_len = total_seq_len;
-
         Ok(output)
     }
 
     fn reshape_head(x: Tensor) -> Result<Tensor> {
         let (n_tokens, n_heads, head_dim) = x.dims3()?;
         x.reshape((1, n_heads, n_tokens, head_dim))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kv_cache_seq_len_increment() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+
+        let mut attention = Attention::new(
+            Tensor::zeros((16, 16), candle_core::DType::F32, &device)?,
+            Tensor::zeros((8, 16), candle_core::DType::F32, &device)?,
+            Tensor::zeros((8, 16), candle_core::DType::F32, &device)?,
+            Tensor::zeros((16, 16), candle_core::DType::F32, &device)?,
+            None, None, None,
+            2, 1, 8, false, 10000.0, 128,
+        );
+
+        let mut cache = crate::kv_cache::KvCache::new(128);
+        let input = Tensor::zeros((1, 1, 16), candle_core::DType::F32, &device)?;
+
+        // First token
+        attention.forward(&input, 1, &mut cache)?;
+        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.cache_k.as_ref().unwrap().dim(2)?, 1);
+
+        // Second token
+        attention.forward(&input, 1, &mut cache)?;
+        assert_eq!(cache.seq_len, 2);
+        assert_eq!(cache.cache_k.as_ref().unwrap().dim(2)?, 2);
+
+        Ok(())
     }
 }
 

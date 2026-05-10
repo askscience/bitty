@@ -375,6 +375,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "half",
+ "memmap2",
  "rand 0.9.4",
  "serde",
  "thiserror 1.0.69",

@@ -43,6 +43,8 @@ pub struct BitNetKvCache;
 pub struct SamplingOptions {
     pub temperature: f32,
     pub top_p: f32,
+    pub top_k: usize,
+    pub repeat_penalty: f32,
 }
 
 impl Default for SamplingOptions {
@@ -50,6 +52,8 @@ impl Default for SamplingOptions {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 40,
+            repeat_penalty: 1.1,
         }
     }
 }
@@ -181,49 +185,25 @@ impl BitNetRuntime {
         ))
     }
 
-    pub fn sample(&self, logits: &BitNetLogits, options: SamplingOptions) -> Result<u32> {
+    pub fn sample(
+        &self,
+        logits: &BitNetLogits,
+        options: SamplingOptions,
+        recent_tokens: &[u32],
+    ) -> Result<u32> {
         if !logits.verify_checksum() {
             return Err(BitNetRuntimeError::ChecksumFailed);
         }
-        if options.temperature <= 0.0 {
-            return logits
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index as u32)
-                .ok_or(BitNetRuntimeError::EmptyLogits);
-        }
 
-        let mut scaled: Vec<f32> = logits
-            .logits
-            .iter()
-            .map(|l| l / options.temperature)
-            .collect();
-        let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for val in scaled.iter_mut() {
-            *val = (*val - max_logit).exp();
-            sum += *val;
-        }
-        if sum <= 0.0 {
-            return logits
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index as u32)
-                .ok_or(BitNetRuntimeError::EmptyLogits);
-        }
-        for val in scaled.iter_mut() {
-            *val /= sum;
-        }
-
-        let dist = rand::distr::weighted::WeightedIndex::new(scaled)
-            .map_err(|_| BitNetRuntimeError::EmptyLogits)?;
-        let mut rng = rand::rng();
-        use rand::Rng;
-        Ok(rng.sample(&dist) as u32)
+        let mut logits_vec = logits.logits.clone();
+        Ok(bitty_candle_runtime::sample_token(
+            &mut logits_vec,
+            options.temperature,
+            options.top_k,
+            options.top_p,
+            options.repeat_penalty,
+            recent_tokens,
+        ))
     }
 
     pub async fn generate_full(
@@ -241,7 +221,7 @@ impl BitNetRuntime {
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -271,6 +251,10 @@ impl BitNetRuntime {
         let mut emitted: String = String::new();
         let mut cache = BitNetKvCache;
         let mut shard = self.load_shard(0..self.metadata.layer_count)?;
+        let options = SamplingOptions {
+            temperature,
+            ..SamplingOptions::default()
+        };
         for position in 0..max_tokens {
             let activation =
                 BitNetActivation::from_tokens("local", position as u32, &current_input);
@@ -278,13 +262,7 @@ impl BitNetRuntime {
                 .forward_layers(&mut shard, &mut cache, activation)
                 .await?;
             let logits = self.final_logits(activation).await?;
-            let token = self.sample(
-                &logits,
-                SamplingOptions {
-                    temperature,
-                    top_p: 1.0,
-                },
-            )?;
+            let token = self.sample(&logits, options.clone(), &generated_ids)?;
             if self.is_stop_token(token) {
                 break;
             }
@@ -444,10 +422,10 @@ mod tests {
         let split_logits = split.final_logits(split_activation).await.unwrap();
 
         let full_token = full
-            .sample(&full_logits, SamplingOptions::default())
+            .sample(&full_logits, SamplingOptions::default(), &[])
             .unwrap();
         let split_token = split
-            .sample(&split_logits, SamplingOptions::default())
+            .sample(&split_logits, SamplingOptions::default(), &[])
             .unwrap();
         assert_eq!(split_token, full_token);
     }

@@ -30,7 +30,7 @@ pub struct LoadedModel {
 }
 
 pub struct WeightStore {
-    data: Vec<u8>,
+    mmap: memmap2::Mmap,
     pub tensors: Vec<GgufTensorInfo>,
     data_offset: u64,
     pub device: Device,
@@ -40,8 +40,8 @@ impl WeightStore {
     pub fn get_raw(&self, name: &str) -> Option<&[u8]> {
         let info = self.tensors.iter().find(|t| t.name == name)?;
         let start = (self.data_offset + info.offset) as usize;
-        let end = (start + info.byte_len as usize).min(self.data.len());
-        Some(&self.data[start..end])
+        let end = (start + info.byte_len as usize).min(self.mmap.len());
+        Some(&self.mmap[start..end])
     }
 
     pub fn get_info(&self, name: &str) -> Option<&GgufTensorInfo> {
@@ -69,14 +69,15 @@ impl WeightStore {
 
 pub fn load_gguf(source: &str, device: &Device) -> Result<LoadedModel> {
     let path = Path::new(source);
-    let data = std::fs::read(path)?;
-    let gguf = gguf::parse_gguf_bytes(&data)?;
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let gguf = gguf::parse_gguf_bytes(&mmap)?;
 
     let config = extract_config(&gguf)?;
-    let data_offset = compute_data_offset(&data, gguf.alignment);
+    let data_offset = compute_data_offset(&mmap, gguf.alignment);
 
     let weights = WeightStore {
-        data,
+        mmap,
         tensors: gguf.tensors.clone(),
         data_offset,
         device: device.clone(),
