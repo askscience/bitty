@@ -63,10 +63,33 @@ What works today:
 Important limitations:
 
 - Bitty is still a development/test app.
-- The main end-to-end inference runtime currently supports BitNet b1.58 GGUF.
-- Metadata extraction and architecture detection work for all GGUF models; full inference for non-BitNet architectures is in progress.
+- The main end-to-end inference runtime supports BitNet b1.58, Gemma3, TinyLlama, SmolLM2, DeepSeek-R1, Llama 3.x, Qwen 2.5/3, Mistral, Phi 3.5, and other GGUF models via CPU and GPU backends.
+- GPU acceleration is automatic: Metal on macOS, CUDA on NVIDIA Linux, Vulkan/DX12 via wgpu. No flags needed.
 - The distributed runtime is experimental and should be tested before relying on it.
 - The HTTP API is a compatibility layer, not a full Ollama replacement yet.
+
+## GPU Acceleration
+
+Bitty auto-detects your GPU. No configuration needed.
+
+```
+bitty run gemma3:4b "Hello"    # → running on candle-metal
+bitty run tinyllama:1.1b --cpu  # → running on CPU
+```
+
+| Your hardware | Backend used |
+|---|---|
+| macOS (Apple Silicon / AMD) | Metal |
+| Linux + NVIDIA GPU | CUDA |
+| Linux + AMD GPU | Vulkan (wgpu) |
+| Linux + Intel GPU | Vulkan (wgpu) |
+| Windows + NVIDIA | CUDA |
+| Windows + AMD | Vulkan / DX12 |
+| No GPU | CPU (silent fallback) |
+
+Force specific backends: `--cpu`, `--cuda`, `--metal`, `--vulkan`, `--dx12`, `--metal-gpu`.
+
+Full docs: [GPU Acceleration](documentation/05-gpu-acceleration.md) · [All Docs](documentation/README.md)
 
 ## Install
 
