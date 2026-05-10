@@ -282,6 +282,14 @@ fi
 
 cd "$INSTALL_DIR"
 
+# Stop any running bitty processes before building (prevents old daemons
+# from staying alive with buggy code after reinstall)
+echo "Stopping any running bitty processes..."
+pkill -9 bitty 2>/dev/null || true
+pkill -9 bitty-coordinator 2>/dev/null || true
+pkill -9 bitty-worker 2>/dev/null || true
+sleep 1
+
 # Auto-detect GPU features for the host hardware
 detect_gpu_features() {
   case "$(uname -s)" in
