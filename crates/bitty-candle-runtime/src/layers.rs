@@ -1,6 +1,12 @@
 use candle_core::{Device, Result, Tensor, D};
 use candle_nn::ops::rms_norm;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RopeStyle {
+    Neox,
+    Interleaved,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub vocab_size: usize,
@@ -12,9 +18,13 @@ pub struct ModelConfig {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub rope_style: RopeStyle,
     pub tie_word_embeddings: bool,
     pub lm_head_f16: bool,
     pub is_qwen: bool,
+    pub embedding_scale: Option<f32>,
+    pub final_logit_softcap: Option<f32>,
+    pub is_gemma3: bool,
 }
 
 impl ModelConfig {
@@ -27,7 +37,7 @@ impl ModelConfig {
     }
 }
 
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
+fn rotate_half_neox(x: &Tensor) -> Result<Tensor> {
     let last = x.dim(D::Minus1)?;
     let half = last / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
@@ -35,8 +45,31 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
 }
 
-fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    Ok((x.broadcast_mul(cos)? + rotate_half(x)?.broadcast_mul(sin)?)?)
+fn apply_rotary_emb_neox(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    Ok((x.broadcast_mul(cos)? + rotate_half_neox(x)?.broadcast_mul(sin)?)?)
+}
+
+fn apply_rotary_emb_interleaved(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let last_d = x.dim(D::Minus1)?;
+    let half = last_d / 2;
+    let cos_half = cos.narrow(D::Minus1, 0, half)?;
+    let sin_half = sin.narrow(D::Minus1, 0, half)?;
+
+    let (batch, n_heads, n_tokens, _) = x.dims4()?;
+    let xr = x.reshape((batch, n_heads, n_tokens, half, 2))?;
+    let x0 = xr.narrow(4, 0, 1)?.reshape((batch, n_heads, n_tokens, half))?;
+    let x1 = xr.narrow(4, 1, 1)?.reshape((batch, n_heads, n_tokens, half))?;
+
+    let cos_b = cos_half.reshape((1, 1, n_tokens, half))?;
+    let sin_b = sin_half.reshape((1, 1, n_tokens, half))?;
+
+    let r0 = (x0.broadcast_mul(&cos_b)? - x1.broadcast_mul(&sin_b)?)?;
+    let r1 = (x0.broadcast_mul(&sin_b)? + x1.broadcast_mul(&cos_b)?)?;
+
+    let r0u = r0.unsqueeze(4)?;
+    let r1u = r1.unsqueeze(4)?;
+    let ri = Tensor::cat(&[&r0u, &r1u], 4)?;
+    ri.reshape((batch, n_heads, n_tokens, last_d))
 }
 
 fn precompute_freqs_cis(
@@ -78,6 +111,7 @@ pub struct Attention {
     gqa_group_size: usize,
     is_qwen: bool,
     rope_theta: f32,
+    rope_style: RopeStyle,
     rope_cos: Option<Tensor>,
     rope_sin: Option<Tensor>,
     max_seq_len: usize,
@@ -98,6 +132,7 @@ impl Attention {
         head_dim: usize,
         is_qwen: bool,
         rope_theta: f32,
+        rope_style: RopeStyle,
         max_seq_len: usize,
     ) -> Self {
         Self {
@@ -114,6 +149,7 @@ impl Attention {
             gqa_group_size: num_heads / num_kv_heads,
             is_qwen,
             rope_theta,
+            rope_style,
             rope_cos: None,
             rope_sin: None,
             max_seq_len,
@@ -176,12 +212,18 @@ impl Attention {
         let q_seq_start = cache.seq_len;
         let cos_q = cos.narrow(0, q_seq_start, n_tokens)?;
         let sin_q = sin.narrow(0, q_seq_start, n_tokens)?;
-        let q = apply_rotary_emb(&q, &cos_q, &sin_q)?;
+        let q = match self.rope_style {
+            RopeStyle::Neox => apply_rotary_emb_neox(&q, &cos_q, &sin_q)?,
+            RopeStyle::Interleaved => apply_rotary_emb_interleaved(&q, &cos_q, &sin_q)?,
+        };
 
         let k_seq_start = cache.seq_len;
         let cos_k = cos.narrow(0, k_seq_start, n_tokens)?;
         let sin_k = sin.narrow(0, k_seq_start, n_tokens)?;
-        let k = apply_rotary_emb(&k, &cos_k, &sin_k)?;
+        let k = match self.rope_style {
+            RopeStyle::Neox => apply_rotary_emb_neox(&k, &cos_k, &sin_k)?,
+            RopeStyle::Interleaved => apply_rotary_emb_interleaved(&k, &cos_k, &sin_k)?,
+        };
 
         cache.append(&k, &v)?;
 
@@ -230,7 +272,7 @@ mod tests {
             Tensor::zeros((8, 16), candle_core::DType::F32, &device)?,
             Tensor::zeros((16, 16), candle_core::DType::F32, &device)?,
             None, None, None,
-            2, 1, 8, false, 10000.0, 128,
+            2, 1, 8, false, 10000.0, RopeStyle::Neox, 128,
         );
 
         let mut cache = crate::kv_cache::KvCache::new(128);
@@ -281,6 +323,9 @@ impl FFN {
 pub struct TransformerBlock {
     input_ln_w: Tensor,
     post_attn_ln_w: Tensor,
+    post_attention_norm: Option<Tensor>,
+    pre_ffn_norm: Option<Tensor>,
+    post_ffn_norm: Option<Tensor>,
     attention: Attention,
     ffn: FFN,
     rms_norm_eps: f32,
@@ -290,6 +335,9 @@ impl TransformerBlock {
     pub fn new(
         input_ln_w: Tensor,
         post_attn_ln_w: Tensor,
+        post_attention_norm: Option<Tensor>,
+        pre_ffn_norm: Option<Tensor>,
+        post_ffn_norm: Option<Tensor>,
         attention: Attention,
         ffn: FFN,
         rms_norm_eps: f32,
@@ -297,6 +345,9 @@ impl TransformerBlock {
         Self {
             input_ln_w,
             post_attn_ln_w,
+            post_attention_norm,
+            pre_ffn_norm,
+            post_ffn_norm,
             attention,
             ffn,
             rms_norm_eps,
@@ -312,11 +363,26 @@ impl TransformerBlock {
         let residual = x;
         let normed = rms_norm(x, &self.input_ln_w, self.rms_norm_eps)?;
         let attn_out = self.attention.forward(&normed, n_tokens, cache)?;
-        let x = (residual + attn_out)?;
+        let mut x = (residual + attn_out)?;
 
-        let residual = &x;
-        let normed = rms_norm(&x, &self.post_attn_ln_w, self.rms_norm_eps)?;
-        let ffn_out = self.ffn.forward(&normed)?;
-        residual + ffn_out
+        if let Some(ref post_attn_norm) = self.post_attention_norm {
+            x = rms_norm(&x, post_attn_norm, self.rms_norm_eps)?;
+        }
+
+        let ffn_input = if let Some(ref pre_ffn) = self.pre_ffn_norm {
+            rms_norm(&x, pre_ffn, self.rms_norm_eps)?
+        } else {
+            rms_norm(&x, &self.post_attn_ln_w, self.rms_norm_eps)?
+        };
+
+        let ffn_out = self.ffn.forward(&ffn_input)?;
+
+        let ffn_out = if let Some(ref post_ffn) = self.post_ffn_norm {
+            rms_norm(&ffn_out, post_ffn, self.rms_norm_eps)?
+        } else {
+            ffn_out
+        };
+
+        (x + ffn_out)
     }
 }

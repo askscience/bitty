@@ -161,7 +161,8 @@ impl CandleModel {
                 q_bias, k_bias, v_bias,
                 config.num_attention_heads, config.num_key_value_heads,
                 head_dim, config.is_qwen,
-                config.rope_theta, config.max_position_embeddings,
+                config.rope_theta, config.rope_style,
+                config.max_position_embeddings,
             );
 
             let ffn = FFN::new(up_proj, gate_proj, down_proj);
@@ -171,7 +172,45 @@ impl CandleModel {
             let post_attn_ln = require_f32(weights,
                 &format!("{p}.post_attention_layernorm.weight"), &[config.hidden_size])?;
 
-            layers.push(TransformerBlock::new(input_ln, post_attn_ln, attention, ffn, config.rms_norm_eps));
+            let post_attention_norm = if config.is_gemma3 {
+                weights.has(&format!("{p}.post_attention_layernorm.weight"))
+                    .then(|| require_f32(weights,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        &[config.hidden_size]))
+                    .transpose()
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let pre_ffn_norm = if config.is_gemma3 {
+                weights.has(&format!("{p}.pre_feedforward_layernorm.weight"))
+                    .then(|| require_f32(weights,
+                        &format!("{p}.pre_feedforward_layernorm.weight"),
+                        &[config.hidden_size]))
+                    .transpose()
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let post_ffn_norm = if config.is_gemma3 {
+                weights.has(&format!("{p}.post_feedforward_layernorm.weight"))
+                    .then(|| require_f32(weights,
+                        &format!("{p}.post_feedforward_layernorm.weight"),
+                        &[config.hidden_size]))
+                    .transpose()
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            layers.push(TransformerBlock::new(
+                input_ln, post_attn_ln,
+                post_attention_norm, pre_ffn_norm, post_ffn_norm,
+                attention, ffn, config.rms_norm_eps,
+            ));
             kv_caches.push(KvCache::new(config.max_position_embeddings));
         }
 
@@ -219,6 +258,9 @@ impl CandleModel {
         )?;
 
         let mut hidden = self.embed_tokens.embedding(&ids_tensor)?;
+        if let Some(scale) = self.config.embedding_scale {
+            hidden = (hidden * scale as f64)?;
+        }
 
         for i in 0..self.layers.len() {
             let out = self.layers[i].forward(&hidden, n, &mut self.kv_caches[i])?;
@@ -247,7 +289,12 @@ impl CandleModel {
             }
         };
 
-        let logits_f32 = logits.to_vec1::<f32>()?;
+        let mut logits_f32 = logits.to_vec1::<f32>()?;
+        if let Some(softcap) = self.config.final_logit_softcap {
+            for v in logits_f32.iter_mut() {
+                *v = softcap * (*v / softcap).tanh();
+            }
+        }
         Ok(logits_f32)
     }
 
@@ -257,7 +304,12 @@ impl CandleModel {
             token_ids.len(),
             &self.device,
         )?;
-        Ok(self.embed_tokens.embedding(&ids_tensor)?)
+        let emb = self.embed_tokens.embedding(&ids_tensor)?;
+        if let Some(scale) = self.config.embedding_scale {
+            Ok((emb * scale as f64)?)
+        } else {
+            Ok(emb)
+        }
     }
 
     pub fn forward_layers<F>(
@@ -294,7 +346,13 @@ impl CandleModel {
                 last_token.matmul(&w.t()?)?.reshape(self.config.vocab_size)?
             }
         };
-        logits.to_vec1::<f32>().map_err(Into::into)
+        let mut logits_f32 = logits.to_vec1::<f32>()?;
+        if let Some(softcap) = self.config.final_logit_softcap {
+            for v in logits_f32.iter_mut() {
+                *v = softcap * (*v / softcap).tanh();
+            }
+        }
+        Ok(logits_f32)
     }
 
     pub fn layers_and_caches_mut(&mut self) -> (&mut Vec<TransformerBlock>, &mut Vec<KvCache>) {

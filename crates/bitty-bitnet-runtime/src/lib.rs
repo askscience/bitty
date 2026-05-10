@@ -236,6 +236,26 @@ impl BitNetRuntime {
         max_tokens: usize,
         temperature: f32,
         reset_cache: bool,
+        on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let token_ids = self
+            .tokenizer()
+            .encode(prompt, true)
+            .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
+        self.generate_from_ids_raw(&token_ids, max_tokens, temperature, reset_cache, on_delta).await
+    }
+
+    /// Generate accepting pre-tokenized IDs, avoiding the decode→encode round-trip
+    /// that strips special tokens from chat templates.
+    pub async fn generate_from_ids_raw<F>(
+        &mut self,
+        token_ids: &[u32],
+        max_tokens: usize,
+        temperature: f32,
+        reset_cache: bool,
         mut on_delta: F,
     ) -> Result<String>
     where
@@ -244,10 +264,7 @@ impl BitNetRuntime {
         if reset_cache {
             self.reset_kv_cache();
         }
-        let mut current_input = self
-            .tokenizer()
-            .encode(prompt, true)
-            .map_err(|err| BitNetRuntimeError::Backend(err.to_string()))?;
+        let mut current_input = token_ids.to_vec();
         let mut generated_ids: Vec<u32> = Vec::new();
         let mut emitted: String = String::new();
         let mut cache = BitNetKvCache;

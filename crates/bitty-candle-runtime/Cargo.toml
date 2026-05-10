@@ -24,6 +24,10 @@ ureq = "3"
 [features]
 default = []
 cuda = ["candle-core/cuda"]
+# TODO: candle-core 0.10.x does not yet expose a ROCm backend. When it does,
+# change this to `rocm = ["candle-core/rocm"]` and add the Device::new_rocm
+# branch in src/device.rs.
+rocm = []
 metal = ["candle-core/metal"]
 cpu-mkl = ["candle-core/mkl"]
 cpu-accelerate = ["candle-core/accelerate"]

@@ -4,7 +4,7 @@ use bitty_model::gguf::{
 use candle_core::{Device, Tensor};
 use std::path::Path;
 
-use crate::layers::ModelConfig;
+use crate::layers::{ModelConfig, RopeStyle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -140,6 +140,25 @@ fn extract_config(gguf: &GgufFileMetadata) -> Result<ModelConfig> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let is_bitnet = arch_str.contains("bitnet");
+    let is_gemma3 = arch_str.starts_with("gemma3") || arch_str.starts_with("gemma-3");
+
+    let rope_style = match arch_str {
+        "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => {
+            RopeStyle::Interleaved
+        }
+        _ => RopeStyle::Neox,
+    };
+
+    let embedding_scale = if arch_str.starts_with("gemma") {
+        Some((hidden_size as f32).sqrt())
+    } else {
+        None
+    };
+
+    let final_logit_softcap = m
+        .get(&format!("{arch_str}.final_logit_softcapping"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
 
     let tie_word_embeddings = is_bitnet
         || gguf.tensors.iter().all(|t| t.name != "lm_head.weight");
@@ -159,9 +178,13 @@ fn extract_config(gguf: &GgufFileMetadata) -> Result<ModelConfig> {
         max_position_embeddings,
         rms_norm_eps,
         rope_theta,
+        rope_style,
         tie_word_embeddings,
         lm_head_f16,
         is_qwen,
+        embedding_scale,
+        final_logit_softcap,
+        is_gemma3,
     })
 }
 
