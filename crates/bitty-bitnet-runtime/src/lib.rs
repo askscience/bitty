@@ -60,6 +60,7 @@ impl Default for SamplingOptions {
 
 pub type BitNetTokenizer = bitty_candle_runtime::Tokenizer;
 pub use bitty_candle_runtime::tokenizer::ChatMessage;
+pub use bitty_candle_runtime::tokenizer::GgufTokenizerOverrides;
 
 pub fn load_tokenizer(path: &Path, hf_model_id: Option<&str>) -> Result<BitNetTokenizer> {
     bitty_candle_runtime::Tokenizer::from_gguf_path(path, hf_model_id)

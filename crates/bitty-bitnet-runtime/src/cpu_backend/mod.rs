@@ -6,7 +6,7 @@
 //!
 //! Architecture:
 //! - `types.rs`     — Core data structures
-//! - `loader/`      — GGUF parsing, tensor name classification, metadata extraction  
+//! - `loader/`      — GGUF parsing, tensor name classification, metadata extraction
 //! - `layers/`      — Layer implementations (attention, SSM, MLP)
 //! - `matmul/`      — Quantized matrix-vector multiply by GGML type
 //! - `dequant.rs`   — Dequant block readers (Q4K, Q6K, Q8_0)
@@ -20,6 +20,7 @@ pub mod ops;
 pub mod types;
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use types::*;
 
 /// CPU-loaded GGUF model ready for inference.
@@ -44,11 +45,16 @@ impl CpuModel {
             memmap2::Mmap::map(&file)
                 .map_err(|e| format!("Cannot mmap model: {e}"))?
         };
-        let (metadata, weights) = loader::load_gguf(&mmap)?;
-        let tokenizer = bitty_candle_runtime::Tokenizer::from_gguf_path(path, hf_model_id)
-            .map_err(|e| format!("tokenizer error: {e}"))?;
+        let (gguf_metadata, weights) = loader::load_gguf(&mmap)?;
+        let overrides = loader::metadata::extract_tokenizer_overrides(&gguf_metadata);
+        let tokenizer = bitty_candle_runtime::Tokenizer::from_gguf_path_with_overrides(
+            path,
+            hf_model_id,
+            overrides,
+        )
+        .map_err(|e| format!("tokenizer error: {e}"))?;
         let num_layers = weights.layers.len().max(1);
-        let meta = loader::metadata::extract_config(&metadata, num_layers);
+        let meta = loader::metadata::extract_config(&gguf_metadata, num_layers);
 
         let max_kv_dim = meta.num_kv_heads * meta.head_dim;
         let mut kv_cache = KvCache::new();
@@ -83,6 +89,7 @@ impl CpuModel {
         temperature: f32,
         top_k: usize,
         repeat_penalty: f32,
+        seed: Option<u64>,
         on_delta: F,
     ) -> Result<String, String>
     where
@@ -92,31 +99,32 @@ impl CpuModel {
             .tokenizer
             .apply_chat_template(messages)
             .map_err(|e| format!("chat template error: {e}"))?;
-        let prompt = self
-            .tokenizer
-            .decode(&prompt_ids)
-            .map_err(|e| format!("decode error: {e}"))?;
-        self.generate_stream(&prompt, max_tokens, temperature, top_k, repeat_penalty, on_delta)
+        self.generate_from_ids(
+            &prompt_ids,
+            max_tokens,
+            temperature,
+            top_k,
+            repeat_penalty,
+            seed,
+            on_delta,
+        )
     }
 
-    /// Full end-to-end generation on CPU, streaming decoded text deltas to
-    /// `on_delta` as they become available. Returns the complete final text.
-    pub fn generate_stream<F>(
+    /// Generates tokens directly from pre-tokenized IDs — no decode→encode round-trip.
+    pub fn generate_from_ids<F>(
         &self,
-        prompt: &str,
+        prompt_ids: &[u32],
         max_tokens: usize,
         temperature: f32,
         top_k: usize,
         repeat_penalty: f32,
+        seed: Option<u64>,
         mut on_delta: F,
     ) -> Result<String, String>
     where
         F: FnMut(&str),
     {
-        let tokens = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| format!("Tokenize error: {e}"))?;
+        let tokens = prompt_ids.to_vec();
         let eos = self.tokenizer.eos_token_id();
         let eot = self.tokenizer.eot_token_id();
         let im_end = self.tokenizer.im_end_token_id();
@@ -127,38 +135,56 @@ impl CpuModel {
         let mut recurrent = init_recurrent_states(&self.layers, m);
 
         let vocab_size = m.vocab_size;
-        let mut hidden = vec![0f32; d];
+
+        // ---- Process prompt tokens
+        let prompt_len = tokens.len();
+        if prompt_len == 0 {
+            return Ok(String::new());
+        }
+        let mut last_hidden = vec![0f32; d];
         for (pos, &tid) in tokens.iter().enumerate() {
             let tid = tid as usize;
-            let mut h = vec![0f32; d];
-            if tid < vocab_size && self.embed_tokens.len() >= d * vocab_size {
-                for i in 0..d {
-                    h[i] = self.embed_tokens[tid * d + i];
-                }
-            }
+            let mut h = embed_token(tid, &self.embed_tokens, d, vocab_size, m.embedding_scale);
             for layer in &self.layers {
                 h = layer.forward(&h, pos, &mut kv_cache, &mut recurrent, m, &self.rope_cache)?;
             }
-            hidden = h;
+            last_hidden = h;
             kv_cache.seq_len += 1;
         }
+
+        // ---- RNG setup: seed from SystemTime + prompt_pos by default, overridable
+        let rng_base = seed.unwrap_or_else(|| {
+            let ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            ns ^ (prompt_len as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        });
+        let mut rng_state = rng_base;
 
         let mut recent: Vec<u32> = tokens.clone();
         let mut generated: Vec<u32> = Vec::new();
         let mut emitted: String = String::new();
 
-        let mut pos = tokens.len();
-        let mut rng_state: u64 = 0xC0FFEE_u64 ^ (pos as u64).wrapping_mul(0x9E3779B97F4A7C15);
-        for _ in 0..max_tokens {
-            for layer in &self.layers {
-                hidden =
-                    layer.forward(&hidden, pos, &mut kv_cache, &mut recurrent, m, &self.rope_cache)?;
-            }
-            kv_cache.seq_len += 1;
-            let normed = ops::rms_norm(&hidden, &self.final_norm, m.rms_norm_eps);
-            let mut logits =
-                compute_logits(&normed, &self.lm_head, &self.embed_tokens, d, m.vocab_size)?;
+        let eps = m.rms_norm_eps;
+        let softcap = m.final_logit_softcapping;
 
+        // ---- Generation loop
+        let mut pos = prompt_len;
+        for _step in 0..max_tokens {
+            // Compute logits from the current hidden state (norm + lm_head)
+            let normed = ops::rms_norm(&last_hidden, &self.final_norm, eps);
+            let mut logits =
+                compute_logits(&normed, &self.lm_head, &self.embed_tokens, d, vocab_size)?;
+
+            // Gemma logit softcapping
+            if let Some(attn_logit_softcapping) = softcap {
+                for v in logits.iter_mut() {
+                    *v = attn_logit_softcapping * (*v / attn_logit_softcapping).tanh();
+                }
+            }
+
+            // Repeat penalty
             if repeat_penalty > 1.0 {
                 let window = recent.len().saturating_sub(64).max(0);
                 for &tok in &recent[window..] {
@@ -179,9 +205,9 @@ impl CpuModel {
             }
 
             generated.push(next_token);
-            // Decode the accumulated sequence so the ByteLevel decoder can
-            // reassemble multi-byte UTF-8 correctly, then emit only the new
-            // suffix.
+            recent.push(next_token);
+
+            // Decode accumulated generated tokens for streaming
             if let Ok(full) = self.tokenizer.decode(&generated) {
                 if full.len() > emitted.len() && full.starts_with(&emitted) {
                     let tail = &full[emitted.len()..];
@@ -192,14 +218,23 @@ impl CpuModel {
                 }
             }
 
-            recent.push(next_token);
-            if (next_token as usize) < vocab_size && self.embed_tokens.len() >= d * vocab_size {
-                for i in 0..d {
-                    hidden[i] = self.embed_tokens[next_token as usize * d + i];
-                }
+            // Embed the sampled token and run layers for the next position
+            last_hidden = embed_token(
+                next_token as usize,
+                &self.embed_tokens,
+                d,
+                vocab_size,
+                m.embedding_scale,
+            );
+            for layer in &self.layers {
+                last_hidden =
+                    layer.forward(&last_hidden, pos, &mut kv_cache, &mut recurrent, m, &self.rope_cache)?;
             }
+            kv_cache.seq_len += 1;
             pos += 1;
         }
+
+        // Flush any remaining decoded text
         if let Ok(full) = self.tokenizer.decode(&generated) {
             if full.len() > emitted.len() && full.starts_with(&emitted) {
                 on_delta(&full[emitted.len()..]);
@@ -207,6 +242,27 @@ impl CpuModel {
             }
         }
         Ok(emitted)
+    }
+
+    /// Full end-to-end generation on CPU, streaming decoded text deltas to
+    /// `on_delta` as they become available. Returns the complete final text.
+    pub fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        repeat_penalty: f32,
+        on_delta: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str),
+    {
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| format!("Tokenize error: {e}"))?;
+        self.generate_from_ids(&tokens, max_tokens, temperature, top_k, repeat_penalty, None, on_delta)
     }
 
     /// Full end-to-end generation on CPU.
@@ -220,6 +276,28 @@ impl CpuModel {
     ) -> Result<String, String> {
         self.generate_stream(prompt, max_tokens, temperature, top_k, repeat_penalty, |_| {})
     }
+}
+
+fn embed_token(
+    tid: usize,
+    embed_tokens: &[f32],
+    d: usize,
+    vocab_size: usize,
+    embedding_scale: Option<f32>,
+) -> Vec<f32> {
+    let mut h = vec![0f32; d];
+    if tid < vocab_size && embed_tokens.len() >= d * vocab_size {
+        let off = tid * d;
+        for i in 0..d {
+            h[i] = embed_tokens[off + i];
+        }
+    }
+    if let Some(scale) = embedding_scale {
+        for v in h.iter_mut() {
+            *v *= scale;
+        }
+    }
+    h
 }
 
 fn init_recurrent_states(layers: &[CpuLayer], meta: &CpuModelMetadata) -> Vec<RecurrentState> {

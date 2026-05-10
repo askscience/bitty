@@ -44,6 +44,15 @@ pub fn softmax(x: &mut [f32]) {
 }
 
 /// Apply RoPE (Rotary Position Embedding) to Q and K in-place using pre-computed cache.
+///
+/// Supports two rotation styles detected from the model architecture:
+/// - `Neox` (i, i+rp) — used by Gemma, Qwen, GPT-NeoX.
+/// - `Interleaved` (2i, 2i+1) — used by Llama-family after llama.cpp GGUF conversion
+///   (the converter permutes weights so that adjacent pairs are the real/imag components).
+///
+/// Under GQA (groups > 1), each KV head is rotated exactly once; Q heads are rotated
+/// individually. This avoids the previous bug where every Q-head iteration also
+/// re-rotated the shared K head, compounding RoPE `groups` times.
 pub fn rope_apply(
     q: &mut [f32],
     k: &mut [f32],
@@ -51,38 +60,76 @@ pub fn rope_apply(
     head_dim: usize,
     num_heads: usize,
     num_kv_heads: usize,
+    style: super::types::RopeStyle,
     rope_cache: &RopeCache,
 ) {
     if head_dim == 0 {
         return;
     }
-    // Partial RoPE: `rope_cache` holds `rope_dim/2` pairs; rotate dims `i` and `i + rp`.
     let rp = rope_cache.rope_pair_count().min(head_dim / 2);
-    let groups = num_heads.max(1) / num_kv_heads.max(1);
-    let max_h = (q.len() / head_dim.max(1)).min(num_heads);
-    let _max_kv_h = (k.len() / head_dim.max(1)).min(num_kv_heads);
 
-    for h in 0..max_h {
-        let q_off = h * head_dim;
-        let k_off = if groups > 0 {
-            (h / groups.max(1)) * head_dim
-        } else {
-            0
-        };
-        if q_off + rp * 2 > q.len() || k_off + rp * 2 > k.len() {
-            continue;
+    use super::types::RopeStyle;
+
+    match style {
+        RopeStyle::Neox => {
+            let q_heads = (q.len() / head_dim.max(1)).min(num_heads);
+            for h in 0..q_heads {
+                let q_off = h * head_dim;
+                if q_off + rp * 2 > q.len() {
+                    continue;
+                }
+                for i in 0..rp {
+                    let (cos, sin) = rope_cache.get(pos, i);
+                    let q0 = q[q_off + i];
+                    let q1 = q[q_off + i + rp];
+                    q[q_off + i] = q0 * cos - q1 * sin;
+                    q[q_off + i + rp] = q0 * sin + q1 * cos;
+                }
+            }
+            // Each KV head rotated once (not groups times)
+            let kv_heads = (k.len() / head_dim.max(1)).min(num_kv_heads);
+            for h in 0..kv_heads {
+                let k_off = h * head_dim;
+                if k_off + rp * 2 > k.len() {
+                    continue;
+                }
+                for i in 0..rp {
+                    let (cos, sin) = rope_cache.get(pos, i);
+                    let k0 = k[k_off + i];
+                    let k1 = k[k_off + i + rp];
+                    k[k_off + i] = k0 * cos - k1 * sin;
+                    k[k_off + i + rp] = k0 * sin + k1 * cos;
+                }
+            }
         }
-        for i in 0..rp {
-            let (cos, sin) = rope_cache.get(pos, i);
-            let q0 = q[q_off + i];
-            let q1 = q[q_off + i + rp];
-            q[q_off + i] = q0 * cos - q1 * sin;
-            q[q_off + i + rp] = q0 * sin + q1 * cos;
-            if k_off + i + rp < k.len() {
-                let k0 = k[k_off + i];
-                let k1 = k[k_off + i + rp];
-                k[k_off + i] = k0 * cos - k1 * sin;
-                k[k_off + i + rp] = k0 * sin + k1 * cos;
+        RopeStyle::Interleaved => {
+            let q_heads = (q.len() / head_dim.max(1)).min(num_heads);
+            for h in 0..q_heads {
+                let q_off = h * head_dim;
+                if q_off + head_dim > q.len() {
+                    continue;
+                }
+                for i in 0..rp {
+                    let (cos, sin) = rope_cache.get(pos, i);
+                    let q0 = q[q_off + 2 * i];
+                    let q1 = q[q_off + 2 * i + 1];
+                    q[q_off + 2 * i] = q0 * cos - q1 * sin;
+                    q[q_off + 2 * i + 1] = q0 * sin + q1 * cos;
+                }
+            }
+            let kv_heads = (k.len() / head_dim.max(1)).min(num_kv_heads);
+            for h in 0..kv_heads {
+                let k_off = h * head_dim;
+                if k_off + head_dim > k.len() {
+                    continue;
+                }
+                for i in 0..rp {
+                    let (cos, sin) = rope_cache.get(pos, i);
+                    let k0 = k[k_off + 2 * i];
+                    let k1 = k[k_off + 2 * i + 1];
+                    k[k_off + 2 * i] = k0 * cos - k1 * sin;
+                    k[k_off + 2 * i + 1] = k0 * sin + k1 * cos;
+                }
             }
         }
     }

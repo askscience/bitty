@@ -61,17 +61,48 @@ impl CpuLayer {
             LayerKind::Ssm(_) | LayerKind::LinearAttn(_) => block_out,
         };
 
-        // ---- First residual: x1 = x + block_proj
+        // ---- First residual: x1 = hidden + block_proj
         let mut x1 = vec![0f32; d];
         for i in 0..d {
             x1[i] = hidden[i] + block_proj[i];
         }
 
-        // ---- Post-attention norm on the residual sum (not on the raw block_proj!)
-        let post_normed = ops::rms_norm(&x1, &self.post_attn_ln, meta.rms_norm_eps);
+        // Gemma3 applies an extra norm (post_attention_norm) on the residual sum
+        // between attention and FFN.
+        let ffn_input = if let Some(ref post_attn) = self.post_attention_norm {
+            if post_attn.len() == d {
+                ops::rms_norm(&x1, post_attn, meta.rms_norm_eps)
+            } else {
+                x1.clone()
+            }
+        } else {
+            x1.clone()
+        };
+
+        // ---- Post-attention / pre-FFN norm
+        let pre_ffn = if let Some(ref pre_f) = self.pre_ffn_norm {
+            if pre_f.len() == d {
+                ops::rms_norm(&ffn_input, pre_f, meta.rms_norm_eps)
+            } else {
+                ops::rms_norm(&ffn_input, &self.post_attn_ln, meta.rms_norm_eps)
+            }
+        } else {
+            ops::rms_norm(&ffn_input, &self.post_attn_ln, meta.rms_norm_eps)
+        };
 
         // ---- FFN
-        let ffn_out = mlp::forward(&post_normed, &self.mlp, d, inter)?;
+        let ffn_raw = mlp::forward(&pre_ffn, &self.mlp, d, inter)?;
+
+        // Gemma3 applies a norm on the FFN output before the second residual.
+        let ffn_out = if let Some(ref post_f) = self.post_ffn_norm {
+            if post_f.len() == d {
+                ops::rms_norm(&ffn_raw, post_f, meta.rms_norm_eps)
+            } else {
+                ffn_raw
+            }
+        } else {
+            ffn_raw
+        };
 
         // ---- Second residual: x2 = x1 + ffn_out
         let mut out = vec![0f32; d];

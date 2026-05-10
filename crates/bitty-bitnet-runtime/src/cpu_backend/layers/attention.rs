@@ -2,7 +2,9 @@
 
 use crate::cpu_backend::matmul;
 use crate::cpu_backend::ops;
-use crate::cpu_backend::types::{AttentionWeights, CpuModelMetadata, KvCache, RopeCache};
+use crate::cpu_backend::types::{
+    AttentionWeights, CpuModelMetadata, KvCache, RopeCache,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -95,7 +97,7 @@ pub fn forward(
     let actual_q_dim = q.len();
     let actual_k_dim = k.len();
 
-    // Apply RoPE — use actual dims
+    // Apply RoPE — use actual dims and detected rope style
     ops::rope_apply(
         &mut q,
         &mut k,
@@ -103,6 +105,7 @@ pub fn forward(
         actual_hd,
         n_heads,
         n_kv,
+        meta.rope_style,
         rope_cache,
     );
 
@@ -156,10 +159,11 @@ pub fn forward(
                 continue;
             }
             let mut dot = 0f32;
-            for d in 0..actual_hd.min(actual_kv_hd) {
+            let dot_dim = actual_hd.min(actual_kv_hd);
+            for d in 0..dot_dim {
                 dot += q[q_start + d] * key_cache[k_start + d];
             }
-            scores[kj] = dot / (actual_hd as f32).sqrt();
+            scores[kj] = dot / (dot_dim as f32).sqrt();
         }
         ops::softmax(&mut scores);
         for d in 0..actual_hd {

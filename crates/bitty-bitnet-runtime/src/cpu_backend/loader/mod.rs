@@ -153,6 +153,18 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufFileMetadata, CpuWeights), String> 
                     layer_builders.entry(l).or_default().post_attn_ln =
                         dequant_to_f32(tensor_data, tensor.ggml_type, num_elements);
                 }
+                TensorRole::PostAttentionNorm(l) => {
+                    layer_builders.entry(l).or_default().post_attention_norm =
+                        Some(dequant_to_f32(tensor_data, tensor.ggml_type, num_elements));
+                }
+                TensorRole::PreFfnNorm(l) => {
+                    layer_builders.entry(l).or_default().pre_ffn_norm =
+                        Some(dequant_to_f32(tensor_data, tensor.ggml_type, num_elements));
+                }
+                TensorRole::PostFfnNorm(l) => {
+                    layer_builders.entry(l).or_default().post_ffn_norm =
+                        Some(dequant_to_f32(tensor_data, tensor.ggml_type, num_elements));
+                }
                 TensorRole::QProj(l) => {
                     layer_builders.entry(l).or_default().q_proj = Some(packed);
                 }
@@ -280,6 +292,11 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufFileMetadata, CpuWeights), String> 
         let b = layer_builders.remove(&i).unwrap();
         let builder = b;
 
+        // Extract Gemma norms before builder is consumed by kind construction
+        let post_attention_norm = builder.post_attention_norm.clone();
+        let pre_ffn_norm = builder.pre_ffn_norm.clone();
+        let post_ffn_norm = builder.post_ffn_norm.clone();
+
         let mlp = MlpBlock {
             up_proj: builder
                 .up_proj
@@ -388,6 +405,9 @@ pub fn load_gguf(data: &[u8]) -> Result<(GgufFileMetadata, CpuWeights), String> 
             kind,
             input_ln,
             post_attn_ln,
+            post_attention_norm,
+            pre_ffn_norm,
+            post_ffn_norm,
             mlp,
             layer_idx: i,
         });
@@ -453,6 +473,9 @@ fn build_linear_attn(b: LayerBuilder) -> Result<LinearAttnWeights, String> {
 struct LayerBuilder {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
+    post_attention_norm: Option<Vec<f32>>,
+    pre_ffn_norm: Option<Vec<f32>>,
+    post_ffn_norm: Option<Vec<f32>>,
     q_proj: Option<PackedTensor>,
     k_proj: Option<PackedTensor>,
     v_proj: Option<PackedTensor>,

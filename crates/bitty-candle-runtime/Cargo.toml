@@ -11,12 +11,15 @@ candle-nn.workspace = true
 bytemuck = "1"
 half = { version = "2", features = ["bytemuck"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
 rand = "0.9"
 memmap2 = "0.9"
+minijinja = "2"
+ureq = "3"
 
 [features]
 default = []

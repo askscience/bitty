@@ -6,8 +6,9 @@
 //! default, but `.max()` is a numeric floor and silently inflated smaller models'
 //! dims so they stopped matching tensor shapes. Fall back with `unwrap_or` only.
 
-use crate::cpu_backend::types::{ActivationFn, CpuModelMetadata};
+use crate::cpu_backend::types::{ActivationFn, CpuModelMetadata, RopeStyle};
 use bitty_model::gguf::GgufFileMetadata;
+use bitty_candle_runtime::tokenizer::GgufTokenizerOverrides;
 
 /// Detect model architecture from GGUF metadata.
 pub fn detect_architecture(meta: &GgufFileMetadata) -> String {
@@ -131,6 +132,20 @@ pub fn extract_config(meta: &GgufFileMetadata, num_layers: usize) -> CpuModelMet
     let ssm_dt_rank = get_u32("ssm.time_step_rank").unwrap_or(0) as usize;
     let ssm_n_group = get_u32("ssm.group_count").unwrap_or(0) as usize;
 
+    let rope_style = RopeStyle::from_architecture(&arch);
+
+    let embedding_scale = if arch.starts_with("gemma") {
+        Some((hidden_size as f32).sqrt())
+    } else {
+        None
+    };
+
+    let final_logit_softcapping = meta
+        .metadata
+        .get(&format!("{arch}.final_logit_softcapping"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+
     CpuModelMetadata {
         architecture: arch,
         hidden_size,
@@ -139,12 +154,15 @@ pub fn extract_config(meta: &GgufFileMetadata, num_layers: usize) -> CpuModelMet
         num_kv_heads,
         head_dim,
         rope_dim,
+        rope_style,
         intermediate_size,
         vocab_size,
         max_seq_len,
         rms_norm_eps: rms_eps,
         rope_theta,
         activation,
+        embedding_scale,
+        final_logit_softcapping,
         is_qwen35,
         full_attention_interval,
         rope_sections,
@@ -153,5 +171,16 @@ pub fn extract_config(meta: &GgufFileMetadata, num_layers: usize) -> CpuModelMet
         ssm_d_state,
         ssm_dt_rank,
         ssm_n_group,
+    }
+}
+
+pub fn extract_tokenizer_overrides(meta: &GgufFileMetadata) -> GgufTokenizerOverrides {
+    let get_u32 = |key: &str| meta.metadata.get(key).and_then(|v| v.as_u32());
+    let get_bool = |key: &str| meta.metadata.get(key).and_then(|v| v.as_bool());
+    GgufTokenizerOverrides {
+        bos_id: get_u32("tokenizer.ggml.bos_token_id"),
+        eos_id: get_u32("tokenizer.ggml.eos_token_id"),
+        pad_id: get_u32("tokenizer.ggml.padding_token_id"),
+        add_bos_token: get_bool("tokenizer.ggml.add_bos_token"),
     }
 }

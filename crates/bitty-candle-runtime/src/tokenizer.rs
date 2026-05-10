@@ -1,6 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use minijinja::{Environment, ErrorKind};
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
@@ -8,10 +16,12 @@ pub enum TokenizerError {
 
 pub type Result<T> = std::result::Result<T, TokenizerError>;
 
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
+#[derive(Clone, Default)]
+pub struct GgufTokenizerOverrides {
+    pub bos_id: Option<u32>,
+    pub eos_id: Option<u32>,
+    pub pad_id: Option<u32>,
+    pub add_bos_token: Option<bool>,
 }
 
 pub struct Tokenizer {
@@ -21,35 +31,50 @@ pub struct Tokenizer {
     eot_id: Option<u32>,
     im_end_id: Option<u32>,
     token_strings: Vec<String>,
+    chat_template: Option<String>,
 }
 
 impl Tokenizer {
-    pub fn from_file(path: &str) -> Result<Self> {
-        let tokenizer = tokenizers::Tokenizer::from_file(path)
-            .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer: {e}")))?;
-        Self::from_hf_tokenizer(tokenizer)
+    pub fn from_gguf_path(model_path: &Path, hf_model_id: Option<&str>) -> Result<Self> {
+        Self::from_gguf_path_with_overrides(model_path, hf_model_id, GgufTokenizerOverrides::default())
     }
 
-    pub fn from_gguf_path(model_path: &Path, hf_model_id: Option<&str>) -> Result<Self> {
-        let parent = model_path.parent().unwrap_or(Path::new("."));
-        let json_path = parent.join("tokenizer.json");
+    pub fn from_gguf_path_with_overrides(
+        model_path: &Path,
+        hf_model_id: Option<&str>,
+        overrides: GgufTokenizerOverrides,
+    ) -> Result<Self> {
+        let dir = model_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+
+        let json_path = dir.join("tokenizer.json");
         if json_path.exists() {
-            return Self::from_file(&json_path.to_string_lossy());
+            let tokenizer = tokenizers::Tokenizer::from_file(&json_path)
+                .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer.json: {e}")))?;
+            let chat_template = load_chat_template(dir, hf_model_id);
+            return Self::from_hf_tokenizer_with_overrides(tokenizer, overrides, chat_template);
         }
+
         if let Some(model_id) = hf_model_id {
             let tokenizer = tokenizers::Tokenizer::from_pretrained(model_id, None)
                 .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer from HF: {e}")))?;
-            // Save locally so subsequent runs skip the network
             let _ = tokenizer.save(&json_path, false);
-            return Self::from_hf_tokenizer(tokenizer);
+            let chat_template = load_chat_template(dir, hf_model_id);
+            return Self::from_hf_tokenizer_with_overrides(tokenizer, overrides, chat_template);
         }
+
         Err(TokenizerError::Tokenizer(format!(
             "No tokenizer.json found next to {} and no HuggingFace model ID provided",
             model_path.display()
         )))
     }
 
-    fn from_hf_tokenizer(tokenizer: tokenizers::Tokenizer) -> Result<Self> {
+    fn from_hf_tokenizer_with_overrides(
+        tokenizer: tokenizers::Tokenizer,
+        overrides: GgufTokenizerOverrides,
+        chat_template: Option<String>,
+    ) -> Result<Self> {
         let vocab_size = tokenizer.get_vocab_size(true);
         let token_strings: Vec<String> = (0..vocab_size)
             .map(|i| {
@@ -60,12 +85,25 @@ impl Tokenizer {
             })
             .collect();
 
-        let bos_id = tokenizer.token_to_id("<s>")
-            .or_else(|| tokenizer.token_to_id("<|begin_of_text|>"))
+        let bos_id = overrides
+            .bos_id
+            .or_else(|| {
+                tokenizer
+                    .token_to_id("<s>")
+                    .or_else(|| tokenizer.token_to_id("<|begin_of_text|>"))
+                    .or_else(|| tokenizer.token_to_id("<bos>"))
+            })
             .unwrap_or(1);
-        let eos_id = tokenizer.token_to_id("</s>")
-            .or_else(|| tokenizer.token_to_id("<|end_of_text|>"))
-            .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
+
+        let eos_id = overrides
+            .eos_id
+            .or_else(|| {
+                tokenizer
+                    .token_to_id("</s>")
+                    .or_else(|| tokenizer.token_to_id("<|end_of_text|>"))
+                    .or_else(|| tokenizer.token_to_id("<|eot_id|>"))
+                    .or_else(|| tokenizer.token_to_id("<eos>"))
+            })
             .unwrap_or(2);
 
         Ok(Self {
@@ -75,13 +113,14 @@ impl Tokenizer {
             bos_id,
             eos_id,
             token_strings,
+            chat_template,
         })
     }
 
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode(text, true)
             .map_err(|e| TokenizerError::Tokenizer(format!("Encode failed: {e}")))?;
 
         let mut ids: Vec<u32> = Vec::new();
@@ -135,6 +174,10 @@ impl Tokenizer {
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        if let Some(ref tmpl) = self.chat_template {
+            return self.apply_jinja_template(messages, tmpl);
+        }
+
         let im_start = self.inner.token_to_id("<|im_start|>");
         let im_end = self.inner.token_to_id("<|im_end|>");
         if let (Some(im_start), Some(im_end)) = (im_start, im_end) {
@@ -169,6 +212,38 @@ impl Tokenizer {
         Ok(tokens)
     }
 
+    fn apply_jinja_template(&self, messages: &[ChatMessage], tmpl: &str) -> Result<Vec<u32>> {
+        let mut env = Environment::new();
+        env.set_keep_trailing_newline(true);
+        env.add_filter("trim", |s: String| s.trim().to_string());
+        env.add_function("raise_exception", |msg: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(ErrorKind::UndefinedError, msg))
+        });
+
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({"role": &m.role, "content": &m.content})
+            })
+            .collect();
+
+        let mut ctx_map: BTreeMap<String, minijinja::Value> = BTreeMap::new();
+        ctx_map.insert("messages".into(), minijinja::Value::from_serialize(&msgs));
+        ctx_map.insert(
+            "bos_token".into(),
+            minijinja::Value::from(self.token_strings.get(self.bos_id as usize).cloned().unwrap_or_default()),
+        );
+        ctx_map.insert(
+            "eos_token".into(),
+            minijinja::Value::from(self.token_strings.get(self.eos_id as usize).cloned().unwrap_or_default()),
+        );
+
+        let rendered = env.render_str(tmpl, minijinja::Value::from(ctx_map))
+            .map_err(|e| TokenizerError::Tokenizer(format!("Jinja template error: {e}")))?;
+
+        self.encode(&rendered, false)
+    }
+
     fn apply_chatml(&self, messages: &[ChatMessage], im_start: u32, im_end: u32) -> Result<Vec<u32>> {
         let mut tokens = vec![self.bos_id];
         for msg in messages {
@@ -194,4 +269,34 @@ fn is_pad_token(id: u32, token_strings: &[String]) -> bool {
         || name.starts_with("<unused")
         || name == "<pad>"
         || name == "<unk>"
+}
+
+fn load_chat_template(model_dir: &Path, hf_model_id: Option<&str>) -> Option<String> {
+    let cfg_path = model_dir.join("tokenizer_config.json");
+    if let Ok(content) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(tmpl) = cfg.get("chat_template").and_then(|v| v.as_str()) {
+                return Some(tmpl.to_string());
+            }
+        }
+    }
+
+    if let Some(model_id) = hf_model_id {
+        let url = format!("https://huggingface.co/{}/raw/main/tokenizer_config.json", model_id);
+        if let Ok(response) = ureq::get(&url).call() {
+            if let Ok(body) = response.into_body().read_to_string() {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(tmpl) = cfg.get("chat_template").and_then(|v| v.as_str()) {
+                        let _ = std::fs::write(
+                            model_dir.join("tokenizer_config.json"),
+                            &body,
+                        );
+                        return Some(tmpl.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

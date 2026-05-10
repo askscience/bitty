@@ -11,6 +11,12 @@ pub enum TensorRole {
     LmHead,
     InputNorm(usize),
     PostAttnNorm(usize),
+    /// Gemma3: norm after attention, before residual.
+    PostAttentionNorm(usize),
+    /// Gemma3: norm before FFN (after first residual).
+    PreFfnNorm(usize),
+    /// Gemma3: norm after FFN, before second residual.
+    PostFfnNorm(usize),
     QProj(usize),
     KProj(usize),
     VProj(usize),
@@ -63,6 +69,9 @@ pub fn classify(name: &str) -> Option<TensorRole> {
             "ffn_norm.weight" | "post_attention_norm.weight" => {
                 Some(TensorRole::PostAttnNorm(layer))
             }
+            "post_attention_layernorm.weight" => Some(TensorRole::PostAttentionNorm(layer)),
+            "pre_feedforward_layernorm.weight" => Some(TensorRole::PreFfnNorm(layer)),
+            "post_feedforward_layernorm.weight" => Some(TensorRole::PostFfnNorm(layer)),
             "attn_q_norm.weight" => Some(TensorRole::QNorm(layer)),
             "attn_k_norm.weight" => Some(TensorRole::KNorm(layer)),
             "ffn_up.weight" | "mlp.up_proj.weight" => Some(TensorRole::UpProj(layer)),

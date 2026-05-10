@@ -201,6 +201,8 @@ struct RunConfig {
     data_dir: Option<String>,
     auto_pull: bool,
     local: bool,
+    seed: Option<u64>,
+    debug_tokens: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -731,7 +733,12 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                 .unwrap_or_else(|_| tok.encode(line, true).unwrap_or_default());
 
             // Build prompt from template (decode template tokens back to text)
+            // for the GPU BitNet path, which expects raw text.
             let prompt_text = tok.decode(&prompt_ids).unwrap_or_else(|_| line.to_string());
+
+            if config.debug_tokens {
+                eprintln!("debug: prompt token ids ({}) {:?}", prompt_ids.len(), prompt_ids);
+            }
 
             struct Streamer { started: bool }
             impl Streamer {
@@ -751,11 +758,15 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                     .await
                     .map_err(|e| format!("generate error: {e}"))?
             } else if let Some(ref cpu) = cpu_model {
-                cpu.generate_chat_stream(&messages, reset_cache, max_t, temp, 40, 1.1, |d| streamer.emit(d))
+                cpu.generate_chat_stream(&messages, reset_cache, max_t, temp, 40, 1.1, config.seed, |d| streamer.emit(d))
                     .map_err(|e| format!("CPU generate error: {e}"))?
             } else {
                 break;
             };
+
+            if config.debug_tokens {
+                eprintln!("debug: response = {:?}", response);
+            }
 
             println!();
             messages.push(bitty_bitnet_runtime::ChatMessage {
@@ -1990,6 +2001,8 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
         data_dir: config.data_dir,
         auto_pull: true,
         local: false,
+        seed: None,
+        debug_tokens: false,
     })
     .await
 }
@@ -2286,6 +2299,8 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         data_dir: None,
         auto_pull: true,
         local: false,
+        seed: None,
+        debug_tokens: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2298,9 +2313,13 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             "--no-auto-pull" => config.auto_pull = false,
             "--local" => config.local = true,
+            "--debug-tokens" => config.debug_tokens = true,
             "--no-daemon" => {}
             "--join" => config.node = Some(required_next(args, "--join")?),
-            "--num-ctx" | "--seed" | "--top-k" | "--top-p" | "--system" | "--template" => {
+            "--seed" => {
+                config.seed = Some(parse_next(args, "--seed")?);
+            }
+            "--num-ctx" | "--top-k" | "--top-p" | "--system" | "--template" => {
                 let _ = required_next(args, arg.as_str()).ok();
             }
             value if config.model.is_empty() => config.model = value.into(),

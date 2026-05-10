@@ -205,6 +205,13 @@ impl GgufMetadataValue {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn as_string_array(&self) -> Option<&[String]> {
         match self {
             Self::StringArray(arr) => Some(arr.as_slice()),

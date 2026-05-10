@@ -3,6 +3,29 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 
+/// Whether RoPE uses NEOX-style (i, i+half) or interleaved (2i, 2i+1) pairing.
+/// llama.cpp's GGUF converter permutes Q/K weights for Llama-family models so
+/// they expect interleaved rotation in the actual matmul.  Models like Gemma and
+/// Qwen are shipped in NEOX layout and use the (i, i+half) convention directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RopeStyle {
+    /// (i, i + rope_dim/2) — used by Gemma, Qwen, GPT-NeoX, StableLM.
+    Neox,
+    /// (2*i, 2*i+1) — used by Llama, Mistral, Phi, TinyLlama, SmolLM after GGUF conversion.
+    Interleaved,
+}
+
+impl RopeStyle {
+    pub fn from_architecture(arch: &str) -> Self {
+        match arch {
+            "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => {
+                RopeStyle::Interleaved
+            }
+            _ => RopeStyle::Neox,
+        }
+    }
+}
+
 /// Model configuration extracted from GGUF metadata.
 #[derive(Debug, Clone)]
 pub struct CpuModelMetadata {
@@ -14,12 +37,17 @@ pub struct CpuModelMetadata {
     pub head_dim: usize,
     /// Dimensions that receive RoPE (may be <= head_dim for partial RoPE).
     pub rope_dim: usize,
+    pub rope_style: RopeStyle,
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub activation: ActivationFn,
+    /// Gemma applies `hidden * sqrt(hidden_size)` after embedding lookup.
+    pub embedding_scale: Option<f32>,
+    /// Gemma2/3 logit softcapping: `softcap * tanh(logit / softcap)` before sampling.
+    pub final_logit_softcapping: Option<f32>,
     // Qwen3.5 hybrid (gated delta net + full attention)
     pub is_qwen35: bool,
     pub full_attention_interval: u32,
@@ -122,6 +150,12 @@ pub struct CpuLayer {
     pub kind: LayerKind,
     pub input_ln: Vec<f32>,
     pub post_attn_ln: Vec<f32>,
+    /// Gemma3: norm applied after attention but before the first residual (pre-attn-out norm).
+    pub post_attention_norm: Option<Vec<f32>>,
+    /// Gemma3: norm applied to the FFN input after the first residual.
+    pub pre_ffn_norm: Option<Vec<f32>>,
+    /// Gemma3: norm applied to the FFN output before the second residual.
+    pub post_ffn_norm: Option<Vec<f32>>,
     pub mlp: MlpBlock,
     pub layer_idx: usize,
 }
