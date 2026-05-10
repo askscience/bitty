@@ -14,5 +14,5 @@ mod device;
 mod model;
 mod sampler;
 
-pub use device::WgpuDevice;
+pub use device::{GpuBackend, WgpuDevice};
 pub use model::WgpuModel;

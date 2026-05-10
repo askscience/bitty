@@ -392,10 +392,12 @@ name = "bitty-cli"
 version = "0.1.0"
 dependencies = [
  "bitty-bitnet-runtime",
+ "bitty-candle-runtime",
  "bitty-coordinator",
  "bitty-inference",
  "bitty-model",
  "bitty-protocol",
+ "bitty-wgpu-runtime",
  "bitty-worker",
  "futures",
  "iroh",

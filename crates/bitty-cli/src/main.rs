@@ -1,4 +1,5 @@
 mod cluster_store;
+mod gpu_select;
 mod logger;
 mod model_store;
 mod modelfile;
@@ -684,30 +685,112 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         let temp = config.temperature.parse().unwrap_or(model.temperature);
         let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
         let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
+        let use_gpu = config.gpu && !config.local;
 
         // Load model once, keep alive across turns
         let mut bitnet_runtime: Option<BitNetRuntime> = None;
         let mut cpu_model: Option<bitty_bitnet_runtime::cpu_backend::CpuModel> = None;
+        let mut gpu_backend_kind: Option<gpu_select::GpuBackendKind> = None;
+        let mut candle_model: Option<bitty_candle_runtime::CandleModel> = None;
         let mut messages: Vec<bitty_bitnet_runtime::ChatMessage> = Vec::new();
         let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
             .expect("failed to load tokenizer");
 
-        if is_bitnet {
-            match BitNetRuntime::load(&path, hf_source).await {
-                Ok(rt) => bitnet_runtime = Some(rt),
-                Err(e) => {
-                    eprintln!("GPU unavailable ({}), using CPU backend...", e);
-                    cpu_model = Some(
-                        bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
-                            .map_err(|e| format!("CPU load error: {e}"))?
-                    );
+        if use_gpu {
+            let requested = config.gpu_backend.as_deref()
+                .map(gpu_select::GpuBackendKind::from_cli_flag);
+            let kind = gpu_select::select_backend(requested);
+            eprintln!("  {}  {}", ui::dim("GPU backend:"), ui::dim(kind.name()));
+
+            match kind {
+                gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm => {
+                    let device = bitty_candle_runtime::auto_device();
+                    match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                        Ok(m) => {
+                            eprintln!("  {}  {}", ui::dim("loaded on"), ui::dim(&format!("{device:?}")));
+                            candle_model = Some(m);
+                            gpu_backend_kind = Some(kind);
+                        }
+                        Err(e) => {
+                            eprintln!("  {} ({})", ui::dim("GPU unavailable, falling back to CPU"), e);
+                        }
+                    }
                 }
+                gpu_select::GpuBackendKind::Vulkan | gpu_select::GpuBackendKind::Dx12 | gpu_select::GpuBackendKind::MetalWgpu => {
+                    #[cfg(feature = "gpu-wgpu")]
+                    {
+                        match bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto) {
+                            Ok(dev) => {
+                                eprintln!("  {}  {}", ui::dim("wgpu device:"), ui::dim(&dev.adapter_info));
+                                gpu_backend_kind = Some(kind);
+                            }
+                            Err(e) => {
+                                eprintln!("  {} ({})", ui::dim("wgpu unavailable, falling back to CPU"), e);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "gpu-wgpu"))]
+                    {
+                        eprintln!("  {} (compile with --features gpu-wgpu)", ui::dim("wgpu not compiled in"));
+                    }
+                }
+                gpu_select::GpuBackendKind::Auto => {
+                    // Try each backend
+                    if cfg!(feature = "gpu-metal") && cfg!(target_os = "macos") {
+                        let device = bitty_candle_runtime::auto_device();
+                        match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                            Ok(m) => {
+                                candle_model = Some(m);
+                                gpu_backend_kind = Some(gpu_select::GpuBackendKind::Metal);
+                            }
+                            Err(e) => eprintln!("  {} ({})", ui::dim("Metal GPU load failed"), e),
+                        }
+                    }
+                    if cfg!(feature = "gpu-cuda") && gpu_select::has_cuda_device() {
+                        let device = bitty_candle_runtime::auto_device();
+                        match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                            Ok(m) => {
+                                candle_model = Some(m);
+                                gpu_backend_kind = Some(gpu_select::GpuBackendKind::Cuda);
+                            }
+                            Err(e) => eprintln!("  {} ({})", ui::dim("CUDA GPU load failed"), e),
+                        }
+                    }
+                    #[cfg(feature = "gpu-wgpu")]
+                    {
+                        if candle_model.is_none() {
+                            match bitty_wgpu_runtime::WgpuDevice::new(bitty_wgpu_runtime::GpuBackend::Auto) {
+                                Ok(_dev) => {
+                                    // TODO: full WgpuModel load, not just device probe
+                                    gpu_backend_kind = Some(gpu_select::GpuBackendKind::Vulkan);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+                gpu_select::GpuBackendKind::Cpu => {}
             }
-        } else {
-            cpu_model = Some(
-                bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
-                    .map_err(|e| format!("CPU load error: {e}"))?
-            );
+        }
+
+        if gpu_backend_kind.is_none() {
+            if is_bitnet {
+                match BitNetRuntime::load(&path, hf_source).await {
+                    Ok(rt) => bitnet_runtime = Some(rt),
+                    Err(e) => {
+                        eprintln!("GPU unavailable ({}), using CPU backend...", e);
+                        cpu_model = Some(
+                            bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
+                                .map_err(|e| format!("CPU load error: {e}"))?
+                        );
+                    }
+                }
+            } else {
+                cpu_model = Some(
+                    bitty_bitnet_runtime::cpu_backend::CpuModel::load(&path, hf_source)
+                        .map_err(|e| format!("CPU load error: {e}"))?
+                );
+            }
         }
 
         let mut reset_cache = true;
@@ -759,6 +842,36 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                 rt.generate_stream_raw(&prompt_text, max_t, temp, reset_cache, |d| streamer.emit(d))
                     .await
                     .map_err(|e| format!("generate error: {e}"))?
+            } else if let Some(ref mut candle) = candle_model {
+                // candle GPU generation loop: process prompt, then auto-regress
+                let mut generated = Vec::new();
+                let mut emitted = String::new();
+                let mut current = prompt_ids.clone();
+                for _step in 0..max_t {
+                    let logits = candle.forward(&current)
+                        .map_err(|e| format!("candle forward error: {e}"))?;
+                    let next = bitty_candle_runtime::sample_token(
+                        &mut logits.clone(), temp, 40, 1.0, 1.1, &generated,
+                    );
+                    if next == tok.eos_token_id()
+                        || tok.eot_token_id() == Some(next)
+                        || tok.im_end_token_id() == Some(next)
+                    {
+                        break;
+                    }
+                    generated.push(next);
+                    if let Ok(full) = tok.decode(&generated) {
+                        if full.len() > emitted.len() && full.starts_with(&emitted) {
+                            let tail = &full[emitted.len()..];
+                            if !tail.ends_with('\u{FFFD}') {
+                                streamer.emit(tail);
+                            }
+                            emitted = full;
+                        }
+                    }
+                    current = vec![next];
+                }
+                emitted
             } else if let Some(ref cpu) = cpu_model {
                 cpu.generate_chat_stream(&messages, reset_cache, max_t, temp, 40, 1.1, config.seed, |d| streamer.emit(d))
                     .map_err(|e| format!("CPU generate error: {e}"))?
@@ -785,6 +898,8 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         &prompt,
         config.max_tokens,
         &config.temperature,
+        config.gpu,
+        config.gpu_backend.as_deref(),
     )
     .await
 }
@@ -795,6 +910,8 @@ async fn run_local_model(
     prompt: &str,
     max_tokens: u32,
     temperature: &str,
+    use_gpu: bool,
+    gpu_backend: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = model.model_path(settings);
     if !path.exists() {
@@ -829,11 +946,71 @@ async fn run_local_model(
         }
     }
 
-    // For non-BitNet models, skip GPU and go straight to CPU
     let is_bitnet = model.backend.contains("bitnet") || model.backend.contains("i2s");
     let hf_source = if model.source.is_empty() { None } else { Some(model.source.as_str()) };
     let mut streamer = Streamer::new();
-    let result: Result<(), String> = if is_bitnet {
+
+    // If GPU requested, try GPU backends first
+    let gpu_tried = if use_gpu && !is_bitnet {
+        let requested = gpu_backend.map(gpu_select::GpuBackendKind::from_cli_flag);
+        let kind = gpu_select::select_backend(requested);
+        eprintln!("  {}  {}", ui::dim("GPU backend:"), ui::dim(kind.name()));
+        match kind {
+            gpu_select::GpuBackendKind::Cuda | gpu_select::GpuBackendKind::Metal | gpu_select::GpuBackendKind::Rocm => {
+                let device = bitty_candle_runtime::auto_device();
+                match bitty_candle_runtime::CandleModel::load(&path.to_string_lossy(), &device) {
+                    Ok(mut candle) => {
+                        // Simple one-shot generation via candle
+                        let tok = bitty_bitnet_runtime::load_tokenizer(&path, hf_source)
+                            .expect("tokenizer");
+                        let mut generated = Vec::new();
+                        let mut emitted = String::new();
+                        let prompt_ids = tok.encode(prompt, true).unwrap_or_default();
+                        let mut current = prompt_ids;
+                        let eos = tok.eos_token_id();
+                        let eot = tok.eot_token_id();
+                        let im_end = tok.im_end_token_id();
+                        for _step in 0..max_tokens as usize {
+                            let logits = candle.forward(&current)
+                                .map_err(|e| format!("candle forward error: {e}"))?;
+                            let next = bitty_candle_runtime::sample_token(
+                                &mut logits.clone(), temp, 40, 1.0, 1.1, &generated,
+                            );
+                            if next == eos || Some(next) == eot || Some(next) == im_end {
+                                break;
+                            }
+                            generated.push(next);
+                            if let Ok(full) = tok.decode(&generated) {
+                                if full.len() > emitted.len() && full.starts_with(&emitted) {
+                                    let tail = &full[emitted.len()..];
+                                    if !tail.ends_with('\u{FFFD}') {
+                                        streamer.emit(tail);
+                                    }
+                                    emitted = full;
+                                }
+                            }
+                            current = vec![next];
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("  {} ({})", ui::dim("GPU load failed, falling back to CPU"), e);
+                        false
+                    }
+                }
+            }
+            _ => {
+                eprintln!("  {} (backend not yet wired for one-shot)", ui::dim("GPU"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let result: Result<(), String> = if gpu_tried {
+        Ok(())
+    } else if is_bitnet {
         match spinner("loading model", BitNetRuntime::load(&path, hf_source)).await {
             Ok(mut runtime) => runtime
                 .generate_stream(prompt, max_tokens as usize, temp, |delta| {

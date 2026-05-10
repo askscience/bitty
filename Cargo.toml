@@ -58,6 +58,7 @@ bitty-protocol = { path = "crates/bitty-protocol" }
 bitty-model = { path = "crates/bitty-model" }
 bitty-bitnet-runtime = { path = "crates/bitty-bitnet-runtime" }
 bitty-candle-runtime = { path = "crates/bitty-candle-runtime" }
+bitty-wgpu-runtime = { path = "crates/bitty-wgpu-runtime" }
 bitty-inference = { path = "crates/bitty-inference" }
 bitty-coordinator = { path = "crates/bitty-coordinator" }
 bitty-worker = { path = "crates/bitty-worker" }

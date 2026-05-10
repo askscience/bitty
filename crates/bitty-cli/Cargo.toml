@@ -8,10 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 bitty-bitnet-runtime.workspace = true
+bitty-candle-runtime.workspace = true
 bitty-coordinator.workspace = true
 bitty-inference.workspace = true
 bitty-model.workspace = true
 bitty-protocol.workspace = true
+bitty-wgpu-runtime = { workspace = true, optional = true }
 bitty-worker.workspace = true
 futures.workspace = true
 iroh.workspace = true
@@ -20,6 +22,14 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+
+[features]
+default = []
+gpu-cuda = ["bitty-candle-runtime/cuda"]
+gpu-rocm = ["bitty-candle-runtime/rocm"]
+gpu-metal = ["bitty-candle-runtime/metal"]
+gpu-wgpu = ["bitty-wgpu-runtime"]
+all-gpu = ["gpu-cuda", "gpu-rocm", "gpu-metal", "gpu-wgpu"]
 
 [[bin]]
 name = "bitty"
