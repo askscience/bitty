@@ -61,6 +61,7 @@ struct QuantTensor {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum WgpuModelError {
     #[error("GPU error: {0}")]
     Gpu(String),
@@ -141,7 +142,7 @@ impl WgpuModel {
         max_tokens: usize,
         temperature: f32,
         top_k: usize,
-        mut on_delta: impl FnMut(&str),
+        on_delta: impl FnMut(&str),
     ) -> Result<String, String> {
         let d = self.metadata.hidden_size;
         let num_layers = self.metadata.num_layers;
@@ -175,7 +176,7 @@ impl WgpuModel {
 
             // First generated token: sample from final hidden
             if pos == prompt_ids.len() - 1 {
-                let logits = compute_logits_on_cpu(
+                let _logits = compute_logits_on_cpu(
                     &hidden, &self.weights.final_norm, self.weights.lm_head.as_ref(),
                     &self.weights.embed_tokens, d, self.metadata.vocab_size, self.metadata.rms_norm_eps,
                 );
@@ -193,7 +194,7 @@ impl WgpuModel {
     }
 
     fn forward_layer(
-        &self, hidden: &[f32], pos: usize, li: usize,
+        &self, hidden: &[f32], pos: usize, _li: usize,
         layer: &GpuLayer,
         k_cache: &mut Vec<f32>, v_cache: &mut Vec<f32>,
         meta: &GpuMetadata,
@@ -253,13 +254,13 @@ impl WgpuModel {
     fn generate_loop(
         &self,
         max_tokens: usize, temperature: f32, top_k: usize,
-        hidden: &mut Vec<f32>, d: usize, num_layers: usize, n_kv: usize, hd: usize,
+        hidden: &mut Vec<f32>, d: usize, num_layers: usize, _n_kv: usize, _hd: usize,
         k_cache: &mut [Vec<f32>], v_cache: &mut [Vec<f32>],
         generated: &mut Vec<u32>, emitted: &mut String,
         eos: u32, eot: Option<u32>, im_end: Option<u32>,
         mut on_delta: impl FnMut(&str),
     ) -> Result<String, String> {
-        for step in 0..max_tokens {
+        for _step in 0..max_tokens {
             let normed_vec = gpu_rmsnorm(&self.device, &self.pipelines.rmsnorm, hidden, &self.weights.final_norm, d, self.metadata.rms_norm_eps)?;
             let logits = compute_logits_on_cpu(
                 &normed_vec, &self.weights.final_norm,
@@ -333,7 +334,7 @@ fn gpu_rmsnorm(
 
 fn gpu_matmul(
     gpu: &WgpuDevice, pipelines: &GpuPipelines,
-    input: &[f32], weight: &QuantTensor, in_dim: usize,
+    input: &[f32], weight: &QuantTensor, _in_dim: usize,
 ) -> Result<Vec<f32>, String> {
     let actual_in = weight.in_dim as usize;
     let out_dim = weight.out_dim as usize;
@@ -459,15 +460,15 @@ fn upload_u32(device: &wgpu::Device, data: &[u32], label: &str) -> wgpu::Buffer 
 
 // ─── CPU-side helpers ───
 
-fn embed_token(tid: usize, embed_buf: &wgpu::Buffer, d: usize, vocab: usize, scale: Option<f32>) -> Vec<f32> {
-    let mut h = vec![0f32; d];
+fn embed_token(_tid: usize, _embed_buf: &wgpu::Buffer, d: usize, _vocab: usize, _scale: Option<f32>) -> Vec<f32> {
+    let h = vec![0f32; d];
     // Note: embed_tokens is on GPU. We need to read it back for CPU embedding.
     // For the simplified path: pre-load embedding table to CPU at init time.
     // This is a limitation — see the load function which stores cpu_embed.
     h
 }
 
-fn apply_norm_on_cpu(x: &[f32], weight_buf: &wgpu::Buffer, _eps: f32) -> Vec<f32> {
+fn apply_norm_on_cpu(x: &[f32], _weight_buf: &wgpu::Buffer, _eps: f32) -> Vec<f32> {
     // Weight is on GPU. For now, just pass through (norm weights are small).
     // Proper implementation would read weight from buffer.
     x.to_vec()
@@ -535,7 +536,7 @@ fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, hd: usize, nh: usize, nk
 
 fn compute_attention_on_cpu(
     q: &[f32], k_cache: &[f32], v_cache: &[f32],
-    nh: usize, nk: usize, hd: usize, seq_len: usize, hidden_dim: usize,
+    nh: usize, nk: usize, hd: usize, seq_len: usize, _hidden_dim: usize,
 ) -> Vec<f32> {
     let groups = nh / nk.max(1);
     let mut out = vec![0f32; nh * hd];
@@ -575,7 +576,7 @@ fn compute_logits_on_cpu(
     let rms = (hidden.iter().map(|v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
     let _normed: Vec<f32> = hidden.iter().map(|h| h / rms).collect();
 
-    let mut logits = vec![0f32; vocab];
+    let logits = vec![0f32; vocab];
     // lm_head or tie to embed_tokens: both are on GPU.
     // For the initial version, pre-load both to CPU at init time.
     // This is a simplification — see GpuWeights::cpu_embed / cpu_lm_head.

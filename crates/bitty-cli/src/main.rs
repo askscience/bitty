@@ -703,6 +703,7 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
 
         if use_gpu && !is_bitnet {
             let requested = config.gpu_backend.as_deref()
+                .or(if settings.preferred_gpu_backend != "auto" { Some(settings.preferred_gpu_backend.as_str()) } else { None })
                 .map(gpu_select::GpuBackendKind::from_cli_flag);
             let kind = gpu_select::select_backend(requested);
 
@@ -724,6 +725,12 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                 }
             }
             // If nothing worked, fall through to CPU silently
+        }
+
+        if gpu_backend_kind.is_none() && !config.force_cpu && use_gpu && !settings.gpu_fallback_to_cpu {
+            return Err(format!(
+                "GPU not available and gpu_fallback_to_cpu is false. Use --cpu or set gpu_fallback_to_cpu = true in config."
+            ).into());
         }
 
         if gpu_backend_kind.is_none() {
@@ -855,7 +862,8 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
         config.max_tokens,
         &config.temperature,
         !config.force_cpu,
-        config.gpu_backend.as_deref(),
+        config.gpu_backend.as_deref()
+            .or(if settings.preferred_gpu_backend != "auto" { Some(settings.preferred_gpu_backend.as_str()) } else { None }),
     )
     .await
 }

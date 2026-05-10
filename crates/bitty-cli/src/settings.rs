@@ -16,6 +16,8 @@ pub struct BittySettings {
     pub cluster_name: String,
     pub cluster_description: String,
     pub active_cluster: String,
+    pub preferred_gpu_backend: String,
+    pub gpu_fallback_to_cpu: bool,
 }
 
 impl BittySettings {
@@ -50,6 +52,8 @@ impl BittySettings {
             cluster_name: String::new(),
             cluster_description: String::new(),
             active_cluster: String::new(),
+            preferred_gpu_backend: "auto".into(),
+            gpu_fallback_to_cpu: true,
         }
     }
 
@@ -78,6 +82,8 @@ impl BittySettings {
             "cluster_name" => Some(self.cluster_name.clone()),
             "cluster_description" => Some(self.cluster_description.clone()),
             "active_cluster" => Some(self.active_cluster.clone()),
+            "preferred_gpu_backend" => Some(self.preferred_gpu_backend.clone()),
+            "gpu_fallback_to_cpu" => Some(self.gpu_fallback_to_cpu.to_string()),
             _ => None,
         }
     }
@@ -104,14 +110,16 @@ impl BittySettings {
             "cluster_name" => self.cluster_name = value.into(),
             "cluster_description" => self.cluster_description = value.into(),
             "active_cluster" => self.active_cluster = value.into(),
+            "preferred_gpu_backend" => self.preferred_gpu_backend = value.into(),
+            "gpu_fallback_to_cpu" => self.gpu_fallback_to_cpu = parse_bool(value),
             _ => return false,
         }
         true
     }
 
     pub fn to_toml(&self) -> String {
-        format!(
-            "data_dir = \"{}\"\nmodels_dir = \"{}\"\ndefault_model = \"{}\"\napi_host = \"{}\"\nauto_pull = {}\nauto_start_node = {}\ndefault_temperature = {}\ndefault_num_predict = {}\ndefault_num_ctx = {}\niroh_relays = \"{}\"\ncluster_mode = \"{}\"\ncluster_name = \"{}\"\ncluster_description = \"{}\"\nactive_cluster = \"{}\"\n",
+            format!(
+            "data_dir = \"{}\"\nmodels_dir = \"{}\"\ndefault_model = \"{}\"\napi_host = \"{}\"\nauto_pull = {}\nauto_start_node = {}\ndefault_temperature = {}\ndefault_num_predict = {}\ndefault_num_ctx = {}\niroh_relays = \"{}\"\ncluster_mode = \"{}\"\ncluster_name = \"{}\"\ncluster_description = \"{}\"\nactive_cluster = \"{}\"\npreferred_gpu_backend = \"{}\"\ngpu_fallback_to_cpu = {}\n",
             escape(&self.data_dir.display().to_string()),
             escape(&self.models_dir.display().to_string()),
             escape(&self.default_model),
@@ -125,7 +133,9 @@ impl BittySettings {
             escape(&self.cluster_mode),
             escape(&self.cluster_name),
             escape(&self.cluster_description),
-            escape(&self.active_cluster)
+            escape(&self.active_cluster),
+            escape(&self.preferred_gpu_backend),
+            self.gpu_fallback_to_cpu
         )
     }
 }
