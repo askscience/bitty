@@ -6,6 +6,7 @@ members = [
     "crates/bitty-cli",
     "crates/bitty-bitnet-runtime",
     "crates/bitty-candle-runtime",
+    "crates/bitty-wgpu-runtime",
     "crates/bitty-coordinator",
     "crates/bitty-worker",
     "crates/bitty-sim",

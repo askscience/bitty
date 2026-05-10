@@ -1,0 +1,26 @@
+[package]
+name = "bitty-wgpu-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Cross-GPU inference backend for bitty via wgpu (Vulkan / Metal / DX12 / WebGPU)"
+
+[dependencies]
+bitty-model.workspace = true
+bitty-candle-runtime.workspace = true
+bytemuck = "1"
+memmap2.workspace = true
+pollster = "0.4"
+rand = "0.9"
+thiserror.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+rand = "0.9"
+
+[features]
+default = []
+# Enable WebGPU backend (Firefox, Chrome Canary)
+webgpu = ["wgpu/webgpu"]
