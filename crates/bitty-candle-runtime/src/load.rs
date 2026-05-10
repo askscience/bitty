@@ -88,59 +88,44 @@ pub fn load_gguf(source: &str, device: &Device) -> Result<LoadedModel> {
 
 fn extract_config(gguf: &GgufFileMetadata) -> Result<ModelConfig> {
     let m = &gguf.metadata;
-    let get_f64 = |keys: &[&str]| -> Option<f64> {
-        keys.iter().find_map(|k| match m.get(*k)? {
-            bitty_model::gguf::GgufMetadataValue::F64(v) => Some(*v),
-            _ => None,
-        })
-    };
-
-    let hidden_size = m.get("bitnet.embedding_length")
-        .or_else(|| m.get("llama.embedding_length"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    let intermediate_size = m.get("bitnet.feed_forward_length")
-        .or_else(|| m.get("llama.feed_forward_length"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or((hidden_size as u64 * 8 / 3).max(1)) as usize;
-
-    let num_hidden_layers = m.get("bitnet.block_count")
-        .or_else(|| m.get("llama.block_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    let num_attention_heads = m.get("bitnet.attention.head_count")
-        .or_else(|| m.get("llama.attention.head_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
-
-    let num_key_value_heads = m.get("bitnet.attention.head_count_kv")
-        .or_else(|| m.get("llama.attention.head_count_kv"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(num_attention_heads as u64) as usize;
-
-    let vocab_size = m.get("llama.vocab_size")
-        .or_else(|| m.get("tokenizer.ggml.tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32_000) as usize;
-
-    let max_position_embeddings = m.get("bitnet.context_length")
-        .or_else(|| m.get("llama.context_length"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2048) as usize;
-
-    let rms_norm_eps = get_f64(&["bitnet.attention.layer_norm_epsilon", "llama.attention.layer_norm_epsilon"])
-        .unwrap_or(1e-5) as f32;
-
-    let rope_theta = get_f64(&["bitnet.rope.theta", "llama.rope.theta"])
-        .unwrap_or(10000.0) as f32;
-
     let arch_str = m.get("general.architecture")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let is_bitnet = arch_str.contains("bitnet");
     let is_gemma3 = arch_str.starts_with("gemma3") || arch_str.starts_with("gemma-3");
+
+    // Lookup helper: try {arch}.key, then llama.key, then bitnet.key
+    let get = |suffix: &str| -> Option<u64> {
+        m.get(&format!("{arch_str}.{suffix}"))
+            .or_else(|| m.get(&format!("llama.{suffix}")))
+            .or_else(|| m.get(&format!("bitnet.{suffix}")))
+            .and_then(|v| v.as_u64())
+    };
+    let hidden_size = get("embedding_length").unwrap_or(0) as usize;
+    let intermediate_size = get("feed_forward_length")
+        .unwrap_or((hidden_size as u64 * 8 / 3).max(1)) as usize;
+    let num_hidden_layers = get("block_count").unwrap_or(0) as usize;
+    let num_attention_heads = get("attention.head_count").unwrap_or(1) as usize;
+    let num_key_value_heads = get("attention.head_count_kv")
+        .unwrap_or(num_attention_heads as u64) as usize;
+    let vocab_size = get("vocab_size")
+        .or_else(|| m.get("tokenizer.ggml.tokens").and_then(|v| v.as_u64()))
+        .unwrap_or(32_000) as usize;
+    let max_position_embeddings = get("context_length").unwrap_or(2048) as usize;
+
+    let rms_norm_eps = m.get(&format!("{arch_str}.attention.layer_norm_rms_epsilon"))
+        .or_else(|| m.get(&format!("{arch_str}.attention.layer_norm_epsilon")))
+        .or_else(|| m.get("llama.attention.layer_norm_rms_epsilon"))
+        .or_else(|| m.get("llama.attention.layer_norm_epsilon"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-5) as f32;
+
+    let rope_theta = m.get(&format!("{arch_str}.rope.freq_base"))
+        .or_else(|| m.get(&format!("{arch_str}.rope.theta")))
+        .or_else(|| m.get("llama.rope.freq_base"))
+        .or_else(|| m.get("llama.rope.theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
 
     let rope_style = match arch_str {
         "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => {

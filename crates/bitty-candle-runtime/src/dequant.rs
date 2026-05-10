@@ -36,14 +36,14 @@ pub fn dequantize_tensor(raw: &[u8], ggml_type: u32, expected_elements: usize) -
 
 fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    let block_size = QK8_0 + 4; // 32 elements + 2-byte scale (f16) + 2 padding
+    let block_size = 34; // 2 bytes f16 scale + 32 bytes i8 quants
     for (i, block) in data.chunks(block_size).enumerate() {
         if block.len() < 4 { break; }
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
         let start = i * QK8_0;
-        for j in 0..QK8_0.min(block.len().saturating_sub(4)) {
+        for j in 0..QK8_0.min(block.len().saturating_sub(2)) {
             if start + j >= n { break; }
-            out[start + j] = (block[4 + j] as i8) as f32 * d;
+            out[start + j] = (block[2 + j] as i8) as f32 * d;
         }
     }
     out

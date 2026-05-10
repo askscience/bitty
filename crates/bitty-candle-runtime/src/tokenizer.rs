@@ -189,6 +189,29 @@ impl Tokenizer {
         let eot = self.inner.token_to_id("<|eot_id|>");
 
         if start_header.is_none() || end_header.is_none() || eot.is_none() {
+            // Check for Gemma3 format: <start_of_turn>role\ncontent<end_of_turn>
+            let start_of_turn = self.inner.token_to_id("<start_of_turn>");
+            let end_of_turn = self.inner.token_to_id("<end_of_turn>");
+            if let (Some(sot), Some(eot_tok)) = (start_of_turn, end_of_turn) {
+                return self.apply_gemma_template(messages, sot, eot_tok);
+            }
+
+            // Check for TinyLlama format: <|user|>\ncontent</s> etc.
+            let tl_user = self.inner.token_to_id("<|user|>");
+            let tl_assistant = self.inner.token_to_id("<|assistant|>");
+            if let (Some(_), Some(_)) = (tl_user, tl_assistant) {
+                return self.apply_tinyllama_template(messages);
+            }
+
+            // Check for DeepSeek-R1: <｜User｜>content<｜Assistant｜>
+            let ds_user = self.inner.token_to_id(" <｜User｜>");
+            let ds_assistant = self.inner.token_to_id(" <｜Assistant｜>");
+            if let (Some(_), Some(_)) = (ds_user, ds_assistant) {
+                return self.apply_deepseek_template(messages);
+            }
+
+            // Last resort: raw concatenation (will produce bad output for instruction-tuned models)
+            eprintln!("warning: no chat template found for this model; using raw text fallback. Output may be low quality.");
             let text: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
             return self.encode(&text, true);
         }
@@ -254,6 +277,49 @@ impl Tokenizer {
         }
         tokens.push(im_start);
         tokens.extend(self.encode("assistant\n", false)?);
+        Ok(tokens)
+    }
+
+    /// Gemma3 format: <start_of_turn>role\ncontent<end_of_turn>\n
+    fn apply_gemma_template(&self, messages: &[ChatMessage], sot: u32, eot: u32) -> Result<Vec<u32>> {
+        let mut tokens = vec![self.bos_id];
+        for msg in messages {
+            tokens.push(sot);
+            tokens.extend(self.encode(&format!("{}\n{}", msg.role, msg.content), false)?);
+            tokens.push(eot);
+            tokens.extend(self.encode("\n", false)?);
+        }
+        tokens.push(sot);
+        tokens.extend(self.encode("model\n", false)?);
+        Ok(tokens)
+    }
+
+    /// TinyLlama format: <|user|>\ncontent</s>\n<|assistant|>\ncontent</s>
+    fn apply_tinyllama_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        let mut tokens = vec![self.bos_id];
+        for msg in messages {
+            match msg.role.as_str() {
+                "user" => tokens.extend(self.encode(&format!("<|user|>\n{}</s>\n", msg.content), false)?),
+                "system" => tokens.extend(self.encode(&format!("<|system|>\n{}</s>\n", msg.content), false)?),
+                "assistant" => tokens.extend(self.encode(&format!("<|assistant|>\n{}</s>\n", msg.content), false)?),
+                _ => tokens.extend(self.encode(&format!("<|user|>\n{}</s>\n", msg.content), false)?),
+            }
+        }
+        tokens.extend(self.encode("<|assistant|>\n", false)?);
+        Ok(tokens)
+    }
+
+    /// DeepSeek-R1:  <｜User｜>content  <｜Assistant｜>content
+    fn apply_deepseek_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        let mut tokens = vec![self.bos_id];
+        for msg in messages {
+            if msg.role == "user" {
+                tokens.extend(self.encode(&format!(" <｜User｜>{}", msg.content), false)?);
+            } else {
+                tokens.extend(self.encode(&format!(" <｜Assistant｜>{}", msg.content), false)?);
+            }
+        }
+        tokens.extend(self.encode(" <｜Assistant｜>", false)?);
         Ok(tokens)
     }
 }

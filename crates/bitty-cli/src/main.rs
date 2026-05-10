@@ -806,10 +806,21 @@ async fn run_model(mut config: RunConfig) -> Result<(), Box<dyn std::error::Erro
                     .await
                     .map_err(|e| format!("generate error: {e}"))?
             } else if let Some(ref mut candle) = candle_model {
-                // candle GPU generation loop: process prompt, then auto-regress
+                // candle GPU generation loop with KV cache
+                if reset_cache {
+                    candle.reset_kv_cache();
+                }
                 let mut generated = Vec::new();
                 let mut emitted = String::new();
-                let mut current = prompt_ids.clone();
+                // Process prompt tokens through model (populates KV cache)
+                // Only feed prompt_ids on first turn or after cache reset;
+                // on subsequent turns the cache already contains history.
+                if reset_cache || generated.is_empty() {
+                    let _ = candle.forward(&prompt_ids)
+                        .map_err(|e| format!("candle forward error: {e}"))?;
+                }
+                // Auto-regress from KV cache
+                let mut current = vec![0u32]; // dummy, will be overwritten
                 for _step in 0..max_t {
                     let logits = candle.forward(&current)
                         .map_err(|e| format!("candle forward error: {e}"))?;
