@@ -178,38 +178,44 @@ impl Tokenizer {
             return self.apply_jinja_template(messages, tmpl);
         }
 
+        // Architecture-specific detection must come BEFORE generic ChatML/Llama3
+        // because models like DeepSeek-R1-Qwen share vocabulary with ChatML models
+        // but use completely different chat formats.
+
+        // Check for DeepSeek-R1: <｜User｜>content<｜Assistant｜>
+        let ds_user = self.inner.token_to_id(" <｜User｜>");
+        let ds_assistant = self.inner.token_to_id(" <｜Assistant｜>");
+        if let (Some(_), Some(_)) = (ds_user, ds_assistant) {
+            return self.apply_deepseek_template(messages);
+        }
+
+        // Check for Gemma3: <start_of_turn>role\ncontent<end_of_turn>
+        let start_of_turn = self.inner.token_to_id("<start_of_turn>");
+        let end_of_turn = self.inner.token_to_id("<end_of_turn>");
+        if let (Some(sot), Some(eot_tok)) = (start_of_turn, end_of_turn) {
+            return self.apply_gemma_template(messages, sot, eot_tok);
+        }
+
+        // Check for TinyLlama: <|user|>\ncontent</s> etc.
+        let tl_user = self.inner.token_to_id("<|user|>");
+        let tl_assistant = self.inner.token_to_id("<|assistant|>");
+        if let (Some(_), Some(_)) = (tl_user, tl_assistant) {
+            return self.apply_tinyllama_template(messages);
+        }
+
+        // Generic: ChatML (used by Qwen, etc.)
         let im_start = self.inner.token_to_id("<|im_start|>");
         let im_end = self.inner.token_to_id("<|im_end|>");
         if let (Some(im_start), Some(im_end)) = (im_start, im_end) {
             return self.apply_chatml(messages, im_start, im_end);
         }
 
+        // Llama3 format
         let start_header = self.inner.token_to_id("<|start_header_id|>");
         let end_header = self.inner.token_to_id("<|end_header_id|>");
         let eot = self.inner.token_to_id("<|eot_id|>");
 
         if start_header.is_none() || end_header.is_none() || eot.is_none() {
-            // Check for Gemma3 format: <start_of_turn>role\ncontent<end_of_turn>
-            let start_of_turn = self.inner.token_to_id("<start_of_turn>");
-            let end_of_turn = self.inner.token_to_id("<end_of_turn>");
-            if let (Some(sot), Some(eot_tok)) = (start_of_turn, end_of_turn) {
-                return self.apply_gemma_template(messages, sot, eot_tok);
-            }
-
-            // Check for TinyLlama format: <|user|>\ncontent</s> etc.
-            let tl_user = self.inner.token_to_id("<|user|>");
-            let tl_assistant = self.inner.token_to_id("<|assistant|>");
-            if let (Some(_), Some(_)) = (tl_user, tl_assistant) {
-                return self.apply_tinyllama_template(messages);
-            }
-
-            // Check for DeepSeek-R1: <｜User｜>content<｜Assistant｜>
-            let ds_user = self.inner.token_to_id(" <｜User｜>");
-            let ds_assistant = self.inner.token_to_id(" <｜Assistant｜>");
-            if let (Some(_), Some(_)) = (ds_user, ds_assistant) {
-                return self.apply_deepseek_template(messages);
-            }
-
             // Last resort: raw concatenation (will produce bad output for instruction-tuned models)
             eprintln!("warning: no chat template found for this model; using raw text fallback. Output may be low quality.");
             let text: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
@@ -309,17 +315,34 @@ impl Tokenizer {
         Ok(tokens)
     }
 
-    /// DeepSeek-R1:  <｜User｜>content  <｜Assistant｜>content
+    /// DeepSeek-R1: uses special tokens encoded as single IDs
     fn apply_deepseek_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        let mut tokens = vec![self.bos_id];
+        let ds_user = self.inner.token_to_id("<｜User｜>");
+        let ds_assistant = self.inner.token_to_id("<｜Assistant｜>");
+        let ds_begin = self.inner.token_to_id("<｜begin▁of▁sentence｜>");
+        let ds_think = self.inner.token_to_id("<｜end▁of▁thinking｜>");
+
+        let mut tokens = Vec::new();
+        // DeepSeek uses <｜begin▁of▁sentence｜> instead of regular BOS
+        if let Some(bos) = ds_begin {
+            tokens.push(bos);
+        } else {
+            tokens.push(self.bos_id);
+        }
         for msg in messages {
             if msg.role == "user" {
-                tokens.extend(self.encode(&format!(" <｜User｜>{}", msg.content), false)?);
-            } else {
-                tokens.extend(self.encode(&format!(" <｜Assistant｜>{}", msg.content), false)?);
+                if let Some(u) = ds_user { tokens.push(u); }
+                tokens.extend(self.encode(&msg.content, false)?);
+            } else if msg.role == "system" {
+                tokens.extend(self.encode(&msg.content, false)?);
+            } else if msg.role == "assistant" {
+                if let Some(a) = ds_assistant { tokens.push(a); }
+                tokens.extend(self.encode(&msg.content, false)?);
             }
         }
-        tokens.extend(self.encode(" <｜Assistant｜>", false)?);
+        // Add generation prompt
+        if let Some(a) = ds_assistant { tokens.push(a); }
+        if let Some(t) = ds_think { tokens.push(t); }
         Ok(tokens)
     }
 }
