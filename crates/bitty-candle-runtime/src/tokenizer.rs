@@ -22,6 +22,8 @@ pub struct GgufTokenizerOverrides {
     pub eos_id: Option<u32>,
     pub pad_id: Option<u32>,
     pub add_bos_token: Option<bool>,
+    /// Chat template from GGUF metadata (takes priority over HF download)
+    pub chat_template: Option<String>,
 }
 
 pub struct Tokenizer {
@@ -52,7 +54,9 @@ impl Tokenizer {
         if json_path.exists() {
             let tokenizer = tokenizers::Tokenizer::from_file(&json_path)
                 .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer.json: {e}")))?;
-            let chat_template = load_chat_template(dir, hf_model_id);
+            // Prefer GGUF-embedded chat template (source of truth), fall back to HF download
+            let chat_template = overrides.chat_template.clone()
+                .or_else(|| load_chat_template(dir, hf_model_id));
             return Self::from_hf_tokenizer_with_overrides(tokenizer, overrides, chat_template);
         }
 
@@ -60,7 +64,8 @@ impl Tokenizer {
             let tokenizer = tokenizers::Tokenizer::from_pretrained(model_id, None)
                 .map_err(|e| TokenizerError::Tokenizer(format!("Failed to load tokenizer from HF: {e}")))?;
             let _ = tokenizer.save(&json_path, false);
-            let chat_template = load_chat_template(dir, hf_model_id);
+            let chat_template = overrides.chat_template.clone()
+                .or_else(|| load_chat_template(dir, hf_model_id));
             return Self::from_hf_tokenizer_with_overrides(tokenizer, overrides, chat_template);
         }
 
@@ -317,34 +322,37 @@ impl Tokenizer {
         Ok(tokens)
     }
 
-    /// DeepSeek-R1: uses special tokens encoded as single IDs
+    /// DeepSeek-R1: uses special tokens encoded as single IDs.
+    /// Format: <｜begin▁of▁sentence｜>{system}<｜User｜>{content}<｜Assistant｜>
+    /// The model generates <think> reasoning on its own after <｜Assistant｜>.
     fn apply_deepseek_template(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let ds_user = self.inner.token_to_id("<｜User｜>");
         let ds_assistant = self.inner.token_to_id("<｜Assistant｜>");
         let ds_begin = self.inner.token_to_id("<｜begin▁of▁sentence｜>");
-        let ds_think = self.inner.token_to_id("<｜end▁of▁thinking｜>");
 
         let mut tokens = Vec::new();
-        // DeepSeek uses <｜begin▁of▁sentence｜> instead of regular BOS
         if let Some(bos) = ds_begin {
             tokens.push(bos);
         } else {
             tokens.push(self.bos_id);
         }
+        // System messages come first (after BOS), before user messages
+        for msg in messages {
+            if msg.role == "system" {
+                tokens.extend(self.encode(&msg.content, false)?);
+            }
+        }
         for msg in messages {
             if msg.role == "user" {
                 if let Some(u) = ds_user { tokens.push(u); }
-                tokens.extend(self.encode(&msg.content, false)?);
-            } else if msg.role == "system" {
                 tokens.extend(self.encode(&msg.content, false)?);
             } else if msg.role == "assistant" {
                 if let Some(a) = ds_assistant { tokens.push(a); }
                 tokens.extend(self.encode(&msg.content, false)?);
             }
         }
-        // Add generation prompt
+        // Generation prompt
         if let Some(a) = ds_assistant { tokens.push(a); }
-        if let Some(t) = ds_think { tokens.push(t); }
         Ok(tokens)
     }
 }

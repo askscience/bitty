@@ -177,10 +177,14 @@ pub fn extract_config(meta: &GgufFileMetadata, num_layers: usize) -> CpuModelMet
 pub fn extract_tokenizer_overrides(meta: &GgufFileMetadata) -> GgufTokenizerOverrides {
     let get_u32 = |key: &str| meta.metadata.get(key).and_then(|v| v.as_u32());
     let get_bool = |key: &str| meta.metadata.get(key).and_then(|v| v.as_bool());
+    let chat_template = meta.metadata.get("tokenizer.chat_template")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     GgufTokenizerOverrides {
         bos_id: get_u32("tokenizer.ggml.bos_token_id"),
         eos_id: get_u32("tokenizer.ggml.eos_token_id"),
         pad_id: get_u32("tokenizer.ggml.padding_token_id"),
         add_bos_token: get_bool("tokenizer.ggml.add_bos_token"),
+        chat_template,
     }
 }
