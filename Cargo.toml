@@ -20,18 +20,24 @@ license = "GPL-3.0-only"
 repository = "https://github.com/askscience/bitty"
 rust-version = "1.78"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
 bincode = "1"
 bytes = "1"
 candle-core = { version = "0.10.2", default-features = false }
+candle-flash-attn = "0.10.2"
 candle-nn = "0.10.2"
 criterion = "0.5"
 crc32fast = "1"
 futures = "0.3"
 governor = "0.6"
 iroh = "0.98.2"
+jemallocator = "0.5"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 memmap2 = "0.9"

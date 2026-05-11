@@ -1,3 +1,6 @@
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn::flash_attn as flash_attn_fn;
+
 use candle_core::{Device, Result, Tensor, D};
 use candle_nn::ops::rms_norm;
 
@@ -229,6 +232,20 @@ impl Attention {
 
         let k_full = cache.cache_k.as_ref().unwrap();
         let v_full = cache.cache_v.as_ref().unwrap();
+
+        #[cfg(feature = "flash-attn")]
+        {
+            let q_t = q.transpose(1, 2)?;
+            let k_t = k_full.transpose(1, 2)?;
+            let v_t = v_full.transpose(1, 2)?;
+            let softmax_scale = 1.0 / (self.head_dim as f32).sqrt();
+            let attn_output = flash_attn_fn(
+                &q_t, &k_t, &v_t, softmax_scale, true,
+            )?;
+            let attn_output = attn_output.reshape((n_tokens, self.num_heads * self.head_dim))?;
+            let output = attn_output.matmul(&self.o_proj_w.t()?)?;
+            return Ok(output);
+        }
 
         // GQA: repeat K/V to match number of query heads
         let (k_expanded, v_expanded) = if self.gqa_group_size > 1 {

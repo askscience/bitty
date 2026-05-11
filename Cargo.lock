@@ -373,8 +373,10 @@ dependencies = [
  "bitty-model",
  "bytemuck",
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "half",
+ "jemallocator",
  "memmap2",
  "minijinja",
  "rand 0.9.4",
@@ -652,6 +654,18 @@ dependencies = [
  "tokenizers 0.22.2",
  "yoke 0.8.2",
  "zip",
+]
+
+[[package]]
+name = "candle-flash-attn"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12512cf8e706744642e9a8579305a6ed1e44a0c636ce20c416cd5c519de19b7d"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
 ]
 
 [[package]]
@@ -3091,6 +3105,26 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jemalloc-sys"
+version = "0.5.4+5.3.0-patched"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6c1946e1cea1788cbfde01c993b52a10e2da07f4bac608228d1bed20bfebf2"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "jemallocator"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0de374a9f8e63150e6f5e8a60cc14c668226d7a347d8aee1a45766e3c4dd3bc"
+dependencies = [
+ "jemalloc-sys",
+ "libc",
+]
 
 [[package]]
 name = "jni"

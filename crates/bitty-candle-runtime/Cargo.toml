@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 bitty-model.workspace = true
 candle-core = { workspace = true, default-features = false }
+candle-flash-attn = { workspace = true, optional = true }
 candle-nn.workspace = true
 bytemuck = "1"
+jemallocator.workspace = true
 half = { version = "2", features = ["bytemuck"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,3 +33,4 @@ rocm = []
 metal = ["candle-core/metal"]
 cpu-mkl = ["candle-core/mkl"]
 cpu-accelerate = ["candle-core/accelerate"]
+flash-attn = ["candle-flash-attn"]

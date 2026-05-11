@@ -30,6 +30,7 @@ gpu-rocm = ["bitty-candle-runtime/rocm"]
 gpu-metal = ["bitty-candle-runtime/metal"]
 gpu-wgpu = ["bitty-wgpu-runtime"]
 all-gpu = ["gpu-cuda", "gpu-rocm", "gpu-metal", "gpu-wgpu"]
+flash-attn = ["bitty-candle-runtime/flash-attn"]
 
 [[bin]]
 name = "bitty"
