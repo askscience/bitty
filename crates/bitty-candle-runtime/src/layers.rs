@@ -1,7 +1,8 @@
 #[cfg(feature = "flash-attn")]
 use candle_flash_attn::flash_attn as flash_attn_fn;
 
-use candle_core::{Device, Result, Tensor, D};
+use candle_core::{Device, Result, Tensor, D, Module};
+use candle_core::quantized::QMatMul;
 use candle_nn::ops::rms_norm;
 
 pub use bitty_gguf_loader::config::{ModelConfig, RopeStyle};
@@ -67,10 +68,10 @@ fn precompute_freqs_cis(
 }
 
 pub struct Attention {
-    q_proj_w: Tensor,
-    k_proj_w: Tensor,
-    v_proj_w: Tensor,
-    o_proj_w: Tensor,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
     q_bias: Option<Tensor>,
     k_bias: Option<Tensor>,
     v_bias: Option<Tensor>,
@@ -89,10 +90,10 @@ pub struct Attention {
 impl Attention {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        q_proj_w: Tensor,
-        k_proj_w: Tensor,
-        v_proj_w: Tensor,
-        o_proj_w: Tensor,
+        q_proj: QMatMul,
+        k_proj: QMatMul,
+        v_proj: QMatMul,
+        o_proj: QMatMul,
         q_bias: Option<Tensor>,
         k_bias: Option<Tensor>,
         v_bias: Option<Tensor>,
@@ -105,10 +106,10 @@ impl Attention {
         max_seq_len: usize,
     ) -> Self {
         Self {
-            q_proj_w,
-            k_proj_w,
-            v_proj_w,
-            o_proj_w,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             q_bias,
             k_bias,
             v_bias,
@@ -149,15 +150,15 @@ impl Attention {
         let hidden = x.reshape((n_tokens, hidden_size))?;
         let device = x.device();
 
-        let mut q = hidden.matmul(&self.q_proj_w.t()?)?;
+        let mut q = self.q_proj.forward(&hidden)?;
         if let Some(ref bias) = self.q_bias {
             q = q.broadcast_add(bias)?;
         }
-        let mut k = hidden.matmul(&self.k_proj_w.t()?)?;
+        let mut k = self.k_proj.forward(&hidden)?;
         if let Some(ref bias) = self.k_bias {
             k = k.broadcast_add(bias)?;
         }
-        let mut v = hidden.matmul(&self.v_proj_w.t()?)?;
+        let mut v = self.v_proj.forward(&hidden)?;
         if let Some(ref bias) = self.v_bias {
             v = v.broadcast_add(bias)?;
         }
@@ -209,7 +210,7 @@ impl Attention {
                 &q_t, &k_t, &v_t, softmax_scale, true,
             )?;
             let attn_output = attn_output.reshape((n_tokens, self.num_heads * self.head_dim))?;
-            let output = attn_output.matmul(&self.o_proj_w.t()?)?;
+            let output = self.o_proj.forward(&attn_output)?;
             return Ok(output);
         }
 
@@ -230,7 +231,7 @@ impl Attention {
 
         let attn_output = attn_output.reshape((n_tokens, self.num_heads * self.head_dim))?;
 
-        let output = attn_output.matmul(&self.o_proj_w.t()?)?;
+        let output = self.o_proj.forward(&attn_output)?;
 
         Ok(output)
     }
@@ -250,10 +251,10 @@ mod tests {
         let device = Device::Cpu;
 
         let mut attention = Attention::new(
-            Tensor::zeros((16, 16), candle_core::DType::F32, &device)?,
-            Tensor::zeros((8, 16), candle_core::DType::F32, &device)?,
-            Tensor::zeros((8, 16), candle_core::DType::F32, &device)?,
-            Tensor::zeros((16, 16), candle_core::DType::F32, &device)?,
+            QMatMul::Tensor(Tensor::zeros((16, 16), candle_core::DType::F32, &device)?),
+            QMatMul::Tensor(Tensor::zeros((8, 16), candle_core::DType::F32, &device)?),
+            QMatMul::Tensor(Tensor::zeros((8, 16), candle_core::DType::F32, &device)?),
+            QMatMul::Tensor(Tensor::zeros((16, 16), candle_core::DType::F32, &device)?),
             None, None, None,
             2, 1, 8, false, 10000.0, RopeStyle::Neox, 128,
         );
@@ -276,30 +277,30 @@ mod tests {
 }
 
 pub struct FFN {
-    up_proj_w: Tensor,
-    gate_proj_w: Option<Tensor>,
-    down_proj_w: Tensor,
+    up_proj: QMatMul,
+    gate_proj: Option<QMatMul>,
+    down_proj: QMatMul,
 }
 
 impl FFN {
-    pub fn new(up_proj_w: Tensor, gate_proj_w: Option<Tensor>, down_proj_w: Tensor) -> Self {
+    pub fn new(up_proj: QMatMul, gate_proj: Option<QMatMul>, down_proj: QMatMul) -> Self {
         Self {
-            up_proj_w,
-            gate_proj_w,
-            down_proj_w,
+            up_proj,
+            gate_proj,
+            down_proj,
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let up = x.matmul(&self.up_proj_w.t()?)?;
-        let activated = if let Some(ref gate_w) = self.gate_proj_w {
-            let gate = x.matmul(&gate_w.t()?)?;
+        let up = self.up_proj.forward(x)?;
+        let activated = if let Some(ref gate_m) = self.gate_proj {
+            let gate = gate_m.forward(x)?;
             let gate = candle_nn::ops::silu(&gate)?;
             gate.broadcast_mul(&up)?
         } else {
             candle_nn::ops::silu(&up)?
         };
-        activated.matmul(&self.down_proj_w.t()?)
+        self.down_proj.forward(&activated)
     }
 }
 

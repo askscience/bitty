@@ -80,7 +80,7 @@ pub fn extract_model_config(gguf: &GgufFileMetadata, tensors: &[GgufTensorInfo])
         .unwrap_or(10000.0) as f32;
 
     let rope_style = match arch_str {
-        "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => {
+        "llama" | "mistral" | "tinyllama" | "smollm" => {
             RopeStyle::Interleaved
         }
         _ => RopeStyle::Neox,

@@ -9,7 +9,7 @@ pub mod config;
 pub mod backend;
 
 pub use backend::{BackendKind, InferenceBackend};
-pub use config::extract_model_config;
+pub use config::{extract_model_config, ModelConfig, RopeStyle};
 pub use mmap_store::{WeightStore, LoadedModel, LoadError, load_gguf};
 pub use mmap_store::compute_data_offset;
 pub use bitty_model::gguf;

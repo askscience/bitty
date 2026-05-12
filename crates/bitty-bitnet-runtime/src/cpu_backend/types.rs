@@ -5,20 +5,21 @@ use std::collections::HashMap;
 
 /// Whether RoPE uses NEOX-style (i, i+half) or interleaved (2i, 2i+1) pairing.
 /// llama.cpp's GGUF converter permutes Q/K weights for Llama-family models so
-/// they expect interleaved rotation in the actual matmul.  Models like Gemma and
-/// Qwen are shipped in NEOX layout and use the (i, i+half) convention directly.
+/// they expect interleaved rotation in the actual matmul.  Models like Gemma,
+/// Qwen, Phi-2/3, and StableLM are shipped in NEOX layout and use the
+/// (i, i+half) convention directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RopeStyle {
-    /// (i, i + rope_dim/2) — used by Gemma, Qwen, GPT-NeoX, StableLM.
+    /// (i, i + rope_dim/2) — used by Gemma, Qwen, GPT-NeoX, Phi-2/3, StableLM.
     Neox,
-    /// (2*i, 2*i+1) — used by Llama, Mistral, Phi, TinyLlama, SmolLM after GGUF conversion.
+    /// (2*i, 2*i+1) — used by Llama, Mistral, TinyLlama, SmolLM after GGUF conversion.
     Interleaved,
 }
 
 impl RopeStyle {
     pub fn from_architecture(arch: &str) -> Self {
         match arch {
-            "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => {
+            "llama" | "mistral" | "tinyllama" | "smollm" => {
                 RopeStyle::Interleaved
             }
             _ => RopeStyle::Neox,

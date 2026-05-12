@@ -1,4 +1,5 @@
 use candle_core::{Device, Tensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_nn::ops::rms_norm;
 use std::path::Path;
 
@@ -10,6 +11,68 @@ use bitty_gguf_loader::{BackendKind, InferenceBackend};
 use bitty_model::gguf::{GGML_TYPE_F16, GGML_TYPE_F32};
 
 pub use crate::layers::ModelConfig;
+
+fn ggml_to_ggml_dtype(ggml_type: u32) -> GgmlDType {
+    match ggml_type {
+        0 => GgmlDType::F32,
+        1 => GgmlDType::F16,
+        2 => GgmlDType::Q4_0,
+        3 => GgmlDType::Q4_1,
+        6 => GgmlDType::Q5_0,
+        7 => GgmlDType::Q5_1,
+        8 => GgmlDType::Q8_0,
+        9 => GgmlDType::Q8_1,
+        10 => GgmlDType::Q2K,
+        11 => GgmlDType::Q3K,
+        12 => GgmlDType::Q4K,
+        13 => GgmlDType::Q5K,
+        14 => GgmlDType::Q6K,
+        15 => GgmlDType::Q8K,
+        30 => GgmlDType::BF16,
+        _ => GgmlDType::F32, // fallback
+    }
+}
+
+/// Build a QMatMul from raw GGUF bytes. For quantized types, stores
+/// packed bytes on the GPU via QTensor for fused dequant+matmul.
+/// For F32/F16 types, uploads directly as a regular Tensor.
+fn build_qmatmul(
+    ws: &DeviceWeightStore,
+    name: &str,
+    shape: &[usize],
+    device: &Device,
+) -> std::result::Result<QMatMul, ModelError> {
+    let info = ws.get_info(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    let raw = ws.get_raw(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+
+    let ggml_type = info.ggml_type;
+
+    // F32/F16: use zero-copy raw buffer tensor path
+    if ggml_type == GGML_TYPE_F32 || ggml_type == GGML_TYPE_F16 {
+        let t = ws.get_raw_tensor(name, shape, ggml_type)
+            .map_err(ModelError::Load)?;
+        return Ok(QMatMul::Tensor(t));
+    }
+
+    // Quantized: use QTensor → QMatMul for fused dequant+matmul
+    let dtype = ggml_to_ggml_dtype(ggml_type);
+    let storage = QStorage::from_data(
+        std::borrow::Cow::Borrowed(raw),
+        device,
+        dtype,
+    ).map_err(|e| ModelError::Load(LoadError::Io(
+        std::io::Error::new(std::io::ErrorKind::Other, format!("QStorage: {e}"))
+    )))?;
+
+    let shape: candle_core::Shape = shape.into();
+    let qtensor = QTensor::new(storage, shape)
+        .map_err(|e| ModelError::Candle(e))?;
+
+    QMatMul::from_qtensor(qtensor)
+        .map_err(|e| ModelError::Candle(e))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -97,60 +160,61 @@ impl CandleModel {
 
             let (q_proj, k_proj, v_proj, o_proj) = if is_ternary {
                 (
-                    require_i2s_with_scale(weights,
+                    QMatMul::Tensor(require_i2s_with_scale(weights,
                         &format!("{p}.self_attn.q_proj.weight"),
                         &format!("{p}.self_attn.q_proj.weight_scale"),
-                        q_out, config.hidden_size)?,
-                    require_i2s_with_scale(weights,
+                        q_out, config.hidden_size)?),
+                    QMatMul::Tensor(require_i2s_with_scale(weights,
                         &format!("{p}.self_attn.k_proj.weight"),
                         &format!("{p}.self_attn.k_proj.weight_scale"),
-                        k_out, config.hidden_size)?,
-                    require_i2s_with_scale(weights,
+                        k_out, config.hidden_size)?),
+                    QMatMul::Tensor(require_i2s_with_scale(weights,
                         &format!("{p}.self_attn.v_proj.weight"),
                         &format!("{p}.self_attn.v_proj.weight_scale"),
-                        v_out, config.hidden_size)?,
-                    require_i2s_with_scale(weights,
+                        v_out, config.hidden_size)?),
+                    QMatMul::Tensor(require_i2s_with_scale(weights,
                         &format!("{p}.self_attn.o_proj.weight"),
                         &format!("{p}.self_attn.o_proj.weight_scale"),
-                        config.hidden_size, o_in)?,
+                        config.hidden_size, o_in)?),
                 )
             } else {
                 (
-                    require_f32(weights, &format!("{p}.self_attn.q_proj.weight"),
-                        &[q_out, config.hidden_size])?,
-                    require_f32(weights, &format!("{p}.self_attn.k_proj.weight"),
-                        &[k_out, config.hidden_size])?,
-                    require_f32(weights, &format!("{p}.self_attn.v_proj.weight"),
-                        &[v_out, config.hidden_size])?,
-                    require_f32(weights, &format!("{p}.self_attn.o_proj.weight"),
-                        &[config.hidden_size, o_in])?,
+                    build_qmatmul(weights, &format!("{p}.self_attn.q_proj.weight"),
+                        &[q_out, config.hidden_size], device)?,
+                    build_qmatmul(weights, &format!("{p}.self_attn.k_proj.weight"),
+                        &[k_out, config.hidden_size], device)?,
+                    build_qmatmul(weights, &format!("{p}.self_attn.v_proj.weight"),
+                        &[v_out, config.hidden_size], device)?,
+                    build_qmatmul(weights, &format!("{p}.self_attn.o_proj.weight"),
+                        &[config.hidden_size, o_in], device)?,
                 )
             };
 
             let (up_proj, down_proj, gate_proj) = if is_ternary {
-                let up = require_i2s_with_scale(weights,
+                let up = QMatMul::Tensor(require_i2s_with_scale(weights,
                     &format!("{p}.mlp.up_proj.weight"),
                     &format!("{p}.mlp.up_proj.weight_scale"),
-                    config.intermediate_size, config.hidden_size)?;
-                let down = require_i2s_with_scale(weights,
+                    config.intermediate_size, config.hidden_size)?);
+                let down = QMatMul::Tensor(require_i2s_with_scale(weights,
                     &format!("{p}.mlp.down_proj.weight"),
                     &format!("{p}.mlp.down_proj.weight_scale"),
-                    config.hidden_size, config.intermediate_size)?;
+                    config.hidden_size, config.intermediate_size)?);
                 let gate = weights.has(&format!("{p}.mlp.gate_proj.weight")).then(|| {
                     require_i2s_with_scale(weights,
                         &format!("{p}.mlp.gate_proj.weight"),
                         &format!("{p}.mlp.gate_proj.weight_scale"),
                         config.intermediate_size, config.hidden_size)
+                        .map(QMatMul::Tensor)
                 }).transpose()?;
                 (up, down, gate)
             } else {
-                let up = require_f32(weights, &format!("{p}.mlp.up_proj.weight"),
-                    &[config.intermediate_size, config.hidden_size])?;
-                let down = require_f32(weights, &format!("{p}.mlp.down_proj.weight"),
-                    &[config.hidden_size, config.intermediate_size])?;
+                let up = build_qmatmul(weights, &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size], device)?;
+                let down = build_qmatmul(weights, &format!("{p}.mlp.down_proj.weight"),
+                    &[config.hidden_size, config.intermediate_size], device)?;
                 let gate = weights.has(&format!("{p}.mlp.gate_proj.weight")).then(|| {
-                    require_f32(weights, &format!("{p}.mlp.gate_proj.weight"),
-                        &[config.intermediate_size, config.hidden_size])
+                    build_qmatmul(weights, &format!("{p}.mlp.gate_proj.weight"),
+                        &[config.intermediate_size, config.hidden_size], device)
                 }).transpose()?;
                 (up, down, gate)
             };

@@ -1,6 +1,7 @@
 use crate::device::{GpuBackend, WgpuDevice};
 use crate::sampler;
 use bitty_candle_runtime::Tokenizer;
+use bitty_gguf_loader::{BackendKind, InferenceBackend, RopeStyle};
 use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
@@ -29,9 +30,6 @@ struct GpuMetadata {
     rope_style: RopeStyle,
     embedding_scale: Option<f32>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RopeStyle { Neox, Interleaved }
 
 struct GpuWeights {
     embed_tokens: wgpu::Buffer,
@@ -360,8 +358,6 @@ impl WgpuModel {
                     if !tail.ends_with('\u{FFFD}') { on_delta(tail); *emitted = full; }
     }
 }
-
-use bitty_gguf_loader::{BackendKind, InferenceBackend};
 
 impl InferenceBackend for WgpuModel {
     type Error = String;
@@ -888,7 +884,7 @@ fn extract_gpu_metadata(gguf: &bitty_model::gguf::GgufFileMetadata) -> Result<Gp
     let theta = m.get(&format!("{arch}.rope.freq_base"))
         .and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(10000.0);
     let rope_style = match arch {
-        "llama" | "mistral" | "phi3" | "phi" | "tinyllama" | "smollm" | "stablelm" => RopeStyle::Interleaved,
+        "llama" | "mistral" | "tinyllama" | "smollm" => RopeStyle::Interleaved,
         _ => RopeStyle::Neox,
     };
     let embedding_scale = if arch.starts_with("gemma") { Some((hidden_size as f32).sqrt()) } else { None };
