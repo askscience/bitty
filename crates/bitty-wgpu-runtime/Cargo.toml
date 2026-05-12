@@ -10,6 +10,7 @@ description = "Cross-GPU inference backend for bitty via wgpu (Vulkan / Metal / 
 [dependencies]
 bitty-model.workspace = true
 bitty-candle-runtime.workspace = true
+bitty-gguf-loader.workspace = true
 bytemuck = "1"
 memmap2.workspace = true
 pollster = "0.4"

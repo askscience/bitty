@@ -1,9 +1,13 @@
 use candle_core::{Device, Tensor};
 use candle_nn::ops::rms_norm;
+use std::path::Path;
 
 use crate::kv_cache::KvCache;
 use crate::layers::{Attention, FFN, TransformerBlock};
-use crate::load::{LoadError, LoadedModel, WeightStore};
+use crate::load::{DeviceWeightStore, LoadError, LoadedModel};
+
+use bitty_gguf_loader::{BackendKind, InferenceBackend};
+use bitty_model::gguf::{GGML_TYPE_F16, GGML_TYPE_F32};
 
 pub use crate::layers::ModelConfig;
 
@@ -45,17 +49,22 @@ impl CandleModel {
         let config = loaded.config;
         let weights = &loaded.weights;
 
-        let require_f32 = |ws: &WeightStore, name: &str, shape: &[usize]| -> Result<Tensor> {
+        let require_f32 = |ws: &DeviceWeightStore, name: &str, shape: &[usize]| -> Result<Tensor> {
             let info = ws.get_info(name)
                 .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
-            let element_count: usize = shape.iter().product();
             let raw = ws.get_raw(name)
                 .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+            // Zero-copy path for native F32/F16 types (avoids intermediate Vec allocation)
+            if info.ggml_type == GGML_TYPE_F32 || info.ggml_type == GGML_TYPE_F16 {
+                return ws.get_raw_tensor(name, shape, info.ggml_type)
+                    .map_err(ModelError::Load);
+            }
+            let element_count: usize = shape.iter().product();
             let data = crate::dequant::dequantize_tensor(raw, info.ggml_type, element_count);
             Ok(Tensor::from_vec(data, shape, device)?)
         };
 
-        let require_i2s_with_scale = |ws: &WeightStore, weight_name: &str,
+        let require_i2s_with_scale = |ws: &DeviceWeightStore, weight_name: &str,
                                       scale_name: &str, out_dim: usize, in_dim: usize| -> Result<Tensor> {
             let weight_raw = ws.get_raw(weight_name)
                 .ok_or_else(|| ModelError::MissingWeight(weight_name.to_string()))?;
@@ -406,4 +415,41 @@ fn dequantize_i2_s_with_scale(raw: &[u8], scale: &[f32], out_dim: usize, in_dim:
         }
     }
     result
+}
+
+impl InferenceBackend for CandleModel {
+    type Error = ModelError;
+
+    fn load(path: &Path, _hf_source: Option<&str>) -> std::result::Result<Self, Self::Error> {
+        let source = path.to_string_lossy().to_string();
+        let device = crate::auto_device();
+        Self::load(&source, &device)
+    }
+
+    fn forward(&mut self, token_ids: &[u32]) -> std::result::Result<Vec<f32>, Self::Error> {
+        self.forward(token_ids)
+    }
+
+    fn reset_kv_cache(&mut self) {
+        self.reset_kv_cache();
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        match self.device() {
+            Device::Cpu => BackendKind::Cpu,
+            #[cfg(feature = "cuda")]
+            _ if self.device().is_cuda() => BackendKind::Cuda,
+            #[cfg(feature = "metal")]
+            _ if self.device().is_metal() => BackendKind::Metal,
+            _ => BackendKind::Cpu,
+        }
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
 }

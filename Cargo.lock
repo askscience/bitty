@@ -351,6 +351,7 @@ name = "bitty-bitnet-runtime"
 version = "0.1.0"
 dependencies = [
  "bitty-candle-runtime",
+ "bitty-gguf-loader",
  "bitty-model",
  "bitty-protocol",
  "bytemuck",
@@ -370,6 +371,7 @@ dependencies = [
 name = "bitty-candle-runtime"
 version = "0.1.0"
 dependencies = [
+ "bitty-gguf-loader",
  "bitty-model",
  "bytemuck",
  "candle-core",
@@ -431,6 +433,17 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bitty-gguf-loader"
+version = "0.1.0"
+dependencies = [
+ "bitty-model",
+ "bytemuck",
+ "half",
+ "memmap2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -508,6 +521,7 @@ name = "bitty-wgpu-runtime"
 version = "0.1.0"
 dependencies = [
  "bitty-candle-runtime",
+ "bitty-gguf-loader",
  "bitty-model",
  "bytemuck",
  "memmap2",

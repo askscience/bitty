@@ -11,6 +11,7 @@
 //! - `shaders/`   — Slang WGSL shader sources (generated WGSL committed to repo)
 
 mod device;
+mod matmul_shader;
 mod model;
 mod sampler;
 

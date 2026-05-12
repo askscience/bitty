@@ -4,41 +4,7 @@ use candle_flash_attn::flash_attn as flash_attn_fn;
 use candle_core::{Device, Result, Tensor, D};
 use candle_nn::ops::rms_norm;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RopeStyle {
-    Neox,
-    Interleaved,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub max_position_embeddings: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub rope_style: RopeStyle,
-    pub tie_word_embeddings: bool,
-    pub lm_head_f16: bool,
-    pub is_qwen: bool,
-    pub embedding_scale: Option<f32>,
-    pub final_logit_softcap: Option<f32>,
-    pub is_gemma3: bool,
-}
-
-impl ModelConfig {
-    pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
-    }
-
-    pub fn gqa_group_size(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
-    }
-}
+pub use bitty_gguf_loader::config::{ModelConfig, RopeStyle};
 
 fn rotate_half_neox(x: &Tensor) -> Result<Tensor> {
     let last = x.dim(D::Minus1)?;

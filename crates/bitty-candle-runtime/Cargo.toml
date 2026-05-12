@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bitty-gguf-loader.workspace = true
 bitty-model.workspace = true
 candle-core = { workspace = true, default-features = false }
 candle-flash-attn = { workspace = true, optional = true }

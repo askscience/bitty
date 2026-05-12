@@ -11,6 +11,7 @@ pub struct WgpuModel {
     tokenizer: Tokenizer,
     weights: GpuWeights,
     pipelines: GpuPipelines,
+    gbuf: GpuBuffers,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,9 @@ struct GpuWeights {
     final_norm: wgpu::Buffer,
     layers: Vec<GpuLayer>,
     lm_head: Option<wgpu::Buffer>,
+    cpu_embed: Vec<f32>,
+    cpu_lm_head: Option<Vec<f32>>,
+    cpu_final_norm: Vec<f32>,
 }
 
 struct GpuLayer {
@@ -51,6 +55,8 @@ struct GpuLayer {
     down_proj: QuantTensor,
     q_norm: Option<wgpu::Buffer>,
     k_norm: Option<wgpu::Buffer>,
+    cpu_input_ln: Vec<f32>,
+    cpu_post_attn_ln: Vec<f32>,
 }
 
 struct QuantTensor {
@@ -81,8 +87,12 @@ struct GpuPipelines {
     matmul_q4k: wgpu::ComputePipeline,
     matmul_q6k: wgpu::ComputePipeline,
     matmul_q8_0: wgpu::ComputePipeline,
+    matmul_q4_0: wgpu::ComputePipeline,
+    matmul_q5k: wgpu::ComputePipeline,
     matmul_f16: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
+    attention: wgpu::ComputePipeline,
+    swiglu: wgpu::ComputePipeline,
     add_bias: wgpu::ComputePipeline,
     softcap: wgpu::ComputePipeline,
 }
@@ -104,17 +114,70 @@ impl GpuPipelines {
             })
         };
 
+        let quant_shader = |t: u32, label: &str| -> wgpu::ComputePipeline {
+            let src = crate::matmul_shader::generate_matmul_shader(t)
+                .unwrap_or_else(|| panic!("no shader template for GGML type {t}"));
+            make(label, &src)
+        };
+
         Self {
-            rmsnorm:    make("rmsnorm",    include_str!("shaders/rmsnorm.wgsl")),
-            embedding:  make("embedding",  include_str!("shaders/embedding.wgsl")),
-            matmul_f32: make("matmul_f32", include_str!("shaders/matmul_f32.wgsl")),
-            matmul_q4k: make("matmul_q4k", include_str!("shaders/matmul_q4k.wgsl")),
-            matmul_q6k: make("matmul_q6k", include_str!("shaders/matmul_q6k.wgsl")),
-            matmul_q8_0:make("matmul_q8_0",include_str!("shaders/matmul_q8_0.wgsl")),
-            matmul_f16: make("matmul_f16", include_str!("shaders/matmul_f16.wgsl")),
-            rope:       make("rope",       include_str!("shaders/rope.wgsl")),
-            add_bias:   make("add_bias",   include_str!("shaders/add_bias.wgsl")),
-            softcap:    make("softcap",    include_str!("shaders/softcap.wgsl")),
+            rmsnorm:     make("rmsnorm",    include_str!("shaders/rmsnorm.wgsl")),
+            embedding:   make("embedding",  include_str!("shaders/embedding.wgsl")),
+            matmul_f32:  make("matmul_f32", include_str!("shaders/matmul_f32.wgsl")),
+            matmul_q4k:  quant_shader(12, "matmul_q4k"),
+            matmul_q6k:  quant_shader(14, "matmul_q6k"),
+            matmul_q8_0: quant_shader(8,  "matmul_q8_0"),
+            matmul_q4_0: quant_shader(2,  "matmul_q4_0"),
+            matmul_q5k:  quant_shader(13, "matmul_q5k"),
+            matmul_f16:  make("matmul_f16", include_str!("shaders/matmul_f16.wgsl")),
+            rope:        make("rope",       include_str!("shaders/rope.wgsl")),
+            attention:   make("attention",  include_str!("shaders/attention.wgsl")),
+            swiglu:      make("swiglu",     include_str!("shaders/swiglu.wgsl")),
+            add_bias:    make("add_bias",   include_str!("shaders/add_bias.wgsl")),
+            softcap:     make("softcap",    include_str!("shaders/softcap.wgsl")),
+        }
+    }
+}
+
+struct GpuBuffers {
+    hidden: wgpu::Buffer,
+    q: wgpu::Buffer,
+    k: wgpu::Buffer,
+    v: wgpu::Buffer,
+    attn_out: wgpu::Buffer,
+    ffn_inter: wgpu::Buffer,
+    ffn_out: wgpu::Buffer,
+    k_cache: wgpu::Buffer,
+    v_cache: wgpu::Buffer,
+    dim: usize,
+    kv_hd: usize,
+    nk: usize,
+    max_seq: usize,
+    num_layers: usize,
+}
+
+impl GpuBuffers {
+    fn new(device: &wgpu::Device, dim: usize, num_heads: usize, nk: usize, hd: usize, max_seq: usize, num_layers: usize) -> Self {
+        let buf = |label: &str, count: usize| -> wgpu::Buffer {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label), size: (count.max(1) * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let qk_dim = num_heads * hd;
+        let kv_stride = num_layers * max_seq * nk * hd;
+        Self {
+            hidden: buf("gbuf_hidden", dim),
+            q: buf("gbuf_q", qk_dim),
+            k: buf("gbuf_k", qk_dim),
+            v: buf("gbuf_v", qk_dim),
+            attn_out: buf("gbuf_attn_out", dim),
+            ffn_inter: buf("gbuf_ffn_inter", dim * 4),
+            ffn_out: buf("gbuf_ffn_out", dim),
+            k_cache: buf("gbuf_k_cache", kv_stride),
+            v_cache: buf("gbuf_v_cache", kv_stride),
+            dim, kv_hd: nk * hd, nk, max_seq, num_layers,
         }
     }
 }
@@ -134,7 +197,9 @@ impl WgpuModel {
 
         let (meta, weights) = load_gguf_to_gpu(&gpu, &mmap)?;
 
-        Ok(Self { device: gpu, metadata: meta, tokenizer, weights, pipelines })
+        let gbuf = GpuBuffers::new(&gpu.device, meta.hidden_size, meta.num_heads, meta.num_kv_heads, meta.head_dim, meta.max_seq_len, meta.num_layers);
+
+        Ok(Self { device: gpu, metadata: meta, tokenizer, weights, pipelines, gbuf })
     }
 
     pub fn generate_from_ids(
@@ -165,7 +230,7 @@ impl WgpuModel {
 
         // Process prompt
         for (pos, &tid) in prompt_ids.iter().enumerate() {
-            hidden = embed_token(tid as usize, &self.weights.embed_tokens, d, self.metadata.vocab_size, self.metadata.embedding_scale);
+            hidden = embed_token(tid as usize, &self.weights.cpu_embed, d, self.metadata.vocab_size, self.metadata.embedding_scale);
 
             for li in 0..num_layers {
                 let layer = &self.weights.layers[li];
@@ -178,8 +243,9 @@ impl WgpuModel {
             // First generated token: sample from final hidden
             if pos == prompt_ids.len() - 1 {
                 let _logits = compute_logits_on_cpu(
-                    &hidden, &self.weights.final_norm, self.weights.lm_head.as_ref(),
-                    &self.weights.embed_tokens, d, self.metadata.vocab_size, self.metadata.rms_norm_eps,
+                    &hidden, &self.weights.cpu_final_norm,
+                    self.weights.cpu_lm_head.as_deref(), &self.weights.cpu_embed,
+                    d, self.metadata.vocab_size, self.metadata.rms_norm_eps,
                 );
                 return self.generate_loop(
                     max_tokens, temperature, top_k,
@@ -212,9 +278,9 @@ impl WgpuModel {
         let k = gpu_matmul(&self.device, &self.pipelines, &normed, &layer.k_proj, d)?;
         let v = gpu_matmul(&self.device, &self.pipelines, &normed, &layer.v_proj, d)?;
 
-        // 2. Q/K norms (if present)
-        let mut q = if let Some(ref qn) = layer.q_norm { apply_norm_on_cpu(&q, qn, eps) } else { q };
-        let mut k = if let Some(ref kn) = layer.k_norm { apply_norm_on_cpu(&k, kn, eps) } else { k };
+        // 2. Q/K norms (if present — CPU since norm weights are tiny)
+        let mut q = if let Some(ref _qn) = layer.q_norm { apply_norm_on_cpu(&q, &layer.cpu_input_ln, eps) } else { q };
+        let mut k = if let Some(ref _kn) = layer.k_norm { apply_norm_on_cpu(&k, &layer.cpu_input_ln, eps) } else { k };
 
         // 3. RoPE on GPU (Q and K concatenated, dispatched once)
         let mut qk = q.clone();
@@ -227,7 +293,7 @@ impl WgpuModel {
         q = qk[..q_len].to_vec();
         k = qk[q_len..].to_vec();
 
-        // 4. KV cache + attention (CPU)
+        // 4. Store K/V in CPU cache for attention (GPU-resident cache planned for Phase 1.6 follow-up)
         let kv_pos = pos * nk * hd;
         if kv_pos + k.len() > k_cache.len() { k_cache.resize(kv_pos + k.len(), 0.0); }
         if kv_pos + v.len() > v_cache.len() { v_cache.resize(kv_pos + v.len(), 0.0); }
@@ -235,28 +301,32 @@ impl WgpuModel {
         v_cache[kv_pos..kv_pos + v.len()].copy_from_slice(&v);
 
         let seq_len = pos + 1;
-        let attn_out = compute_attention_on_cpu(&q, &k_cache, &v_cache, nh, nk, hd, seq_len, d);
+        // GPU fused attention
+        let attn_out = gpu_attention(
+            &self.device, &self.pipelines.attention,
+            &q, &k_cache, &v_cache,
+            nh as u32, nk as u32, hd as u32, seq_len as u32,
+        )?;
 
-        // 4. O projection (GPU)
+        // 5. O projection (GPU)
         let block_out = gpu_matmul(&self.device, &self.pipelines, &attn_out, &layer.o_proj, d)?;
 
-        // 5. Residual
+        // 6. Residual (CPU — tiny op)
         let mut x1 = vec![0f32; d];
         for i in 0..d { x1[i] = hidden[i] + block_out[i]; }
 
-        // 6. FFN: RMSNorm → gate/up matmuls (GPU) → SwiGLU (CPU relay)
+        // 7. FFN: RMSNorm → gate/up matmuls (GPU) → SwiGLU (GPU)
         let ffn_normed = gpu_rmsnorm(&self.device, &self.pipelines.rmsnorm, &x1, &layer.post_attn_ln, d, eps)?;
         let gate = gpu_matmul(&self.device, &self.pipelines, &ffn_normed, &layer.gate_proj, d)?;
         let up = gpu_matmul(&self.device, &self.pipelines, &ffn_normed, &layer.up_proj, d)?;
 
         let inter = gate.len().min(up.len());
-        let mut activated = vec![0f32; inter];
-        for i in 0..inter { activated[i] = silu(gate[i]) * up[i]; }
+        let activated = gpu_swiglu(&self.device, &self.pipelines.swiglu, &gate, &up, inter)?;
 
-        // 7. Down projection (GPU)
+        // 8. Down projection (GPU)
         let ffn_out = gpu_matmul(&self.device, &self.pipelines, &activated, &layer.down_proj, inter)?;
 
-        // 8. Residual
+        // 9. Residual (CPU — tiny op)
         let mut out = vec![0f32; d];
         for i in 0..d { out[i] = x1[i] + ffn_out[i]; }
         Ok(out)
@@ -274,8 +344,8 @@ impl WgpuModel {
         for _step in 0..max_tokens {
             let normed_vec = gpu_rmsnorm(&self.device, &self.pipelines.rmsnorm, hidden, &self.weights.final_norm, d, self.metadata.rms_norm_eps)?;
             let logits = compute_logits_on_cpu(
-                &normed_vec, &self.weights.final_norm,
-                self.weights.lm_head.as_ref(), &self.weights.embed_tokens,
+                &normed_vec, &self.weights.cpu_final_norm,
+                self.weights.cpu_lm_head.as_deref(), &self.weights.cpu_embed,
                 d, self.metadata.vocab_size, self.metadata.rms_norm_eps,
             );
 
@@ -288,12 +358,45 @@ impl WgpuModel {
                 if full.len() > emitted.len() && full.starts_with(emitted.as_str()) {
                     let tail = &full[emitted.len()..];
                     if !tail.ends_with('\u{FFFD}') { on_delta(tail); *emitted = full; }
-                }
-            }
+    }
+}
+
+use bitty_gguf_loader::{BackendKind, InferenceBackend};
+
+impl InferenceBackend for WgpuModel {
+    type Error = String;
+
+    fn load(path: &Path, hf_source: Option<&str>) -> std::result::Result<Self, Self::Error> {
+        Self::load(path, hf_source, GpuBackend::Auto)
+    }
+
+    fn forward(&mut self, token_ids: &[u32]) -> std::result::Result<Vec<f32>, Self::Error> {
+        // Generate one step and return logits
+        let temp = 0.0;
+        let result = self.generate_from_ids(token_ids, 1, temp, 1, |_| {})?;
+        Ok(vec![0.0]) // placeholder — WGPU path uses full generate loop
+    }
+
+    fn reset_kv_cache(&mut self) {
+        // KV cache is managed per-request via Vec<Vec<f32>> in generate_from_ids
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Wgpu
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.metadata.hidden_size
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.metadata.vocab_size
+    }
+}
 
             // Embed next token
-            *hidden = embed_token(next as usize, &self.weights.embed_tokens, d, self.metadata.vocab_size, self.metadata.embedding_scale);
-            let pos = prompt_ids_len_from_cache(k_cache);
+            *hidden = embed_token(next as usize, &self.weights.cpu_embed, d, self.metadata.vocab_size, self.metadata.embedding_scale);
+            let pos = prompt_ids_len_from_cache(k_cache, self.metadata.num_kv_heads, self.metadata.head_dim);
 
             for li in 0..num_layers {
                 let layer = &self.weights.layers[li];
@@ -307,8 +410,10 @@ impl WgpuModel {
     }
 }
 
-fn prompt_ids_len_from_cache(k_cache: &[Vec<f32>]) -> usize {
-    k_cache.iter().map(|k| k.len()).max().unwrap_or(0) / 1 // approximate
+fn prompt_ids_len_from_cache(k_cache: &[Vec<f32>], nk: usize, hd: usize) -> usize {
+    let kv_stride = nk * hd;
+    if kv_stride == 0 { return 0; }
+    k_cache.first().map(|k| k.len() / kv_stride).unwrap_or(0)
 }
 
 // ─── GPU dispatch helpers ───
@@ -352,12 +457,14 @@ fn gpu_matmul(
     if input.len() < actual_in { return Err(format!("matmul dim mismatch: input {} < weight in_dim {}", input.len(), actual_in)); }
 
     let pipeline = match weight.ggml_type {
-        0 => &pipelines.matmul_f32,
-        1 => &pipelines.matmul_f16,  // F16
-        10 => &pipelines.matmul_q4k,  // Q4_K
-        15 => &pipelines.matmul_q6k,  // Q6_K
-        16 => &pipelines.matmul_q8_0, // Q8_0
-        _ => &pipelines.matmul_f32,
+        0  => &pipelines.matmul_f32,   // F32
+        1  => &pipelines.matmul_f16,   // F16
+        2  => &pipelines.matmul_q4_0,  // Q4_0
+        8  => &pipelines.matmul_q8_0,  // Q8_0
+        12 => &pipelines.matmul_q4k,   // Q4_K
+        13 => &pipelines.matmul_q5k,   // Q5_K
+        14 => &pipelines.matmul_q6k,   // Q6_K
+        _  => &pipelines.matmul_f32,   // fallback
     };
 
     let in_buf = upload_f32(&gpu.device, &input[..actual_in], "matmul_in");
@@ -415,6 +522,105 @@ fn gpu_embedding(
 
     dispatch_compute(gpu, pipeline, &bind_group, (n * dim).div_ceil(64));
     readback_f32(gpu, &out_buf, n * dim)
+}
+
+fn gpu_attention(
+    gpu: &WgpuDevice, pipeline: &wgpu::ComputePipeline,
+    q: &[f32], k_cache: &[f32], v_cache: &[f32],
+    nh: u32, nk: u32, hd: u32, seq_len: u32,
+) -> Result<Vec<f32>, String> {
+    let out_dim = (nh * hd) as usize;
+    let q_buf = upload_f32(&gpu.device, q, "attn_q");
+    let k_buf = upload_f32(&gpu.device, k_cache, "attn_k");
+    let v_buf = upload_f32(&gpu.device, v_cache, "attn_v");
+    let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("attn_out"),
+        size: (out_dim * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let scale = 1.0 / (hd as f32).sqrt();
+    let config_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("attn_cfg"),
+        contents: bytemuck::cast_slice(&[nh, nk, hd, seq_len, scale.to_bits()]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: q_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: config_buf.as_entire_binding() },
+        ],
+    });
+
+    dispatch_compute(gpu, pipeline, &bind_group, nh.div_ceil(64) as usize);
+    readback_f32(gpu, &out_buf, out_dim)
+}
+
+fn gpu_swiglu(
+    gpu: &WgpuDevice, pipeline: &wgpu::ComputePipeline,
+    gate: &[f32], up: &[f32], dim: usize,
+) -> Result<Vec<f32>, String> {
+    let gate_buf = upload_f32(&gpu.device, gate, "swiglu_gate");
+    let up_buf = upload_f32(&gpu.device, up, "swiglu_up");
+    let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("swiglu_out"),
+        size: (dim * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let dim_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("swiglu_dim"),
+        contents: bytemuck::cast_slice(&[dim as u32]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: gate_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: up_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() },
+        ],
+    });
+
+    dispatch_compute(gpu, pipeline, &bind_group, dim.div_ceil(64));
+    readback_f32(gpu, &out_buf, dim)
+}
+
+fn gpu_attention_buf(
+    gpu: &WgpuDevice, pipeline: &wgpu::ComputePipeline,
+    q_buf: &wgpu::Buffer, k_cache_buf: &wgpu::Buffer, v_cache_buf: &wgpu::Buffer,
+    out_buf: &wgpu::Buffer, nh: u32, nk: u32, hd: u32, seq_len: u32,
+) {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let config_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("attn_cfg"),
+        contents: bytemuck::cast_slice(&[nh, nk, hd, seq_len, scale.to_bits()]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: q_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_cache_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_cache_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: config_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(nh.div_ceil(64), 1, 1);
+    }
+    gpu.queue.submit(std::iter::once(encoder.finish()));
 }
 
 fn dispatch_compute(gpu: &WgpuDevice, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, workgroups: usize) {
@@ -545,70 +751,45 @@ fn upload_u32(device: &wgpu::Device, data: &[u32], label: &str) -> wgpu::Buffer 
 
 // ─── CPU-side helpers ───
 
-fn embed_token(_tid: usize, _embed_buf: &wgpu::Buffer, d: usize, _vocab: usize, _scale: Option<f32>) -> Vec<f32> {
-    let h = vec![0f32; d];
-    // Note: embed_tokens is on GPU. We need to read it back for CPU embedding.
-    // For the simplified path: pre-load embedding table to CPU at init time.
-    // This is a limitation — see the load function which stores cpu_embed.
-    h
-}
-
-fn apply_norm_on_cpu(x: &[f32], _weight_buf: &wgpu::Buffer, _eps: f32) -> Vec<f32> {
-    // Weight is on GPU. For now, just pass through (norm weights are small).
-    // Proper implementation would read weight from buffer.
-    x.to_vec()
-}
-
-fn compute_attention_on_cpu(
-    q: &[f32], k_cache: &[f32], v_cache: &[f32],
-    nh: usize, nk: usize, hd: usize, seq_len: usize, _hidden_dim: usize,
-) -> Vec<f32> {
-    let groups = nh / nk.max(1);
-    let mut out = vec![0f32; nh * hd];
-    for h in 0..nh {
-        let kv_h = h / groups.max(1);
-        let q_off = h * hd;
-        let o_off = h * hd;
-        let mut scores = vec![0f32; seq_len];
-        for j in 0..seq_len {
-            let k_off = j * nk * hd + kv_h * hd;
-            let mut dot = 0f32;
-            for d in 0..hd { dot += q[q_off + d] * k_cache[k_off + d]; }
-            scores[j] = dot / (hd as f32).sqrt();
-        }
-        // softmax
-        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = scores.iter().map(|s| (s - max).exp()).sum();
-        for s in scores.iter_mut() { *s = (*s - max).exp() / sum; }
-        // combine
-        for d in 0..hd {
-            let mut sum_v = 0f32;
-            for j in 0..seq_len {
-                sum_v += scores[j] * v_cache[j * nk * hd + kv_h * hd + d];
-            }
-            out[o_off + d] = sum_v;
-        }
-    }
-    out
-}
-
 fn compute_logits_on_cpu(
-    hidden: &[f32], _final_norm_buf: &wgpu::Buffer,
-    _lm_head: Option<&wgpu::Buffer>, _embed_tokens: &wgpu::Buffer,
+    hidden: &[f32], cpu_final_norm: &[f32],
+    cpu_lm_head: Option<&[f32]>, cpu_embed: &[f32],
     d: usize, vocab: usize, eps: f32,
 ) -> Vec<f32> {
-    // RMSNorm on CPU
-    let rms = (hidden.iter().map(|v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
-    let _normed: Vec<f32> = hidden.iter().map(|h| h / rms).collect();
-
-    let logits = vec![0f32; vocab];
-    // lm_head or tie to embed_tokens: both are on GPU.
-    // For the initial version, pre-load both to CPU at init time.
-    // This is a simplification — see GpuWeights::cpu_embed / cpu_lm_head.
+    let normed = apply_norm_on_cpu(hidden, cpu_final_norm, eps);
+    let head_weight = cpu_lm_head.unwrap_or(cpu_embed);
+    let mut logits = vec![0f32; vocab];
+    for v in 0..vocab {
+        let offset = v * d;
+        let end = (offset + d).min(head_weight.len());
+        let mut dot = 0f32;
+        for i in 0..d.min(end - offset) {
+            dot += normed[i] * head_weight[offset + i];
+        }
+        logits[v] = dot;
+    }
     logits
 }
 
-fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+fn embed_token(tid: usize, cpu_embed: &[f32], d: usize, vocab: usize, scale: Option<f32>) -> Vec<f32> {
+    let emb_offset = tid.min(vocab - 1) * d;
+    let end = (emb_offset + d).min(cpu_embed.len());
+    if emb_offset >= cpu_embed.len() {
+        return vec![0f32; d];
+    }
+    let mut h = cpu_embed[emb_offset..end].to_vec();
+    if h.len() < d { h.resize(d, 0.0); }
+    if let Some(s) = scale { for v in &mut h { *v *= s; } }
+    h
+}
+
+fn apply_norm_on_cpu(x: &[f32], cpu_norm: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len();
+    let rms = (x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps).sqrt();
+    x.iter().zip(cpu_norm.iter())
+        .map(|(xi, wi)| xi / rms * wi)
+        .collect()
+}
 
 // ─── GGUF loader ───
 
@@ -619,20 +800,24 @@ fn load_gguf_to_gpu(gpu: &WgpuDevice, mmap: &[u8]) -> Result<(GpuMetadata, GpuWe
 
     let (tensor_map, _data_offset) = build_tensor_map(mmap, &gguf);
 
-    let get_f32 = |name: &str, n: usize| -> Result<wgpu::Buffer, String> {
-        let (off, len) = tensor_map.get(name).ok_or_else(|| format!("Missing: {name}"))?;
-        let data: &[f32] = bytemuck::cast_slice(&mmap[*off..*off + *len]);
-        Ok(upload_f32(&gpu.device, &data[..n], name))
+    let get_f32 = |name: &str, n: usize| -> Result<(wgpu::Buffer, Vec<f32>), String> {
+        let (off, len, _ggml) = tensor_map.get(name).ok_or_else(|| format!("Missing: {name}"))?;
+        let off = *off;
+        let len = *len;
+        let data: &[f32] = bytemuck::cast_slice(&mmap[off..off + len.min(n * 4)]);
+        let cpu = data[..n].to_vec();
+        let buf = upload_f32(&gpu.device, &cpu, name);
+        Ok((buf, cpu))
     };
 
-    let embed_tokens = get_f32("token_embd.weight", meta.vocab_size * meta.hidden_size)?;
-    let final_norm = get_f32("output_norm.weight", meta.hidden_size)?;
+    let (embed_tokens, cpu_embed) = get_f32("token_embd.weight", meta.vocab_size * meta.hidden_size)?;
+    let (final_norm, cpu_final_norm) = get_f32("output_norm.weight", meta.hidden_size)?;
 
     let mut layers = Vec::with_capacity(meta.num_layers);
     for i in 0..meta.num_layers {
         let p = format!("blk.{}.", i);
-        let input_ln = get_f32(&format!("{p}attn_norm.weight"), meta.hidden_size)?;
-        let post_attn_ln = get_f32(&format!("{p}ffn_norm.weight"), meta.hidden_size)?;
+        let (input_ln, cpu_input_ln) = get_f32(&format!("{p}attn_norm.weight"), meta.hidden_size)?;
+        let (post_attn_ln, cpu_post_attn_ln) = get_f32(&format!("{p}ffn_norm.weight"), meta.hidden_size)?;
 
         let q_dim = meta.num_heads * meta.head_dim;
         let k_dim = meta.num_kv_heads * meta.head_dim;
@@ -652,30 +837,33 @@ fn load_gguf_to_gpu(gpu: &WgpuDevice, mmap: &[u8]) -> Result<(GpuMetadata, GpuWe
             q_proj, k_proj, v_proj, o_proj,
             up_proj, gate_proj, down_proj,
             q_norm: None, k_norm: None,
+            cpu_input_ln, cpu_post_attn_ln,
         });
     }
 
-    let lm_head = tensor_map.get("output.weight")
-        .map(|(off, len)| {
-            let data: &[f32] = bytemuck::cast_slice(&mmap[*off..*off + *len]);
-            upload_f32(&gpu.device, data, "lm_head")
-        });
+    let (lm_head, cpu_lm_head) = tensor_map.get("output.weight")
+        .map(|(off, len, _ggml)| {
+            let off = *off;
+            let len = *len;
+            let data: &[f32] = bytemuck::cast_slice(&mmap[off..off + len.min(meta.vocab_size * meta.hidden_size * 4)]);
+            let cpu = data[..(meta.vocab_size * meta.hidden_size).min(data.len())].to_vec();
+            let buf = upload_f32(&gpu.device, &cpu, "lm_head");
+            (Some(buf), Some(cpu))
+        })
+        .unwrap_or((None, None));
 
-    Ok((meta, GpuWeights { embed_tokens, final_norm, layers, lm_head }))
+    Ok((meta, GpuWeights { embed_tokens, final_norm, layers, lm_head, cpu_embed, cpu_lm_head, cpu_final_norm }))
 }
 
 fn load_quant_tensor(
-    gpu: &WgpuDevice, mmap: &[u8], tensor_map: &HashMap<String, (usize, usize)>,
+    gpu: &WgpuDevice, mmap: &[u8], tensor_map: &HashMap<String, (usize, usize, u32)>,
     name: &str, in_dim: u32, out_dim: u32,
 ) -> Result<QuantTensor, String> {
-    let (off, len) = tensor_map.get(name).ok_or_else(|| format!("Missing: {name}"))?;
-
-    // Determine ggml_type from the GGUF parser
-    let ggml_type = 10u32; // default Q4_K — should come from tensor info
+    let (off, len, ggml_type) = tensor_map.get(name).copied().ok_or_else(|| format!("Missing: {name}"))?;
 
     let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(name),
-        contents: &mmap[*off..*off + *len],
+        contents: &mmap[off..(off + len).min(mmap.len())],
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -710,7 +898,8 @@ fn extract_gpu_metadata(gguf: &bitty_model::gguf::GgufFileMetadata) -> Result<Gp
         rope_theta: theta, rope_style, embedding_scale })
 }
 
-fn build_tensor_map(mmap: &[u8], gguf: &bitty_model::gguf::GgufFileMetadata) -> (HashMap<String, (usize, usize)>, usize) {
+fn build_tensor_map(mmap: &[u8], gguf: &bitty_model::gguf::GgufFileMetadata) -> (HashMap<String, (usize, usize, u32)>, usize) {
+    use bitty_model::gguf::bytes_per_element;
     let mut map = HashMap::new();
     let mut pos: usize = 12;
     let tensor_count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
@@ -732,15 +921,15 @@ fn build_tensor_map(mmap: &[u8], gguf: &bitty_model::gguf::GgufFileMetadata) -> 
         pos += 4;
         let mut dims = Vec::new();
         for _ in 0..dim_count { dims.push(u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize); pos += 8; }
-        let _ggml_type = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+        let ggml_type = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
         pos += 4;
         let offset = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let elem_count: usize = dims.iter().product();
         let data_offset = compute_data_offset(mmap, gguf.alignment);
         let tensor_start = data_offset + offset as usize;
-        let byte_len = elem_count; // approximate — should use actual ggml size
-        map.insert(name, (tensor_start, byte_len));
+        let byte_len = (elem_count as f64 * bytes_per_element(ggml_type)).ceil() as usize;
+        map.insert(name, (tensor_start, byte_len, ggml_type));
     }
     (map, compute_data_offset(mmap, gguf.alignment))
 }

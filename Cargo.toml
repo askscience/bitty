@@ -11,6 +11,7 @@ members = [
     "crates/bitty-worker",
     "crates/bitty-sim",
     "crates/bitty-observability",
+    "crates/bitty-gguf-loader",
 ]
 resolver = "2"
 
@@ -69,3 +70,4 @@ bitty-inference = { path = "crates/bitty-inference" }
 bitty-coordinator = { path = "crates/bitty-coordinator" }
 bitty-worker = { path = "crates/bitty-worker" }
 bitty-observability = { path = "crates/bitty-observability" }
+bitty-gguf-loader = { path = "crates/bitty-gguf-loader" }

@@ -429,3 +429,37 @@ fn compute_logits(
         }
     }
 }
+
+use bitty_gguf_loader::{BackendKind, InferenceBackend};
+
+impl InferenceBackend for CpuModel {
+    type Error = String;
+
+    fn load(path: &Path, hf_source: Option<&str>) -> Result<Self, Self::Error> {
+        Self::load(path, hf_source)
+    }
+
+    fn forward(&mut self, _token_ids: &[u32]) -> Result<Vec<f32>, Self::Error> {
+        // CPU backend uses full generation loop via generate/generate_from_ids.
+        // Single-step forward not supported in the streaming API.
+        Err("CPU backend: use generate() for inference".into())
+    }
+
+    fn reset_kv_cache(&mut self) {
+        self.kv_cache.keys.clear();
+        self.kv_cache.values.clear();
+        self.kv_cache.seq_len = 0;
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Cpu
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.metadata.hidden_size as usize
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.metadata.vocab_size as usize
+    }
+}
