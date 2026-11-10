@@ -44,6 +44,33 @@ pub struct StageOptions {
     pub context: u32,
     /// Requests the stage keeps state for at the same time.
     pub sessions: u32,
+    /// Layers of the served range to keep on the GPU, counted from the top of the range.
+    pub gpu_layers: u32,
+}
+
+impl StageOptions {
+    /// Defaults overridden by `BITTY_STAGE_THREADS` and `BITTY_GPU_LAYERS`.
+    pub fn from_env() -> Self {
+        let read = |name: &str| std::env::var(name).ok().and_then(|value| value.trim().parse::<u32>().ok());
+        let mut options = Self::default();
+        if let Some(threads) = read("BITTY_STAGE_THREADS") {
+            options.threads = threads;
+        }
+        if let Some(gpu_layers) = read("BITTY_GPU_LAYERS") {
+            options.gpu_layers = gpu_layers;
+        }
+        options
+    }
+}
+
+/// Translates "layers of this range on the GPU" into llama.cpp's count, which starts from the
+/// top of the whole model and counts the output layer first.
+fn engine_gpu_layers(gpu_layers: u32, start: u32, end: u32, layer_count: u32) -> u32 {
+    let wanted = gpu_layers.min(end.saturating_sub(start));
+    if wanted == 0 {
+        return 0;
+    }
+    layer_count.saturating_sub(end) + wanted + 1
 }
 
 impl Default for StageOptions {
@@ -52,6 +79,7 @@ impl Default for StageOptions {
             threads: 0,
             context: 8192,
             sessions: 4,
+            gpu_layers: 0,
         }
     }
 }
@@ -68,12 +96,16 @@ struct Engine {
     next_session_id: u64,
 }
 
+/// Returns the model file to open for layers `[start, end)`, fetching it first if needed.
+pub type StageSource = Arc<dyn Fn(u32, u32) -> Result<PathBuf, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct StageExecutor {
     metadata: Arc<ModelMetadata>,
     model_path: Option<PathBuf>,
     engine_path: Option<PathBuf>,
     options: StageOptions,
+    stage_source: Option<StageSource>,
     engine: Arc<Mutex<Engine>>,
 }
 
@@ -93,7 +125,8 @@ impl StageExecutor {
             metadata: Arc::new(metadata),
             model_path: None,
             engine_path: None,
-            options: StageOptions::default(),
+            options: StageOptions::from_env(),
+            stage_source: None,
             engine: Arc::default(),
         }
     }
@@ -118,6 +151,13 @@ impl StageExecutor {
 
     pub fn with_engine(mut self, engine_path: impl Into<PathBuf>) -> Self {
         self.engine_path = Some(engine_path.into());
+        self
+    }
+
+    /// Opens a file chosen per layer range, for a node that holds stage files and not the whole
+    /// model. The file given to [`StageExecutor::load`] then only supplies the metadata.
+    pub fn with_stage_source(mut self, source: StageSource) -> Self {
+        self.stage_source = Some(source);
         self
     }
 
@@ -187,12 +227,27 @@ impl StageExecutor {
         };
         engine.process = None;
         engine.sessions.clear();
+        let fetched;
+        let model = match &self.stage_source {
+            Some(source) => {
+                fetched = source(range.start_layer, range.end_layer_exclusive)
+                    .map_err(|err| ExecutorError::Failed(format!("stage file is not available: {err}")))?;
+                &fetched
+            }
+            None => model,
+        };
         let process = StageProcess::spawn(&StageProcessConfig {
             engine: engine_path.clone(),
             model: model.clone(),
             start_layer: range.start_layer,
             end_layer_exclusive: range.end_layer_exclusive,
             threads: self.options.threads,
+            gpu_layers: engine_gpu_layers(
+                self.options.gpu_layers,
+                range.start_layer,
+                range.end_layer_exclusive,
+                self.metadata.layer_count,
+            ),
             context: self.options.context,
             sessions: self.options.sessions,
         })
@@ -217,6 +272,11 @@ impl Engine {
 
 #[async_trait]
 impl LayerExecutor for StageExecutor {
+    async fn prepare_range(&self, range: &AssignedLayerRange) -> Result<(), ExecutorError> {
+        let range = range.clone();
+        self.blocking(move |this, engine| this.ensure_process(engine, &range)).await
+    }
+
     /// Token ids go into a range that starts at layer 0, hidden states into any other range.
     /// `token_position == 0` opens the request on this stage; later calls continue it in order.
     /// The final range returns the logits of the last token as an `F32` activation whose
@@ -385,5 +445,24 @@ impl LayerExecutor for StageExecutor {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         Ok(Logits::new(activation.request_id, activation.token_position, logits))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::engine_gpu_layers;
+
+    #[test]
+    fn gpu_layers_count_from_the_top_of_the_model() {
+        // nothing asked, nothing offloaded
+        assert_eq!(engine_gpu_layers(0, 10, 20, 40), 0);
+        // the whole middle range: everything from layer 10 up
+        assert_eq!(engine_gpu_layers(10, 10, 20, 40), 31);
+        assert_eq!(engine_gpu_layers(99, 10, 20, 40), 31);
+        // the top four layers of the range
+        assert_eq!(engine_gpu_layers(4, 10, 20, 40), 25);
+        // the final range: its layers and the output layer
+        assert_eq!(engine_gpu_layers(10, 30, 40, 40), 11);
+        assert_eq!(engine_gpu_layers(3, 30, 40, 40), 4);
     }
 }

@@ -381,7 +381,31 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
     validate_cluster_token(&cluster_token)?;
-    let executor = Arc::new(StageExecutor::load(&config.model).await?);
+    // A node that holds the whole model opens it directly. Any other node keeps only the
+    // vocabulary file now and fetches the stage file of its layers once they are assigned.
+    let node_settings = BittySettings::load(data_dir.clone());
+    let (model_file, stage_source) = match model_store::whole_model_path(&node_settings, &config.model) {
+        Some(path) => (path, None),
+        None => {
+            let settings = node_settings.clone();
+            let model = config.model.clone();
+            let vocabulary = tokio::task::spawn_blocking(move || {
+                model_store::ensure_stage(&settings, &model, 0, 0)
+            })
+            .await??;
+            let settings = node_settings.clone();
+            let model = config.model.clone();
+            let source: bitty_inference::StageSource = Arc::new(move |start, end| {
+                model_store::ensure_stage(&settings, &model, start, end)
+            });
+            (vocabulary, Some(source))
+        }
+    };
+    let mut executor = StageExecutor::load(&model_file).await?;
+    if let Some(source) = stage_source {
+        executor = executor.with_stage_source(source);
+    }
+    let executor = Arc::new(executor);
     let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
         .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
     let worker_stats = worker.runtime_stats();
@@ -424,7 +448,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     } else {
         let leader = listen_as_connect_endpoint(&config.listen);
         let mut coordinator = NetworkCoordinator::new(demo_layers(config.layers))
-            .with_model_path(&config.model)
+            .with_model_path(&model_file)
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         if let Some(iroh_node) = &iroh_node {
             coordinator =

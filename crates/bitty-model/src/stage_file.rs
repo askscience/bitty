@@ -175,6 +175,9 @@ pub struct StageFileReport {
 
 /// Whether a tensor belongs to the stage `[start, end)` of a model with `layers` blocks.
 pub fn stage_holds_tensor(name: &str, start: u32, end: u32, layers: u32, has_output_weight: bool) -> bool {
+    if start >= end {
+        return false;
+    }
     let first = start == 0;
     let last = end == layers;
     if let Some(block) = block_of(name) {
@@ -259,7 +262,9 @@ pub fn write_stage_file(
         return Err(StageFileError::SourceIsStage { start: *from, end: *to });
     }
     let layers = block_count(&layout).ok_or(StageFileError::NoBlockCount)?;
-    if start >= end || end > layers {
+    // 0..0 is the vocabulary file: every metadata value and no tensor
+    let vocabulary_only = start == 0 && end == 0;
+    if (start >= end && !vocabulary_only) || end > layers {
         return Err(StageFileError::BadRange { start, end, layers });
     }
 
@@ -443,6 +448,14 @@ mod tests {
         let kept = parsed.tensors.iter().map(|tensor| tensor.name.clone()).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         (kept, bytes, report, names)
+    }
+
+    #[test]
+    fn empty_range_gives_a_vocabulary_file_without_tensors() {
+        let (kept, bytes, report, _) = build(true, 0, 0);
+        assert!(kept.is_empty());
+        assert_eq!(report.tensors, 0);
+        assert_eq!(report.bytes, bytes.len() as u64);
     }
 
     #[test]

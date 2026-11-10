@@ -23,6 +23,11 @@ pub trait LayerExecutor: Send + Sync {
         format!("<token:{token_id}>")
     }
 
+    /// Gets ready to serve `range` before the first request: fetch the weights, load them.
+    async fn prepare_range(&self, _range: &AssignedLayerRange) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     /// Drops any per-request state (KV cache, recurrent state) held for `request_id`.
     async fn end_request(&self, _request_id: &str) {}
 

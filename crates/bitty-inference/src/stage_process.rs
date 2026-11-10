@@ -65,6 +65,8 @@ pub struct StageProcessConfig {
     pub end_layer_exclusive: u32,
     /// 0 lets the engine choose.
     pub threads: u32,
+    /// llama.cpp's count: layers from the top of the whole model; 0 keeps everything on the CPU.
+    pub gpu_layers: u32,
     /// Context length of one session, in tokens.
     pub context: u32,
     /// Sessions the stage keeps state for at the same time.
@@ -103,6 +105,9 @@ impl StageProcess {
             .arg(config.context.to_string())
             .arg("--sessions")
             .arg(config.sessions.to_string());
+        if config.gpu_layers > 0 {
+            command.arg("--gpu-layers").arg(config.gpu_layers.to_string());
+        }
         if config.threads > 0 {
             command.arg("-t").arg(config.threads.to_string());
         }

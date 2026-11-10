@@ -68,14 +68,22 @@ impl ModelMetadata {
             .iter()
             .map(TensorMetadata::from)
             .collect::<Vec<_>>();
-        let layer_count = tensors
-            .iter()
-            .filter_map(|tensor| tensor.layer_id)
-            .max()
-            .map(|layer_id| layer_id + 1)
-            .ok_or(MetadataError::NoLayerTensors)?;
         let architecture =
             metadata_string(&gguf, &["general.architecture"]).unwrap_or_else(|| "unknown".into());
+        // The declared block count comes first: a stage file holds only some of the blocks and
+        // a vocabulary file none.
+        let block_key = format!("{architecture}.block_count");
+        let layer_count = metadata_u64(&gguf, &[block_key.as_str()])
+            .map(|count| count as u32)
+            .filter(|count| *count > 0)
+            .or_else(|| {
+                tensors
+                    .iter()
+                    .filter_map(|tensor| tensor.layer_id)
+                    .max()
+                    .map(|layer_id| layer_id + 1)
+            })
+            .ok_or(MetadataError::NoLayerTensors)?;
         let hidden_key = format!("{architecture}.embedding_length");
         let hidden_size = metadata_u64(&gguf, &[hidden_key.as_str(), "llama.embedding_length"])
             .or_else(|| infer_hidden_size(&gguf.tensors))

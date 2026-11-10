@@ -172,10 +172,39 @@ pub fn stage_path(settings: &BittySettings, spec: &ModelSpec, start: u32, end: u
         .join(format!("{stem}.layers-{start}-{end}.gguf"))
 }
 
+/// The model a stage comes from: a registry name, a local GGUF or an http(s) URL.
+fn stage_spec(settings: &BittySettings, model: &str) -> Result<(ModelSpec, bool), String> {
+    let is_url = model.starts_with("https://") || model.starts_with("http://");
+    if !is_url {
+        return resolve_model(settings, model)
+            .map(|spec| (spec, false))
+            .ok_or_else(|| format!("unknown model: {model}"));
+    }
+    let filename = model
+        .split(['?', '#'])
+        .next()
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("model.gguf");
+    let spec = ModelSpec {
+        name: Path::new(filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("model")
+            .into(),
+        tag: "remote".into(),
+        filename: filename.into(),
+        url: model.into(),
+        ..Default::default()
+    };
+    Ok((spec, true))
+}
+
 /// Fetches only the layers `[start, end)` of a model into a stage file.
 ///
 /// `model` is a registry name, a local GGUF or an http(s) URL. A whole copy already on disk is
 /// used as the source, otherwise the tensors come from the model URL with range requests.
+/// The range `0..0` gives the vocabulary file: the metadata and no weights.
 pub fn pull_stage(
     settings: &BittySettings,
     model: &str,
@@ -183,28 +212,7 @@ pub fn pull_stage(
     end: u32,
     output: Option<&Path>,
 ) -> Result<(PathBuf, bitty_model::StageFileReport), Box<dyn std::error::Error>> {
-    let is_url = model.starts_with("https://") || model.starts_with("http://");
-    let spec = if is_url {
-        let filename = model
-            .split(['?', '#'])
-            .next()
-            .and_then(|path| path.rsplit('/').next())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("model.gguf");
-        ModelSpec {
-            name: Path::new(filename)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("model")
-                .into(),
-            tag: "remote".into(),
-            filename: filename.into(),
-            url: model.into(),
-            ..Default::default()
-        }
-    } else {
-        resolve_model(settings, model).ok_or_else(|| format!("unknown model: {model}"))?
-    };
+    let (spec, is_url) = stage_spec(settings, model)?;
     let dest = match output {
         Some(path) => path.to_path_buf(),
         None => stage_path(settings, &spec, start, end),
@@ -219,6 +227,34 @@ pub fn pull_stage(
         bitty_model::write_stage_file(&bitty_model::HttpSource::new(&spec.url), start, end, &dest)?
     };
     Ok((dest, report))
+}
+
+/// The stage file for `[start, end)`, fetched only when it is not on disk yet.
+pub fn ensure_stage(settings: &BittySettings, model: &str, start: u32, end: u32) -> Result<PathBuf, String> {
+    let (spec, _) = stage_spec(settings, model)?;
+    let dest = stage_path(settings, &spec, start, end);
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    eprintln!("bitty: fetching layers {start}..{end} of {}", spec.id());
+    let (dest, report) = pull_stage(settings, model, start, end, None).map_err(|err| err.to_string())?;
+    eprintln!(
+        "bitty: layers {start}..{end} ready, {} MiB in {}",
+        report.bytes / (1024 * 1024),
+        dest.display()
+    );
+    Ok(dest)
+}
+
+/// The whole model on disk, if this machine has it.
+pub fn whole_model_path(settings: &BittySettings, model: &str) -> Option<PathBuf> {
+    let direct = Path::new(model);
+    if direct.is_file() {
+        return Some(direct.to_path_buf());
+    }
+    let (spec, is_url) = stage_spec(settings, model).ok()?;
+    let path = spec.model_path(settings);
+    (!is_url && path.is_file()).then_some(path)
 }
 
 pub fn write_manifest(

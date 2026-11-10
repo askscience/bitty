@@ -309,12 +309,6 @@ where
                 "shard assigned to a different node",
             ));
         }
-        if !manifest.path.is_empty() && !std::path::Path::new(&manifest.path).exists() {
-            return Err(Status::not_found(format!(
-                "shard path does not exist: {}",
-                manifest.path
-            )));
-        }
         if !manifest.sha256_hex.is_empty() && !manifest.path.is_empty() {
             verify_file_sha256(&manifest.path, &manifest.sha256_hex)
                 .map_err(ShardHashError::into_status)?;
@@ -325,6 +319,12 @@ where
                 message: "shard manifest already loaded".into(),
             }));
         }
+
+        // Fetches the stage file if this node does not hold it yet, then loads the layers.
+        self.executor
+            .prepare_range(&manifest.range)
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
 
         let assignment = LayerAssignment {
             node_id: manifest.node_id.clone(),

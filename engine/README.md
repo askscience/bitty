@@ -85,9 +85,33 @@ with the same `--start` / `--end`. `llama-stage-check -s a.gguf,b.gguf,...` runs
 the chain with one file per stage and compares it with the whole model given by
 `-m`.
 
+A node does this by itself. Give `bitty node --model` a registry name or a URL
+of a model that is not on disk: the node fetches the vocabulary file (the range
+`0..0`: all the metadata and no weights, about 10 MB) to start, and the stage
+file of its layers when the coordinator hands them over, which happens on the
+first request that uses the node. That request waits for the download. A node
+that holds the whole model keeps opening it directly. When the cluster changes
+and a node gets other layers it fetches the new stage file; the old one stays on
+disk.
+
 Limits: the downloaded ranges are protected only by TLS, there is no hash check
 of a stage file against the published model yet, and an interrupted pull starts
 again from the beginning.
+
+## GPU and threads
+
+Build llama.cpp with `-DGGML_VULKAN=ON` (or another GPU backend) and set on the
+node:
+
+- `BITTY_GPU_LAYERS=N`: keep N layers of the node's range on the GPU, counted
+  from the top of the range. More than the range holds means all of it.
+- `BITTY_STAGE_THREADS=N`: CPU threads of the engine (llama.cpp picks 4 when
+  unset).
+- `GGML_VK_VISIBLE_DEVICES=0`: llama.cpp's own variable, to pick one card when
+  the machine has several.
+
+Only the tensors of the range that go to the GPU take video memory, so a card
+too small for the model can still hold one stage of it.
 
 ## Text and sampling
 
@@ -157,6 +181,22 @@ was four times slower, and nodes have no setting for it yet. The first request
 after start waits for the stages to load (about 100 s here). The nodes in this
 run opened the whole model file with their layer range, not the stage files.
 
+Node without the model: a second node started with the URL of the 0.8B model
+and an empty data directory fetched 10 MiB of vocabulary at start and the 358
+MiB stage file of layers 0..12 on the first request (43 s in all), then answered
+with the node that holds the whole model. This is also the first run where a
+node loads a stage file. Not tried on the 35B model.
+
+GPU (Radeon RX 5500M through Vulkan, about 3.9 GB of its 8 GB free): the 0.8B
+model split in three stages on the GPU produces the same tokens as the CPU
+reference (`STAGE_CHECK_GPU_LAYERS=99 llama-stage-check -c 8,16`; logits differ
+by up to 1.2 from rounding). On the 35B model, three layers of a middle stage on
+the GPU took 1.3 GB of video memory, so tensors outside the range are not
+loaded there. One node with all 40 layers, 6 of them on the GPU (3.4 GB) and 8
+threads: 120 tokens in 33 s, against 40 s on the CPU alone. A whole 10-layer
+stage (about 5 GB) did not fit in the free memory of this card, so a fully
+offloaded stage is not measured.
+
 ## Not done yet
 
 - Requests carry one user message: there is no system prompt, conversation
@@ -167,8 +207,10 @@ run opened the whole model file with their layer range, not the stage files.
 - `bitty run --local` is not wired to the engine yet. `bitty chat` sends each
   line as a separate request with the default sampling and no memory of the
   earlier lines.
-- GPU offload: `n_gpu_layers` is not rebased to the range.
-- Workers do not fetch their stage file on their own when they get a layer
-  assignment; `bitty pull --layers` is a manual step for now.
+- A node learns its layers only when a request arrives, so the stage download
+  delays that request; nothing is fetched ahead of time and old stage files are
+  not cleaned up.
+- GPU settings come from environment variables only, and nothing checks the
+  free video memory before loading.
 - State save/load does not record the range.
 - `llama_model_size` still reports the whole file for a stage loaded from it.

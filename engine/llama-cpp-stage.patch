@@ -24,10 +24,10 @@ index 0000000..74beb1a
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-check/stage-check.cpp b/examples/stage-check/stage-check.cpp
 new file mode 100644
-index 0000000..ccd2967
+index 0000000..c6d802d
 --- /dev/null
 +++ b/examples/stage-check/stage-check.cpp
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,306 @@
 +// Checks stage execution: the model split into layer ranges and chained through hidden states
 +// must give the same logits as the whole model.
 +//
@@ -60,6 +60,9 @@ index 0000000..ccd2967
 +    llama_model_params mparams = llama_model_default_params();
 +    mparams.n_gpu_layers = 0;
 +    if (end != 0) {
++        // STAGE_CHECK_GPU_LAYERS puts the stages on the GPU; the whole-model reference stays on the CPU
++        const char * gpu = getenv("STAGE_CHECK_GPU_LAYERS");
++        mparams.n_gpu_layers = gpu ? atoi(gpu) : 0;
 +        mparams.stage_layer_start = begin;
 +        mparams.stage_layer_end   = end;
 +    }
@@ -325,7 +328,9 @@ index 0000000..ccd2967
 +    for (auto & st : chain) free_stage(st);
 +    llama_backend_free();
 +
-+    const bool ok = n_mismatch == 0 && n_token_diff == 0 && max_diff < 1e-3;
++    // stages on the GPU against a CPU reference differ in rounding: the tokens must still agree
++    const bool gpu = getenv("STAGE_CHECK_GPU_LAYERS") != nullptr;
++    const bool ok = n_mismatch == 0 && n_token_diff == 0 && (gpu || max_diff < 1e-3);
 +    printf("%s\n", ok ? "PASS" : "FAIL");
 +    return ok ? 0 : 1;
 +}
@@ -342,10 +347,10 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..60a3430
+index 0000000..a476c6f
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,473 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
@@ -570,6 +575,7 @@ index 0000000..60a3430
 +    std::string model_path;
 +    server      srv;
 +    int         threads = 0;
++    int         gpu_layers = 0; // llama.cpp's count: layers from the top of the whole model
 +    bool        vocab_only = false;
 +
 +    for (int i = 1; i < argc; ++i) {
@@ -586,6 +592,7 @@ index 0000000..60a3430
 +        else if (a == "--start")    srv.begin      = atoi(argv[++i]);
 +        else if (a == "--end")      srv.end        = atoi(argv[++i]);
 +        else if (a == "-t")         threads        = atoi(argv[++i]);
++        else if (a == "--gpu-layers") gpu_layers   = atoi(argv[++i]);
 +        else if (a == "--ctx")      srv.n_ctx_seq  = atoi(argv[++i]);
 +        else if (a == "--sessions") srv.n_sessions = atoi(argv[++i]);
 +        else if (a == "--batch")    srv.n_batch    = atoi(argv[++i]);
@@ -598,7 +605,7 @@ index 0000000..60a3430
 +        srv.begin = srv.end = 0;
 +    }
 +    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
-+        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]\n"
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512]\n"
 +                        "       %s -m model.gguf --vocab-only\n", argv[0], argv[0]);
 +        return 2;
 +    }
@@ -610,7 +617,7 @@ index 0000000..60a3430
 +    llama_backend_init();
 +
 +    llama_model_params mparams = llama_model_default_params();
-+    mparams.n_gpu_layers      = 0;
++    mparams.n_gpu_layers      = vocab_only ? 0 : gpu_layers;
 +    mparams.stage_layer_start = srv.begin;
 +    mparams.stage_layer_end   = srv.end;
 +    mparams.vocab_only        = vocab_only;
