@@ -216,7 +216,15 @@ impl NetworkCoordinator {
                             "workers ready in {:.1}s; topology_epoch={seen}",
                             started.elapsed().as_secs_f64()
                         ),
-                        Err(err) => println!("could not prepare the workers: {}", err.message()),
+                        Err(err) => {
+                            println!(
+                                "could not prepare the workers: {}; trying again",
+                                err.message()
+                            );
+                            // the same plan is tried again after the settle time
+                            prepared = String::new();
+                            seen_at = Instant::now();
+                        }
                     },
                     _ = changed => println!(
                         "the network changed while preparing topology_epoch={seen}; planning again"

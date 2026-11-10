@@ -23,7 +23,7 @@ pub fn redact_secret_args(args: &[String]) -> Vec<String> {
     redacted
 }
 
-fn redact_iroh_token(value: &str) -> String {
+pub fn redact_iroh_token(value: &str) -> String {
     if let Some((prefix, rest)) = value.split_once("token=") {
         let suffix = rest
             .split_once('&')

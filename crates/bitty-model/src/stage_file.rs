@@ -112,7 +112,9 @@ impl HttpSource {
         let mut command = Command::new("curl");
         command
             .args(["--location", "--fail", "--silent", "--show-error"])
-            .args(["--retry", "5", "--retry-delay", "2", "--proto", "=https,http"]);
+            .args(["--retry", "5", "--retry-delay", "2", "--proto", "=https,http"])
+            // a connection that stalls is ended, so the transfer can go on from where it was
+            .args(["--speed-limit", "1024", "--speed-time", "60"]);
         command
     }
 }
@@ -144,9 +146,46 @@ impl ByteSource for HttpSource {
     }
 
     fn copy_range(&self, offset: u64, len: u64, out: &mut dyn Write) -> Result<(), StageFileError> {
-        if len == 0 {
-            return Ok(());
+        // A transfer of several gigabytes over a home line breaks now and then. What arrived
+        // is kept and the rest is asked again from where it stopped; only a row of attempts
+        // that bring nothing ends the download.
+        let mut done = 0u64;
+        let mut empty_attempts = 0u32;
+        while done < len {
+            let received = self.copy_once(offset + done, len - done, out)?;
+            if received > len - done {
+                return Err(StageFileError::Fetch(format!(
+                    "expected {len} bytes at offset {offset}, the server sent more"
+                )));
+            }
+            done += received;
+            if done == len {
+                break;
+            }
+            if received == 0 {
+                empty_attempts += 1;
+                if empty_attempts >= RESUME_ATTEMPTS {
+                    return Err(StageFileError::Fetch(format!(
+                        "expected {len} bytes at offset {offset}, received {done}"
+                    )));
+                }
+            } else {
+                empty_attempts = 0;
+            }
+            std::thread::sleep(RESUME_PAUSE);
         }
+        Ok(())
+    }
+}
+
+/// Attempts in a row that may bring no byte before a download is given up.
+const RESUME_ATTEMPTS: u32 = 5;
+const RESUME_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl HttpSource {
+    /// One range request. Returns how many bytes reached `out`, which is less than `len`
+    /// when the connection broke on the way.
+    fn copy_once(&self, offset: u64, len: u64, out: &mut dyn Write) -> Result<u64, StageFileError> {
         let mut child = self
             .curl()
             .arg("--range")
@@ -160,38 +199,42 @@ impl ByteSource for HttpSource {
         let mut limited = (&mut stdout).take(len + 1);
         let mut buffer = vec![0u8; 1 << 20];
         let mut cancelled = false;
-        let copied = (|| -> io::Result<u64> {
-            let mut total = 0u64;
-            loop {
-                if self.cancel.as_ref().is_some_and(|cancel| cancel()) {
-                    cancelled = true;
-                    return Ok(total);
-                }
-                let read = match limited.read(&mut buffer) {
-                    Ok(0) => return Ok(total),
-                    Ok(read) => read,
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(err) => return Err(err),
-                };
-                out.write_all(&buffer[..read])?;
-                total += read as u64;
+        let mut total = 0u64;
+        let mut write_error = None;
+        loop {
+            if self.cancel.as_ref().is_some_and(|cancel| cancel()) {
+                cancelled = true;
+                break;
             }
-        })();
+            let read = match limited.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                // a broken pipe from curl: what arrived so far still counts
+                Err(_) => break,
+            };
+            if total + read as u64 > len {
+                total += read as u64;
+                break;
+            }
+            if let Err(err) = out.write_all(&buffer[..read]) {
+                write_error = Some(err);
+                break;
+            }
+            total += read as u64;
+        }
         drop(stdout);
-        if cancelled || matches!(copied, Ok(n) if n > len) {
+        if cancelled || total > len || write_error.is_some() {
             let _ = child.kill();
         }
-        let status = child.wait()?;
+        let _ = child.wait()?;
         if cancelled {
             return Err(StageFileError::Cancelled);
         }
-        let copied = copied?;
-        if copied != len || !status.success() {
-            return Err(StageFileError::Fetch(format!(
-                "expected {len} bytes at offset {offset}, received {copied}"
-            )));
+        if let Some(err) = write_error {
+            return Err(err.into());
         }
-        Ok(())
+        Ok(total)
     }
 }
 
@@ -546,5 +589,52 @@ mod tests {
             Err(StageFileError::SourceIsStage { start: 0, end: 1 })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    /// A server that honours ranges but closes every connection after `cut` body bytes.
+    fn flaky_server(data: Vec<u8>, cut: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        let (start, end) = value.trim().split_once('-').unwrap();
+                        range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                    }
+                }
+                let Some((start, end)) = range else { continue };
+                let body = &data[start..=end];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(), start, end, data.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body[..body.len().min(cut)]);
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_download_that_breaks_goes_on_from_where_it_stopped() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let source = HttpSource::new(flaky_server(data.clone(), 4_000));
+        let bytes = source.read_range(100, 9_000).unwrap();
+        assert_eq!(bytes, &data[100..9_100]);
     }
 }

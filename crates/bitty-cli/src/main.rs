@@ -370,7 +370,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         "starting node id={} model={} join={}",
         config.node_id,
         config.model,
-        config.join.as_deref().unwrap_or("leader")
+        secrets::redact_iroh_token(config.join.as_deref().unwrap_or("leader"))
     ));
     let use_iroh = config.iroh || config.join.as_deref().is_some_and(is_iroh_join_target);
     let data_dir = bitty_data_dir(config.data_dir.as_deref());
