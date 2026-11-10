@@ -46,6 +46,9 @@ pub struct StageOptions {
     pub sessions: u32,
     /// Layers of the served range to keep on the GPU, counted from the top of the range.
     pub gpu_layers: u32,
+    /// Keeps the output layer on the GPU even when no block of the range is there. It is one
+    /// large matrix, about a tenth of the work of a token, and needs little video memory.
+    pub gpu_output: bool,
 }
 
 impl StageOptions {
@@ -59,16 +62,26 @@ impl StageOptions {
         if let Some(gpu_layers) = read("BITTY_GPU_LAYERS") {
             options.gpu_layers = gpu_layers;
         }
+        if let Some(gpu_output) = read("BITTY_GPU_OUTPUT") {
+            options.gpu_output = gpu_output > 0;
+        }
         options
     }
 }
 
 /// Translates "layers of this range on the GPU" into llama.cpp's count, which starts from the
 /// top of the whole model and counts the output layer first.
-fn engine_gpu_layers(gpu_layers: u32, start: u32, end: u32, layer_count: u32) -> u32 {
+fn engine_gpu_layers(
+    gpu_layers: u32,
+    gpu_output: bool,
+    start: u32,
+    end: u32,
+    layer_count: u32,
+) -> u32 {
     let wanted = gpu_layers.min(end.saturating_sub(start));
     if wanted == 0 {
-        return 0;
+        // the output layer is the first one llama.cpp counts
+        return u32::from(gpu_output && end == layer_count);
     }
     layer_count.saturating_sub(end) + wanted + 1
 }
@@ -80,6 +93,7 @@ impl Default for StageOptions {
             context: 8192,
             sessions: 4,
             gpu_layers: 0,
+            gpu_output: false,
         }
     }
 }
@@ -244,12 +258,14 @@ impl StageExecutor {
             threads: self.options.threads,
             gpu_layers: engine_gpu_layers(
                 self.options.gpu_layers,
+                self.options.gpu_output,
                 range.start_layer,
                 range.end_layer_exclusive,
                 self.metadata.layer_count,
             ),
             context: self.options.context,
             sessions: self.options.sessions,
+            top_logits: crate::sampling::top_logits_limit() as u32,
         })
         .map_err(|err| ExecutorError::Failed(err.to_string()))?;
         engine.process = Some(process);
@@ -383,13 +399,27 @@ impl LayerExecutor for StageExecutor {
             }
 
             let (values, shape) = match output {
+                StageOutput::TopLogits(pairs) => {
+                    return Ok(ActivationTensor::new(
+                        activation.request_id,
+                        activation.token_position,
+                        range.start_layer,
+                        range.end_layer_exclusive,
+                        vec![(pairs.len() / 8) as u32],
+                        ActivationDType::TopLogits,
+                        pairs,
+                    ));
+                }
                 StageOutput::Hidden(values) => (values, vec![tokens as u32, hidden_size as u32]),
                 StageOutput::Logits(values) => {
                     let width = values.len() as u32;
                     (values, vec![width])
                 }
             };
-            let payload: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let mut payload = Vec::with_capacity(values.len() * 4);
+            for value in &values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
             Ok(ActivationTensor::new(
                 activation.request_id,
                 activation.token_position,
@@ -430,6 +460,25 @@ impl LayerExecutor for StageExecutor {
         if !activation.verify_checksum() {
             return Err(ExecutorError::ChecksumFailed);
         }
+        if activation.dtype == ActivationDType::TopLogits && activation.target_layer == self.metadata.layer_count {
+            // the logits the stage left out can never be sampled: they stand as minus infinity
+            let vocabulary = self
+                .blocking(|_, engine| {
+                    engine
+                        .process
+                        .as_ref()
+                        .map(|process| process.info().vocab_size as usize)
+                        .ok_or_else(|| ExecutorError::Failed("no stage is loaded yet".into()))
+                })
+                .await?;
+            let mut logits = vec![f32::NEG_INFINITY; vocabulary];
+            for (token, logit) in crate::sampling::decode_top_logits(&activation.payload).unwrap_or_default() {
+                if let Some(slot) = logits.get_mut(token as usize) {
+                    *slot = logit;
+                }
+            }
+            return Ok(Logits::new(activation.request_id, activation.token_position, logits));
+        }
         if activation.dtype != ActivationDType::F32
             || activation.target_layer != self.metadata.layer_count
             || activation.shape.len() != 1
@@ -455,14 +504,17 @@ mod tests {
     #[test]
     fn gpu_layers_count_from_the_top_of_the_model() {
         // nothing asked, nothing offloaded
-        assert_eq!(engine_gpu_layers(0, 10, 20, 40), 0);
+        assert_eq!(engine_gpu_layers(0, false, 10, 20, 40), 0);
         // the whole middle range: everything from layer 10 up
-        assert_eq!(engine_gpu_layers(10, 10, 20, 40), 31);
-        assert_eq!(engine_gpu_layers(99, 10, 20, 40), 31);
+        assert_eq!(engine_gpu_layers(10, false, 10, 20, 40), 31);
+        assert_eq!(engine_gpu_layers(99, false, 10, 20, 40), 31);
         // the top four layers of the range
-        assert_eq!(engine_gpu_layers(4, 10, 20, 40), 25);
+        assert_eq!(engine_gpu_layers(4, false, 10, 20, 40), 25);
         // the final range: its layers and the output layer
-        assert_eq!(engine_gpu_layers(10, 30, 40, 40), 11);
-        assert_eq!(engine_gpu_layers(3, 30, 40, 40), 4);
+        assert_eq!(engine_gpu_layers(10, false, 30, 40, 40), 11);
+        assert_eq!(engine_gpu_layers(3, false, 30, 40, 40), 4);
+        // the output layer alone, only where the range holds it
+        assert_eq!(engine_gpu_layers(0, true, 30, 40, 40), 1);
+        assert_eq!(engine_gpu_layers(0, true, 10, 20, 40), 0);
     }
 }

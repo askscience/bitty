@@ -107,6 +107,10 @@ node:
   from the top of the range. More than the range holds means all of it.
 - `BITTY_STAGE_THREADS=N`: CPU threads of the engine (llama.cpp picks 4 when
   unset).
+- `BITTY_GPU_OUTPUT=1`: when the node holds the final stage and no block was
+  asked on the GPU, put the output layer alone there. It is the most expensive
+  single step of the model (47 ms against 64 for the last five-block stage of
+  the 35B model) and takes little video memory.
 - `GGML_VK_VISIBLE_DEVICES=0`: llama.cpp's own variable, to pick one card when
   the machine has several.
 
@@ -126,12 +130,21 @@ are loaded by the first request as before.
 
 The final stage sends the coordinator only the best 1024 logits, as pairs of
 token id and logit: a few KB per token where the whole vocabulary is about
-1 MB. `BITTY_TOP_LOGITS` changes the number; 0 sends everything. Sampling gives
-the same text as long as the number is not below `--top-k`.
+1 MB. The engine picks them itself (`bitty-stage --top-logits N`), so an engine
+built before this option has to be rebuilt. `BITTY_TOP_LOGITS` changes the
+number; 0 sends everything. Sampling gives the same text as long as the number
+is not below `--top-k`.
 
-Engines are started with `OMP_WAIT_POLICY=passive` unless the variable is
-already set, so a stage that waits for its turn does not keep the cores busy.
-See `docs/split-on-one-machine.md` for the measurements behind this.
+Engines are started with `GOMP_SPINCOUNT=1000` unless that variable or
+`OMP_WAIT_POLICY` is already set: idle threads spin briefly and then sleep.
+The libgomp default spins long enough to take the cores from the other stages
+of the same machine, and a fully passive wait costs 7 to 8 ms per call.
+
+`BITTY_TIMING=1` on the coordinator prints, after each request, the time per
+token spent in every worker.
+
+See `docs/split-on-one-machine.md` for the measurements behind all this.
+`engine/stage_ab.py` compares engine settings on one stage.
 
 ## Text and sampling
 
@@ -230,9 +243,10 @@ threads, one token at a time after a 16-token prompt.
 A fully offloaded 5-layer stage takes 2.9 GB of video memory. The sums leave out
 the network and the coordinator, so they are the ceiling for a chain of eight
 such peers, not a measured cluster speed. The same script with all 40 layers in
-one CPU process needs 357 ms per token, more than the eight separate stages
-together; the cause is not established (memory pressure from holding 21 GB of
-weights on a 32 GB machine, or heat, are the candidates).
+one CPU process needs 278 ms per token in a clean run, a little more than the
+eight separate stages together. Whole-model runs on this machine vary a lot
+(up to 420 ms), most likely from memory pressure with 21 GB of weights on a
+32 GB machine.
 
 ```sh
 BITTY_STAGE_BIN=build/bin/bitty-stage python3 engine/stage_bench.py cpu model.gguf 5

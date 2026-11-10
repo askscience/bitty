@@ -347,13 +347,14 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..a476c6f
+index 0000000..8e3afc7
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,502 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
++//               [--top-logits N]
 +//   bitty-stage -m model.gguf --vocab-only
 +//
 +// With --vocab-only no weights are loaded: the process only serves the text ops (5 to 8) and
@@ -373,7 +374,9 @@ index 0000000..a476c6f
 +//   2 DECODE_HIDDEN  payload = n_tokens * n_embd f32
 +//        `pos` is the position of the first token in the session; it must continue the session
 +//        (0 opens a new session). A non-final stage answers kind HIDDEN with n_tokens * n_embd
-+//        f32; the final stage answers kind LOGITS with the n_vocab f32 logits of the last token.
++//        f32; the final stage answers kind LOGITS with the n_vocab f32 logits of the last token,
++//        or with --top-logits N kind TOP_LOGITS: the N best as pairs of u32 token id and f32
++//        logit, best first (equal logits by token id), rows = number of pairs.
 +//   3 END            drops the session state
 +//   4 PING           answers kind NONE
 +//   5 TOKEN_TEXT     payload = token ids, answers kind BYTES with their UTF-8 text
@@ -391,15 +394,17 @@ index 0000000..a476c6f
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstdlib>
++#include <cmath>
 +#include <cstring>
 +#include <map>
++#include <numeric>
 +#include <string>
 +#include <vector>
 +
 +#include <unistd.h>
 +
 +enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8 };
-+enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4 };
++enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4, KIND_TOP_LOGITS = 5 };
 +
 +static const uint32_t PROTOCOL_VERSION = 1;
 +static const uint32_t MAX_PAYLOAD      = 1u << 30;
@@ -457,6 +462,7 @@ index 0000000..a476c6f
 +    int  n_layer = 0, n_embd = 0, n_vocab = 0;
 +    int  begin = 0, end = 0;
 +    int  n_batch = 512, n_ctx_seq = 4096, n_sessions = 4;
++    int  top_logits = 0; // 0 answers with the whole vocabulary
 +    bool first = false, last = false;
 +
 +    std::map<uint64_t, session> sessions;
@@ -596,6 +602,7 @@ index 0000000..a476c6f
 +        else if (a == "--ctx")      srv.n_ctx_seq  = atoi(argv[++i]);
 +        else if (a == "--sessions") srv.n_sessions = atoi(argv[++i]);
 +        else if (a == "--batch")    srv.n_batch    = atoi(argv[++i]);
++        else if (a == "--top-logits") srv.top_logits = atoi(argv[++i]);
 +        else {
 +            fprintf(stderr, "unknown argument %s\n", a.c_str());
 +            return 2;
@@ -605,7 +612,7 @@ index 0000000..a476c6f
 +        srv.begin = srv.end = 0;
 +    }
 +    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
-+        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512]\n"
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N]\n"
 +                        "       %s -m model.gguf --vocab-only\n", argv[0], argv[0]);
 +        return 2;
 +    }
@@ -661,6 +668,8 @@ index 0000000..a476c6f
 +
 +    std::vector<uint8_t> payload;
 +    std::vector<float>   result;
++    std::vector<uint32_t> order;
++    std::vector<uint8_t>  best;
 +    for (;;) {
 +        uint8_t head[24];
 +        if (!read_all(STDIN_FILENO, head, sizeof(head))) break; // parent closed the pipe
@@ -719,6 +728,26 @@ index 0000000..a476c6f
 +                    // the state may hold part of the request: the session cannot continue
 +                    srv.drop(sid);
 +                    ok = respond_error(out_fd, err);
++                    break;
++                }
++                if (srv.last && srv.top_logits > 0 && (size_t) srv.top_logits < result.size()) {
++                    // choosing here keeps a megabyte of logits per token out of the pipe and
++                    // out of the caller, whose thread has been asleep during the decode
++                    order.resize(result.size());
++                    std::iota(order.begin(), order.end(), 0u);
++                    order.erase(std::remove_if(order.begin(), order.end(),
++                            [&](uint32_t t) { return std::isnan(result[t]); }), order.end());
++                    const size_t keep = std::min((size_t) srv.top_logits, order.size());
++                    std::partial_sort(order.begin(), order.begin() + keep, order.end(),
++                            [&](uint32_t a, uint32_t b) {
++                                return result[a] != result[b] ? result[a] > result[b] : a < b;
++                            });
++                    best.resize(keep * 8);
++                    for (size_t i = 0; i < keep; ++i) {
++                        memcpy(best.data() + i * 8, &order[i], 4);
++                        memcpy(best.data() + i * 8 + 4, &result[order[i]], 4);
++                    }
++                    ok = respond(out_fd, 0, KIND_TOP_LOGITS, (uint32_t) keep, best.data(), best.size());
 +                    break;
 +                }
 +                ok = srv.last

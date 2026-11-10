@@ -56,7 +56,7 @@ results = []
 for start in range(0, LAYERS, STEP):
     end = min(start + STEP, LAYERS)
     gpu = mode == "gpu"
-    args = ["--start", str(start), "--end", str(end), "-t", "8"]
+    args = ["--start", str(start), "--end", str(end), "-t", os.environ.get("BENCH_THREADS", "8")]
     if gpu: args += ["--gpu-layers", str(LAYERS - start + 1)]
     t0 = time.time(); st = Stage(args); load = time.time() - t0
     op = 1 if start == 0 else 2

@@ -432,6 +432,9 @@ impl NetworkCoordinator {
 
         let mut outputs = Vec::with_capacity(max_new_tokens as usize);
         let mut failure = None;
+        // time spent waiting for each worker, prompt excluded: BITTY_TIMING=1 prints it
+        let mut hop_micros = vec![0u64; worker_clients.len()];
+        let generation_started = Instant::now();
         for token_position in 0..max_new_tokens {
             let started = Instant::now();
             let payload = current_input
@@ -448,9 +451,15 @@ impl NetworkCoordinator {
                 payload,
             );
 
-            for client in &mut worker_clients {
+            for (index, client) in worker_clients.iter_mut().enumerate() {
+                let hop_started = Instant::now();
                 match client.forward_activation(&activation).await {
-                    Ok(output) => activation = output,
+                    Ok(output) => {
+                        if token_position > 0 {
+                            hop_micros[index] += hop_started.elapsed().as_micros() as u64;
+                        }
+                        activation = output
+                    }
                     Err(err) => {
                         failure = Some(err);
                         break;
@@ -531,6 +540,31 @@ impl NetworkCoordinator {
             if finished {
                 break;
             }
+        }
+
+        if std::env::var_os("BITTY_TIMING").is_some() && outputs.len() > 1 {
+            let steps = (outputs.len() - 1) as f64;
+            let hops: Vec<String> = assignments
+                .iter()
+                .zip(&hop_micros)
+                .map(|(assignment, micros)| {
+                    format!(
+                        "{} {}..{} {:.1}",
+                        assignment.node_id.0,
+                        assignment.range.start_layer,
+                        assignment.range.end_layer_exclusive,
+                        *micros as f64 / steps / 1000.0
+                    )
+                })
+                .collect();
+            let in_hops = hop_micros.iter().sum::<u64>() as f64 / steps / 1000.0;
+            println!(
+                "timing: {} tokens in {:.1}s; ms per token after the first: workers {:.1} [{}]",
+                outputs.len(),
+                generation_started.elapsed().as_secs_f64(),
+                in_hops,
+                hops.join(", ")
+            );
         }
 
         for client in &mut worker_clients {

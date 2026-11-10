@@ -6,11 +6,14 @@ looks worth working on and, just as carefully, what has not been shown yet.
 ## The finding in one paragraph
 
 Qwen3.5-35B-A3B (Q4_K_M, 21 GB, 40 blocks) run as eight stages of five blocks,
-each stage **measured alone**, costs less per token than the same 40 blocks in
-one process. On CPU the eight stages add up to about 255 ms per token (3.9
-tokens/s) against 357 ms (2.8 tokens/s) for the whole model in one engine. With
+each stage **measured alone**, costs about the same per token as the 40 blocks
+in one process. On CPU the eight stages add up to about 255 ms per token (3.9
+tokens/s); the whole model in one engine needs about 278 ms in a clean run. With
 each stage fully on the GPU the eight add up to about 100 ms per token (10
 tokens/s).
+
+An earlier version of these notes said one process needs 357 ms and is clearly
+slower than its parts. That was noise: see "Optimisation round" below.
 
 That last figure is the sum of stages measured one after the other. It is what
 eight peers with an 8 GB GPU each would compute, before network time. This
@@ -65,7 +68,9 @@ The run with 400 tokens per stage is there to rule out a short burst before the
 CPU heats up: the figures hold.
 
 A stage fully on the GPU takes about 2.9 GB of video memory. All 40 blocks in
-one CPU engine on the same bench: 357 ms per token.
+one CPU engine on the same bench: 357 ms per token in the first run, 278 ms in
+a later clean one (whole-model runs on this machine swing between 280 and 420
+ms, see below).
 
 ## What this does and does not show
 
@@ -79,19 +84,25 @@ Shown:
   mid-range laptop GPU it runs about 2.5 times faster than on eight CPU cores.
 - Idle engines must sleep. With the default OpenMP wait policy the threads of
   the seven waiting stages keep spinning and take the cores from the working
-  one: 74 s against 47 s. `bitty` now starts every engine with
-  `OMP_WAIT_POLICY=passive` unless the variable is already set.
+  one: 74 s against 47 s with `OMP_WAIT_POLICY=passive`. Fully passive threads
+  turned out to cost 7 to 8 ms per stage call, so `bitty` now starts every
+  engine with a short spin (`GOMP_SPINCOUNT=1000`): 39 s.
 
 Not shown:
 
 - Ten tokens/s on this machine. It is a projection for eight GPUs.
 - That separate stages really beat one process on CPU when they run as a
   cluster. Alone they sum to 255 ms per token, but the real eight-node run
-  needs about 390 ms per token (47.1 s for 120 tokens, with about 5 s for the
-  prompt). The gap between 255 and 390 is not explained yet.
+  needed about 390 ms per token (47.1 s for 120 tokens, with about 5 s for the
+  prompt). After the optimisation round below it needs 305 ms; the rest of the
+  gap is about 5 ms per hop.
 - Anything about a real network. All nodes were on `127.0.0.1`.
 
 ## Open questions, with the experiment for each
+
+Questions 1, 2, 3 and 6 were worked on after this list was written: the answers
+so far are in "Optimisation round" and "First run over the Internet" below. The
+list is kept as it was.
 
 1. **Why is one 40-block process slower than the sum of its parts (357 vs 255
    ms)?** Guesses: memory. 21 GB of weights on a 32 GB machine with a desktop
@@ -124,6 +135,120 @@ Not shown:
 6. **Network cost per hop.** 2048 floats are 8 KB per token per hop, and the
    last stage sends about 1 MB of logits. On a home link the logits dominate:
    send only the top values (the sampler uses top-k 20 by default).
+
+## Optimisation round (2026-11-10, later the same day)
+
+Different techniques tried one at a time. Unless noted: CPU build, 8 threads,
+stage 10..15 of the 35B model, median ms per token over 60 tokens, measured
+with `engine/stage_ab.py`, which runs the variants in turn and repeats within
+0.3 ms.
+
+### Threads of one stage
+
+| Variant | ms per token |
+|---|---|
+| default (libgomp spins for a while after each parallel region) | 27.4 |
+| `OMP_WAIT_POLICY=active` | 27.4 |
+| `OMP_PLACES=cores OMP_PROC_BIND=close` | 27.6 |
+| `OMP_WAIT_POLICY=passive` | 35.0 |
+| cores bound and passive | 32.7 |
+| 4 threads | 34 |
+| 6 threads | 29.2 |
+| 12 threads | 26.1 |
+| 16 threads | 47 |
+| `GOMP_SPINCOUNT=100` | 32.7 |
+| `GOMP_SPINCOUNT=1000` | 28.6 to 29.2 |
+| `GOMP_SPINCOUNT=10000` | 28.0 to 28.7 |
+| `GOMP_SPINCOUNT=50000` | 27.6 |
+
+Binding threads to cores does nothing. Passive waiting is expensive because the
+threads go to sleep at every barrier inside one token, not only between
+requests. Twelve threads on eight cores give 5%; sixteen are a disaster.
+
+### The eight-node cluster, 120 tokens
+
+| Variant | Seconds |
+|---|---|
+| default spinning (earlier run) | 74.3 |
+| `OMP_WAIT_POLICY=passive` | 46.1 |
+| `GOMP_SPINCOUNT=50000` | 44.9 |
+| `GOMP_SPINCOUNT=10000` | 43.3 |
+| `GOMP_SPINCOUNT=1000` (now the default) | 39.3 |
+| the same, final stage picks the best logits itself | 39.0 |
+
+One run each. With many stages on one machine a long spin steals the cores of
+the stage that works, a sleep costs wake-ups inside every token; a spin of
+about a thousand iterations is the best of the values tried. On peers with one
+stage each the choice matters less, and `GOMP_SPINCOUNT` or `OMP_WAIT_POLICY`
+set by hand are left alone.
+
+`BITTY_TIMING=1` on the coordinator prints the time of each hop. With the
+defaults: 305 ms per token in the workers, 32 to 37 ms for each of the first
+seven hops (the engine alone needs 27.5) and 66 for the last (engine alone 59
+to 64).
+
+### Where the time of a hop goes outside the engine
+
+Measured with temporary timers on one node with the 0.8B model: the engine call
+took 60 ms and the worker 67 to 70. The 7 to 8 ms between them were spent on
+the megabyte of logits: two conversions, a checksum and the choice of the best
+1024. This is much slower than the same code should be, and the reason is
+probably the CPU frequency: the machine uses the `powersave` governor, the
+thread that receives the reply has slept during the whole decode, and it wakes
+on a core at 800 MHz. The idle-gap test supports the engine side of this (a 250
+ms pause between calls costs the engine only 1 ms, its threads spin up
+quickly), the frequency of the receiving thread was not measured directly.
+
+The fix does not depend on the cause: the engine now picks the best logits
+itself (`--top-logits`), in the thread that has just done the decode, and
+sends 8 KB through the pipe. One node, 0.8B: 69 to 63 ms per token, the engine
+alone 60. Eight nodes, 35B: the last hop went from 71 to 66 ms.
+
+The same effect probably explains most of the 5 ms that every other hop adds
+to its engine. Things to try: the `performance` governor (needs root, not
+changed here), or fewer and cheaper steps on the receiving side.
+
+### Output layer on the GPU
+
+The last stage does the output projection over 248320 tokens, which is why it
+costs twice the others. Last stage 35..40 alone, Vulkan build:
+
+| Layers on the GPU | ms per token |
+|---|---|
+| none | 64.5 |
+| output layer only (`--gpu-layers 1`) | 46.8 |
+| output layer and one block | 39.9 |
+| output layer and two blocks | 35.3 |
+
+`BITTY_GPU_OUTPUT=1` on a node asks for the first row: the output layer on the
+GPU when the node holds the final stage, with no block there. In the
+eight-node cluster the last hop went from 66 to 49 ms. The whole run was not
+faster (41.5 s against 39.0) because all eight nodes used the Vulkan build and
+its CPU-only stages were slower in that run (37 to 41 ms a hop against 32 to
+37); the run with the Vulkan build on the last node only has not been done.
+
+### One process against its parts, again
+
+Clean run of `stage_bench.py`, sum of the stages in ms per token: stages of 5
+blocks 248 to 258, of 10 blocks 248, of 20 blocks 263, all 40 in one process
+278. A/B runs of the whole model swing from 310 to 420 ms with prompt times
+from 4.6 to 17 s, on a machine where 21 GB of weights leave little page cache
+next to a desktop. So one process is at most a little slower than its parts,
+and the 357 ms of the first notes was a bad run.
+
+### Starting a client
+
+`bitty status` and `bitty generate` through an invite waited about 3.5 s for
+their own relay connection before dialling. An invite already carries the
+relay and the addresses of the node, so the wait is now skipped: status takes
+0.05 s on the same machine and 1.1 s with a relay-only invite. Not yet
+repeated between two machines.
+
+### The small model on one node
+
+Qwen3.5-0.8B on one node needed about 83 ms per token with the default 4
+threads and 69 with 8; the engine alone 72 and 58. With the logits fix: 63 ms
+with 8 threads.
 
 ## How to repeat
 

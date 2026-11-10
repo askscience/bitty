@@ -20,6 +20,7 @@ const OP_EOG_TOKENS: u32 = 8;
 
 const KIND_HIDDEN: u32 = 1;
 const KIND_LOGITS: u32 = 2;
+const KIND_TOP_LOGITS: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum StageProcessError {
@@ -71,6 +72,8 @@ pub struct StageProcessConfig {
     pub context: u32,
     /// Sessions the stage keeps state for at the same time.
     pub sessions: u32,
+    /// How many logits the final stage answers with, best first; 0 asks for the whole vocabulary.
+    pub top_logits: u32,
 }
 
 /// Output of one decode call.
@@ -80,6 +83,10 @@ pub enum StageOutput {
     Hidden(Vec<f32>),
     /// `vocab_size` logits of the last token; only the final stage returns them.
     Logits(Vec<f32>),
+    /// The best logits of the last token in the wire form of
+    /// [`crate::sampling::encode_top_logits`]; the final stage returns them when it was started
+    /// with a limit.
+    TopLogits(Vec<u8>),
 }
 
 /// One running `bitty-stage` child. Calls block; the process dies with this value.
@@ -111,6 +118,9 @@ impl StageProcess {
         if config.threads > 0 {
             command.arg("-t").arg(config.threads.to_string());
         }
+        if config.top_logits > 0 {
+            command.arg("--top-logits").arg(config.top_logits.to_string());
+        }
         Self::start(command, &config.engine)
     }
 
@@ -128,11 +138,16 @@ impl StageProcess {
         } else {
             Stdio::null()
         };
-        // An engine that waits for its turn must sleep. By default the OpenMP threads of
-        // llama.cpp keep spinning after a batch, and on a machine that runs several stages
-        // they steal the cores from the stage that is working.
-        if std::env::var_os("OMP_WAIT_POLICY").is_none() {
-            command.env("OMP_WAIT_POLICY", "passive");
+        // An engine that waits for its turn must get out of the way. By default the OpenMP
+        // threads of llama.cpp spin for milliseconds after every batch, and on a machine that
+        // runs several stages they take the cores from the stage that is working. Sleeping at
+        // once (OMP_WAIT_POLICY=passive) is no answer: the threads then also sleep at every
+        // barrier inside a batch, which costs about 8 ms per token and stage. A short spin
+        // keeps the barriers fast and frees the cores within microseconds.
+        if std::env::var_os("OMP_WAIT_POLICY").is_none()
+            && std::env::var_os("GOMP_SPINCOUNT").is_none()
+        {
+            command.env("GOMP_SPINCOUNT", "1000");
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -214,6 +229,13 @@ impl StageProcess {
         payload: &[u8],
     ) -> Result<StageOutput, StageProcessError> {
         let (kind, _, bytes) = self.call(op, session, position, tokens, payload)?;
+        if kind == KIND_TOP_LOGITS {
+            return if bytes.len() % 8 == 0 {
+                Ok(StageOutput::TopLogits(bytes))
+            } else {
+                Err(StageProcessError::BadReply)
+            };
+        }
         let values = bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))

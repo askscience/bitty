@@ -149,26 +149,37 @@ pub fn top_logits_limit() -> usize {
 
 /// The `limit` best logits as pairs of token and logit, best first.
 pub fn top_logits(logits: &[f32], limit: usize) -> Vec<(u32, f32)> {
+    // Find the logit at rank `limit` on a plain copy first: with a vocabulary of a quarter of a
+    // million tokens, building and ordering a pair for every token costs milliseconds per token.
+    let mut threshold = f32::NEG_INFINITY;
+    if limit > 0 && limit < logits.len() {
+        let mut values: Vec<f32> = logits.iter().copied().filter(|logit| !logit.is_nan()).collect();
+        if limit < values.len() {
+            let (_, nth, _) = values.select_nth_unstable_by(limit - 1, |a, b| b.total_cmp(a));
+            threshold = *nth;
+        }
+    }
     let mut candidates: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
-        .filter(|(_, logit)| !logit.is_nan())
+        .filter(|(_, logit)| !logit.is_nan() && **logit >= threshold)
         .map(|(token, logit)| (token as u32, *logit))
         .collect();
-    if limit > 0 && limit < candidates.len() {
-        candidates.select_nth_unstable_by(limit - 1, by_logit);
+    candidates.sort_unstable_by(by_logit);
+    if limit > 0 {
         candidates.truncate(limit);
     }
-    candidates.sort_unstable_by(by_logit);
     candidates
 }
 
 /// Wire form of [`top_logits`]: little-endian u32 token id and f32 logit for each pair.
 pub fn encode_top_logits(pairs: &[(u32, f32)]) -> Vec<u8> {
-    pairs
-        .iter()
-        .flat_map(|(token, logit)| token.to_le_bytes().into_iter().chain(logit.to_le_bytes()))
-        .collect()
+    let mut bytes = Vec::with_capacity(pairs.len() * 8);
+    for (token, logit) in pairs {
+        bytes.extend_from_slice(&token.to_le_bytes());
+        bytes.extend_from_slice(&logit.to_le_bytes());
+    }
+    bytes
 }
 
 pub fn decode_top_logits(payload: &[u8]) -> Option<Vec<(u32, f32)>> {

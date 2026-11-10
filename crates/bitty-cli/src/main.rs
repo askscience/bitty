@@ -1302,7 +1302,7 @@ fn request_with_token<T>(message: T, token: &str) -> tonic::Request<T> {
 async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
     if let Some(target) = iroh_transport::parse_iroh_target(&node) {
-        let endpoint = start_iroh_client().await?;
+        let endpoint = start_iroh_client(target.endpoint_addr.is_empty()).await?;
         let client = IrohSchedulerClient {
             endpoint,
             remote: target.endpoint_addr,
@@ -1440,7 +1440,7 @@ async fn fetch_cluster_status(
 ) -> Result<ClusterStatusResponse, Box<dyn std::error::Error>> {
     let node = resolve_cluster_node(node.unwrap_or(""), data_dir)?;
     let status = if let Some(target) = iroh_transport::parse_iroh_target(&node) {
-        let endpoint = start_iroh_client().await?;
+        let endpoint = start_iroh_client(target.endpoint_addr.is_empty()).await?;
         let client = IrohSchedulerClient {
             endpoint,
             remote: target.endpoint_addr,
@@ -2094,7 +2094,10 @@ async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::er
     })
 }
 
-async fn start_iroh_client() -> Result<Endpoint, Box<dyn std::error::Error>> {
+/// A client that only dials out. `wait_until_online` holds it until its own relay connection is
+/// up, which takes a few seconds: only needed when the target comes without any address and has
+/// to be looked up.
+async fn start_iroh_client(wait_until_online: bool) -> Result<Endpoint, Box<dyn std::error::Error>> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![
@@ -2103,7 +2106,9 @@ async fn start_iroh_client() -> Result<Endpoint, Box<dyn std::error::Error>> {
         ])
         .bind()
         .await?;
-    let _ = timeout(Duration::from_secs(10), endpoint.online()).await;
+    if wait_until_online {
+        let _ = timeout(Duration::from_secs(10), endpoint.online()).await;
+    }
     Ok(endpoint)
 }
 
