@@ -12,7 +12,8 @@ use bitty_protocol::endpoint::normalize_endpoint;
 use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
     SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_REGISTER_WORKER,
-    WORKER_APPLY_TOPOLOGY, WORKER_CLEANUP, WORKER_FINAL_LOGITS, WORKER_FORWARD_ACTIVATION,
+    WORKER_APPLY_TOPOLOGY, WORKER_AWAIT_CHAIN_RESULT, WORKER_CLEANUP, WORKER_FINAL_LOGITS,
+    WORKER_FORWARD_ACTIVATION, WORKER_FORWARD_CHAIN,
     WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
 };
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
@@ -21,7 +22,7 @@ use bitty_protocol::pb::worker_service_server::WorkerService;
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, CleanupRequest, ClusterStatusRequest,
     ClusterStatusResponse, GenerateRequest, GenerateResponse, HeartbeatRequest, HeartbeatResponse,
-    LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
+    ChainResultRequest, ChainStep, LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
     TopologyUpdate,
 };
 use bitty_protocol::security::{
@@ -406,8 +407,11 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         executor = executor.with_stage_source(source);
     }
     let executor = Arc::new(executor);
-    let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
+    let mut worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
         .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
+    if let Some(iroh_node) = &iroh_node {
+        worker = worker.with_iroh_endpoint(iroh_node.endpoint.clone());
+    }
     let worker_stats = worker.runtime_stats();
     if let Some(join) = &config.join {
         remember_active_cluster(&data_dir, join)?;
@@ -2278,6 +2282,20 @@ async fn handle_worker_frame(
                 .cleanup(request_with_token(request, cluster_token))
                 .await?;
             IrohFrame::message(WORKER_CLEANUP, "", &response.into_inner())
+        }
+        WORKER_FORWARD_CHAIN => {
+            let request: ChainStep = frame.decode_message(WORKER_FORWARD_CHAIN)?;
+            let response = worker
+                .forward_chain(request_with_token(request, cluster_token))
+                .await?;
+            IrohFrame::message(WORKER_FORWARD_CHAIN, "", &response.into_inner())
+        }
+        WORKER_AWAIT_CHAIN_RESULT => {
+            let request: ChainResultRequest = frame.decode_message(WORKER_AWAIT_CHAIN_RESULT)?;
+            let response = worker
+                .await_chain_result(request_with_token(request, cluster_token))
+                .await?;
+            IrohFrame::message(WORKER_AWAIT_CHAIN_RESULT, "", &response.into_inner())
         }
         _ => return Err(format!("unknown worker op {}", frame.op).into()),
     };

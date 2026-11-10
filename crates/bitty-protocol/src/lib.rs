@@ -16,6 +16,7 @@ pub mod logits_codec;
 pub mod registration;
 pub mod security;
 pub mod validation;
+pub mod worker_client;
 
 /// Wire compatibility: bump when changing registration or tensor encoding contract.
 pub const BITTY_PROTOCOL_VERSION: u32 = 1;

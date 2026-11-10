@@ -11,6 +11,7 @@ async-trait.workspace = true
 bitty-inference.workspace = true
 bitty-model.workspace = true
 bitty-protocol.workspace = true
+iroh.workspace = true
 metrics.workspace = true
 nvml-wrapper.workspace = true
 serde.workspace = true

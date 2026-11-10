@@ -185,6 +185,35 @@ message SampleTokenRequest {
   bool finished = 3;
 }
 
+// One token on its way through the workers. Each worker runs its layers and hands the
+// result to the next one itself, so the data crosses the network once per worker and not
+// twice.
+message ChainStep {
+  ActivationTensor activation = 1;
+  // Endpoints of the workers that come after the receiver, in order. Empty for the last.
+  repeated string route = 2;
+  // Set when a worker failed: the step then goes straight to the last worker, which
+  // hands the error to the coordinator.
+  string error = 3;
+  // Time each worker so far spent on its layers, in microseconds.
+  repeated uint64 hop_micros = 4;
+}
+
+message ChainAck {
+  bool accepted = 1;
+}
+
+message ChainResultRequest {
+  string request_id = 1;
+  uint32 token_position = 2;
+}
+
+message ChainResult {
+  ActivationTensor activation = 1;
+  string error = 2;
+  repeated uint64 hop_micros = 3;
+}
+
 service CoordinatorService {
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -200,4 +229,8 @@ service WorkerService {
   rpc ApplyTopology(TopologyUpdate) returns (HeartbeatResponse);
   rpc LoadShard(LoadShardRequest) returns (LoadShardResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+  // Takes a step, answers at once, then runs the layers and passes the result on.
+  rpc ForwardChain(ChainStep) returns (ChainAck);
+  // Asked of the last worker: answers when the token has come through the whole route.
+  rpc AwaitChainResult(ChainResultRequest) returns (ChainResult);
 }

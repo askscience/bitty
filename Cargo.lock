@@ -406,6 +406,7 @@ dependencies = [
  "bitty-inference",
  "bitty-model",
  "bitty-protocol",
+ "iroh",
  "metrics",
  "nvml-wrapper",
  "serde",

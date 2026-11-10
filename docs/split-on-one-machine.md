@@ -325,6 +325,37 @@ one) the gain is larger. The weak point is the draft itself: the 0.8B model
 needs 62 ms per token on CPU and 39 on this GPU, a large share of it in the
 output layer over 248320 tokens.
 
+## From worker to worker (2026-11-10)
+
+Until now every worker answered the coordinator, which then called the next
+one: two trips over the network per worker and token. Now each worker hands
+its result to the next, and only the last answers the coordinator: one trip
+per worker plus one. `engine/README.md` describes the mechanism and the
+fallback.
+
+On one machine there is almost no network, so this only checks that nothing
+is lost. The text is the same byte for byte in every case below (seed 7, 120
+tokens).
+
+| Cluster | Through the coordinator | Worker to worker |
+| --- | --- | --- |
+| 35B, eight nodes, gRPC | 39.5 s, 307.5 ms per token | 37.9 s, 294.5 ms per token |
+| 0.8B, four nodes, gRPC | 77.3 to 77.8 ms per token | 75.9 to 77.3 |
+| 0.8B, three nodes, iroh | 73.6 to 75.3 | 73.2 to 76.1 |
+
+In the eight-node run the workers count 287.7 ms of their own per token, so
+everything else (nine trips, sampling, text) is 6.8 ms. One run each: the 4%
+on the 35B is in the range of the run to run noise seen before.
+
+The fallback was tried with a node of the previous version in a four-node
+cluster, once as first worker and twice in the middle. Each time the first
+request started again through the coordinator and gave the same text.
+
+Not measured: two machines. The gain is the network time of the trips that
+are gone, so it shows only there. Not tried: an old node as the last worker, a
+worker that dies during a token, workers that cannot reach each other across
+two home networks (the fallback is the same code as for the old node).
+
 ## How to repeat
 
 ```sh

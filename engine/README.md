@@ -140,8 +140,27 @@ Engines are started with `GOMP_SPINCOUNT=1000` unless that variable or
 The libgomp default spins long enough to take the cores from the other stages
 of the same machine, and a fully passive wait costs 7 to 8 ms per call.
 
+A token goes from worker to worker: the coordinator gives it to the first,
+each worker runs its layers and hands the result to the next one itself, and
+the last one keeps the logits for the coordinator, which has been waiting on
+it since the token left. The data crosses the network once per worker plus
+once, where it used to go back to the coordinator after every worker (twice
+per worker). The workers reach each other at the addresses the coordinator
+knows them by, so they have to be reachable from one another, not only from
+the coordinator.
+
+If a worker cannot hand over the first token of a request (no route to the
+next one, or a node with an older version), the coordinator says so in its
+log, starts the request again with every worker answering it directly, and
+keeps doing so until a node joins or leaves. `BITTY_CHAIN=0` on the
+coordinator asks for that from the start. A worker that dies in the middle of
+a token is noticed only by a timeout, 10 minutes unless
+`BITTY_CHAIN_TIMEOUT_SECS` says otherwise.
+
 `BITTY_TIMING=1` on the coordinator prints, after each request, the time per
-token spent in every worker.
+token, the part of it spent in every worker, and which of the two ways was
+used. From worker to worker the workers count their own time; through the
+coordinator it is the coordinator's wait, so it includes the network.
 
 See `docs/split-on-one-machine.md` for the measurements behind all this.
 `engine/stage_ab.py` compares engine settings on one stage.

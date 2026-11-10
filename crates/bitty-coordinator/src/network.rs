@@ -12,7 +12,7 @@ use bitty_protocol::pb::coordinator_service_server::{
     CoordinatorService, CoordinatorServiceServer,
 };
 use bitty_protocol::pb::{
-    ActivationTensor as ProtoActivationTensor, ClusterStatusRequest, ClusterStatusResponse,
+    ActivationTensor as ProtoActivationTensor, ChainStep, ClusterStatusRequest, ClusterStatusResponse,
     GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
     RegisterWorkerRequest, RegisterWorkerResponse,
     ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
@@ -53,6 +53,44 @@ pub struct NetworkCoordinator {
     /// Held while shards are being loaded, so a request waits for a running preparation
     /// instead of asking the same workers twice.
     prepare_lock: Arc<Mutex<()>>,
+    /// The topology in which the workers could not pass a token to each other. While it
+    /// lasts, every worker answers the coordinator instead.
+    chain_broken: Arc<Mutex<Option<String>>>,
+}
+
+/// `BITTY_CHAIN=0` makes every worker answer the coordinator, as it was before the workers
+/// learned to pass the result to each other.
+fn chain_wanted() -> bool {
+    std::env::var("BITTY_CHAIN")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// How long the coordinator waits for a token that is going from worker to worker.
+/// `BITTY_CHAIN_TIMEOUT_SECS` changes it. It has to cover a long prompt on slow machines.
+fn chain_timeout() -> Duration {
+    let seconds = std::env::var("BITTY_CHAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(600);
+    Duration::from_secs(seconds)
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let rest = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = match authority.strip_prefix('[') {
+        Some(inner) => inner.split(']').next().unwrap_or(inner),
+        None => authority.rsplit_once(':').map_or(authority, |(host, _)| host),
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// How long the topology has to stay unchanged before the workers are asked to load their
@@ -80,6 +118,7 @@ impl NetworkCoordinator {
             shard_cache: Arc::new(Mutex::new(HashMap::new())),
             text_codec: Arc::new(Mutex::new(None)),
             prepare_lock: Arc::new(Mutex::new(())),
+            chain_broken: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -378,6 +417,82 @@ impl NetworkCoordinator {
         Ok(outputs)
     }
 
+    /// The endpoints the workers use to reach each other, in the order of the layers, or
+    /// `None` when the tokens have to go through the coordinator.
+    async fn chain_route(
+        &self,
+        assignments: &[bitty_protocol::LayerAssignment],
+    ) -> Option<Vec<String>> {
+        if !chain_wanted() || assignments.len() < 2 {
+            return None;
+        }
+        if self.chain_broken.lock().await.as_deref() == Some(self.epoch().await.as_str()) {
+            return None;
+        }
+        let registry = self.registry.lock().await;
+        let mut route = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            let endpoint = registry.profile(&assignment.node_id)?.worker_endpoint;
+            // the worker beside an iroh coordinator is reached on the loopback address,
+            // which is another machine for everybody else: they get the iroh address
+            let endpoint = match &self.iroh_endpoint {
+                Some(iroh) if is_loopback_endpoint(&endpoint) => bitty_protocol::iroh_transport::iroh_uri(
+                    iroh.id(),
+                    self.cluster_token.as_deref().unwrap_or_default(),
+                ),
+                _ => endpoint,
+            };
+            route.push(endpoint);
+        }
+        Some(route)
+    }
+
+    /// Sends one token through the workers: the first gets it from here, each hands its
+    /// result to the next, and the last one keeps the logits for the coordinator. Returns
+    /// them with the time each worker spent on its layers.
+    async fn chain_token(
+        worker_clients: &mut [WorkerRpcClient],
+        route: &[String],
+        activation: &ActivationTensor,
+    ) -> Result<(ActivationTensor, Vec<u64>), Status> {
+        let (first, rest) = worker_clients
+            .split_first_mut()
+            .ok_or_else(|| Status::failed_precondition("no workers registered"))?;
+        let last = rest
+            .last_mut()
+            .ok_or_else(|| Status::failed_precondition("a chain needs two workers"))?;
+        let step = ChainStep {
+            activation: Some(ProtoActivationTensor::from(activation)),
+            route: route[1..].to_vec(),
+            error: String::new(),
+            hop_micros: Vec::new(),
+        };
+        let limit = chain_timeout();
+        let wait = async {
+            tokio::time::timeout(
+                limit,
+                last.await_chain_result(&activation.request_id, activation.token_position),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Status::deadline_exceeded(format!(
+                    "no answer from the workers in {} seconds",
+                    limit.as_secs()
+                )))
+            })
+        };
+        let (_, result) = tokio::try_join!(first.forward_chain(step), wait)?;
+        if !result.error.is_empty() {
+            return Err(Status::internal(result.error));
+        }
+        let output = result
+            .activation
+            .ok_or_else(|| Status::internal("the last worker returned no result"))?;
+        let output =
+            ActivationTensor::try_from(output).map_err(|err| Status::internal(err.to_string()))?;
+        Ok((output, result.hop_micros))
+    }
+
     async fn remote_generate_tokens(
         &self,
         request: ProtoGenerateRequest,
@@ -430,19 +545,27 @@ impl NetworkCoordinator {
 
         let mut worker_clients = self.prepare_workers(&assignments, model_path).await?;
 
+        let mut route = self.chain_route(&assignments).await;
+        // the name the workers know the request by; it changes when the request starts again
+        let mut run_id = request_id.clone();
+
         let mut outputs = Vec::with_capacity(max_new_tokens as usize);
         let mut failure = None;
-        // time spent waiting for each worker, prompt excluded: BITTY_TIMING=1 prints it
+        // prompt excluded, BITTY_TIMING=1 prints them: the time of each worker (its own
+        // count when the workers pass the token on, else the wait of the coordinator for
+        // it), and the whole time of the tokens
         let mut hop_micros = vec![0u64; worker_clients.len()];
+        let mut token_micros = 0u64;
         let generation_started = Instant::now();
-        for token_position in 0..max_new_tokens {
+        let mut token_position = 0;
+        while token_position < max_new_tokens {
             let started = Instant::now();
             let payload = current_input
                 .iter()
                 .flat_map(|token| token.to_le_bytes())
                 .collect::<Vec<_>>();
             let mut activation = ActivationTensor::new(
-                request_id.clone(),
+                run_id.clone(),
                 token_position,
                 0,
                 0,
@@ -451,23 +574,66 @@ impl NetworkCoordinator {
                 payload,
             );
 
-            for (index, client) in worker_clients.iter_mut().enumerate() {
-                let hop_started = Instant::now();
-                match client.forward_activation(&activation).await {
-                    Ok(output) => {
+            if let Some(endpoints) = &route {
+                match Self::chain_token(&mut worker_clients, endpoints, &activation).await {
+                    Ok((output, micros)) => {
                         if token_position > 0 {
-                            hop_micros[index] += hop_started.elapsed().as_micros() as u64;
+                            for (total, micros) in hop_micros.iter_mut().zip(micros) {
+                                *total += micros;
+                            }
                         }
-                        activation = output
+                        activation = output;
+                    }
+                    // Nothing has been produced yet and no worker is still busy, so the
+                    // request can start again the old way. After a timeout a worker may
+                    // still be busy, and later in the text the workers hold a state
+                    // that cannot be replayed.
+                    Err(err)
+                        if token_position == 0
+                            && err.code() != tonic::Code::DeadlineExceeded =>
+                    {
+                        eprintln!(
+                            "bitty-coordinator: the workers could not pass the token to each other ({}); every worker answers the coordinator until the cluster changes",
+                            bitty_protocol::worker_client::status_text(&err)
+                        );
+                        *self.chain_broken.lock().await = Some(self.epoch().await);
+                        route = None;
+                        // a worker may still hold, or still be about to build, the state
+                        // of the failed attempt: the new one must not meet it
+                        for client in &mut worker_clients {
+                            let _ = client
+                                .cleanup(bitty_protocol::pb::CleanupRequest {
+                                    request_id: run_id.clone(),
+                                })
+                                .await;
+                        }
+                        run_id = format!("{request_id}-direct");
+                        continue;
                     }
                     Err(err) => {
                         failure = Some(err);
                         break;
                     }
                 }
-            }
-            if failure.is_some() {
-                break;
+            } else {
+                for (index, client) in worker_clients.iter_mut().enumerate() {
+                    let hop_started = Instant::now();
+                    match client.forward_activation(&activation).await {
+                        Ok(output) => {
+                            if token_position > 0 {
+                                hop_micros[index] += hop_started.elapsed().as_micros() as u64;
+                            }
+                            activation = output
+                        }
+                        Err(err) => {
+                            failure = Some(err);
+                            break;
+                        }
+                    }
+                }
+                if failure.is_some() {
+                    break;
+                }
             }
 
             // the final stage answers with the logits of the last token: the best ones, or
@@ -529,6 +695,10 @@ impl NetworkCoordinator {
                 log_prob: sampled.log_prob,
                 gen_latency_us: started.elapsed().as_micros() as u64,
             };
+            if token_position > 0 {
+                token_micros += started.elapsed().as_micros() as u64;
+            }
+            token_position += 1;
             current_input.clear();
             current_input.push(sampled.token);
             if let Some(sender) = &sender {
@@ -559,9 +729,15 @@ impl NetworkCoordinator {
                 .collect();
             let in_hops = hop_micros.iter().sum::<u64>() as f64 / steps / 1000.0;
             println!(
-                "timing: {} tokens in {:.1}s; ms per token after the first: workers {:.1} [{}]",
+                "timing ({}): {} tokens in {:.1}s; ms per token after the first: {:.1}, of which workers {:.1} [{}]",
+                if route.is_some() {
+                    "worker to worker"
+                } else {
+                    "through the coordinator"
+                },
                 outputs.len(),
                 generation_started.elapsed().as_secs_f64(),
+                token_micros as f64 / steps / 1000.0,
                 in_hops,
                 hops.join(", ")
             );
@@ -570,9 +746,16 @@ impl NetworkCoordinator {
         for client in &mut worker_clients {
             let _ = client
                 .cleanup(bitty_protocol::pb::CleanupRequest {
-                    request_id: request_id.clone(),
+                    request_id: run_id.clone(),
                 })
                 .await;
+            if run_id != request_id {
+                let _ = client
+                    .cleanup(bitty_protocol::pb::CleanupRequest {
+                        request_id: request_id.clone(),
+                    })
+                    .await;
+            }
         }
 
         match failure {
@@ -756,6 +939,15 @@ impl CoordinatorService for NetworkCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_endpoints_are_recognised() {
+        assert!(is_loopback_endpoint("127.0.0.1:50061"));
+        assert!(is_loopback_endpoint("http://localhost:50061"));
+        assert!(is_loopback_endpoint("[::1]:50061"));
+        assert!(!is_loopback_endpoint("192.168.1.20:50061"));
+        assert!(!is_loopback_endpoint("iroh://abc?token=secret"));
+    }
 
     #[tokio::test]
     async fn reference_generate_is_deterministic() {
