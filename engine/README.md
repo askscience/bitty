@@ -146,8 +146,9 @@ different machines yet.
 - The final stage sends the full logits (about 1 MB per token for this
   vocabulary) to the coordinator; sending only the most likely ones would cut
   that for slow links.
-- `bitty run --local` and `bitty chat` are not wired to the engine yet; use
-  `bitty generate` against a cluster.
+- `bitty run --local` is not wired to the engine yet. `bitty chat` sends each
+  line as a separate request with the default sampling and no memory of the
+  earlier lines.
 - GPU offload: `n_gpu_layers` is not rebased to the range.
 - Workers do not fetch their stage file on their own when they get a layer
   assignment; `bitty pull --layers` is a manual step for now.
