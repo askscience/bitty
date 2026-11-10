@@ -245,7 +245,18 @@ pub fn ensure_stage(
         return Ok(dest);
     }
     eprintln!("bitty: fetching layers {start}..{end} of {}", spec.id());
-    let (dest, report) = pull_stage(settings, model, start, end, None, cancel).map_err(|err| {
+    let mut fetched = pull_stage(settings, model, start, end, None, cancel.clone());
+    let no_space = |err: &Box<dyn std::error::Error>| {
+        matches!(
+            err.downcast_ref::<bitty_model::StageFileError>(),
+            Some(bitty_model::StageFileError::NoSpace { .. })
+        )
+    };
+    // Layers of an older plan are of no use once the plan has changed: they make room first.
+    if fetched.as_ref().is_err_and(no_space) && remove_other_stages(settings, &spec, &dest) > 0 {
+        fetched = pull_stage(settings, model, start, end, None, cancel);
+    }
+    let (dest, report) = fetched.map_err(|err| {
         eprintln!("bitty: layers {start}..{end} not fetched: {err}");
         err.to_string()
     })?;
@@ -257,7 +268,62 @@ pub fn ensure_stage(
     Ok(dest)
 }
 
-/// The whole model on disk, if this machine has it.
+/// The stage files of a model other than `keep` and the vocabulary, with their sizes.
+fn other_stages(settings: &BittySettings, spec: &ModelSpec, keep: &Path) -> Vec<(PathBuf, u64)> {
+    let vocabulary = stage_path(settings, spec, 0, 0);
+    let Ok(entries) = std::fs::read_dir(spec.model_dir(settings).join("stages")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != keep && path != &vocabulary)
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "gguf" || extension == "partial")
+        })
+        .filter_map(|path| {
+            let len = std::fs::metadata(&path).ok()?.len();
+            Some((path, len))
+        })
+        .collect()
+}
+
+/// Deletes the stage files of other layer ranges. Returns how many went.
+fn remove_other_stages(settings: &BittySettings, spec: &ModelSpec, keep: &Path) -> usize {
+    other_stages(settings, spec, keep)
+        .into_iter()
+        .filter(|(path, len)| {
+            let removed = std::fs::remove_file(path).is_ok();
+            if removed {
+                eprintln!(
+                    "bitty: removed {} ({} MiB) to make room",
+                    path.display(),
+                    len / (1024 * 1024)
+                );
+            }
+            removed
+        })
+        .count()
+}
+
+/// The disk a node can use for the layers of a model, in MB: what is free plus the layers of
+/// older plans, which go when room is needed. `None` when the node holds the whole model or the
+/// disk cannot be read.
+pub fn disk_for_stages_mb(settings: &BittySettings, model: &str) -> Option<u64> {
+    if whole_model_path(settings, model).is_some() {
+        return None;
+    }
+    let (spec, _) = stage_spec(settings, model).ok()?;
+    let dir = spec.model_dir(settings).join("stages");
+    let free = bitty_model::usable_disk_bytes(&dir)?;
+    let held: u64 = other_stages(settings, &spec, Path::new(""))
+        .iter()
+        .map(|(_, len)| len)
+        .sum();
+    Some((free + held) / (1024 * 1024))
+}
+
 /// Whether a node can fetch stage files of this model: it is in the registry or it is a URL.
 pub fn has_stage_source(settings: &BittySettings, model: &str) -> bool {
     stage_spec(settings, model).is_ok_and(|(spec, _)| !spec.url.is_empty())

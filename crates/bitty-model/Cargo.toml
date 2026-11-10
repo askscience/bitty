@@ -12,4 +12,5 @@ crc32fast.workspace = true
 memmap2.workspace = true
 serde.workspace = true
 sha2.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true

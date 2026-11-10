@@ -202,6 +202,10 @@ pub struct HardwareProfile {
     /// Memory free when the node started, in MB. Zero: the node did not say.
     #[serde(default)]
     pub available_ram_mb: u64,
+    /// Disk the node can use for layers, in MB. Zero: the node did not say, or it holds the
+    /// whole model.
+    #[serde(default)]
+    pub free_disk_mb: u64,
     pub vram_mb: u64,
     pub architecture: String,
     pub gpus: Vec<GpuInfo>,
@@ -213,7 +217,62 @@ pub struct HardwareProfile {
     pub max_layers: u32,
 }
 
+/// Memory a stage engine needs on top of its layers: the embeddings or the output head, the
+/// context of every session, the engine itself. `BITTY_STAGE_OVERHEAD_MB` changes it.
+pub fn stage_overhead_bytes() -> u64 {
+    std::env::var("BITTY_STAGE_OVERHEAD_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1536)
+        .saturating_mul(1024 * 1024)
+}
+
+/// The share of its whole memory a node keeps for everything else.
+pub const MEMORY_RESERVE_FRACTION: f64 = 0.15;
+/// The share of the free memory the planner fills before it asks more of any node.
+const FREE_MEMORY_FRACTION: f64 = 0.9;
+/// How far past its free memory a node may go when the layers fit nowhere else. More than half
+/// of a loaded stage is memory the system cannot give back, so this stays small.
+const FREE_MEMORY_STRETCH: f64 = 1.25;
+
 impl HardwareProfile {
+    /// A node with a graphics card loads its layers into the card.
+    pub fn loads_into_gpu(&self) -> bool {
+        self.gpu_tflops > 0.0 && self.vram_mb > 0
+    }
+
+    /// The most a stage may take on this node: past it the node swaps or stalls. The leader
+    /// plans inside it and the node refuses a stage that is larger, with the same rule.
+    pub fn hard_memory_bytes(&self, reserve_fraction: f64) -> u64 {
+        let whole = if self.loads_into_gpu() {
+            self.vram_mb.saturating_mul(1024 * 1024)
+        } else {
+            self.memory_bytes()
+        };
+        let hard = (whole as f64 * (1.0 - reserve_fraction)).max(0.0) as u64;
+        if self.loads_into_gpu() || self.available_ram_mb == 0 {
+            return hard;
+        }
+        let free = self.available_ram_mb.saturating_mul(1024 * 1024) as f64;
+        hard.min((free * FREE_MEMORY_STRETCH) as u64)
+    }
+
+    /// What a stage may take without the node noticing: a share of the memory that was free
+    /// when the node started. A node that does not say how much it has free gets the hard limit.
+    pub fn free_memory_bytes(&self, reserve_fraction: f64) -> u64 {
+        let hard = self.hard_memory_bytes(reserve_fraction);
+        if self.loads_into_gpu() || self.available_ram_mb == 0 {
+            return hard;
+        }
+        let free = self.available_ram_mb.saturating_mul(1024 * 1024) as f64;
+        hard.min((free * FREE_MEMORY_FRACTION) as u64)
+    }
+
+    /// The bytes of layers the disk of this node can hold. `None`: no limit known.
+    pub fn disk_bytes(&self) -> Option<u64> {
+        (self.free_disk_mb > 0).then(|| self.free_disk_mb.saturating_mul(1024 * 1024))
+    }
+
     pub fn memory_bytes(&self) -> u64 {
         let reported = self.ram_mb.saturating_mul(1024 * 1024);
         if reported > 0 {
@@ -466,6 +525,7 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             tier: profile.tier.as_str().into(),
             ram_mb: profile.ram_mb,
             available_ram_mb: profile.available_ram_mb,
+            free_disk_mb: profile.free_disk_mb,
             vram_mb: profile.vram_mb,
             architecture: profile.architecture.clone(),
             gpus: profile.gpus.iter().map(Into::into).collect(),
@@ -521,6 +581,7 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             tier: NodeTier::try_from(profile.tier.as_str())?,
             ram_mb,
             available_ram_mb: profile.available_ram_mb.min(ram_mb),
+            free_disk_mb: profile.free_disk_mb,
             vram_mb: profile.vram_mb,
             architecture: if profile.architecture.is_empty() {
                 "unknown".into()

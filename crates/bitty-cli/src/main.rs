@@ -363,7 +363,7 @@ impl Cli {
 
 async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     if config.node_id.is_empty() {
-        config.node_id = default_node_id();
+        config.node_id = stored_node_id(&bitty_data_dir(config.data_dir.as_deref()));
     }
     logger::log_default(format!(
         "starting node id={} model={} join={}",
@@ -400,7 +400,10 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                 let settings = node_settings.clone();
                 let model = config.model.clone();
                 let source: bitty_inference::StageSource = Arc::new(move |start, end, stale| {
-                    model_store::ensure_stage(&settings, &model, start, end, Some(stale))
+                    let path =
+                        model_store::ensure_stage(&settings, &model, start, end, Some(stale))?;
+                    refuse_stage_past_memory(&path)?;
+                    Ok(path)
                 });
                 (vocabulary, Some(source))
             }
@@ -1091,6 +1094,9 @@ async fn register_and_heartbeat(
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
     profile.network_rtt_ms = estimate_scheduler_rtt_ms(target).await;
     profile.model_path = config.model.clone();
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    profile.free_disk_mb =
+        model_store::disk_for_stages_mb(&BittySettings::load(data_dir), &config.model).unwrap_or(0);
     profile.worker_endpoint = match target {
         SchedulerTarget::Local(_) => local_worker_endpoint
             .map(public_endpoint_from_listen)
@@ -3099,6 +3105,52 @@ fn public_endpoint_from_listen(listen: &str) -> String {
     }
 }
 
+/// The name of this machine in a network. It is made once and kept in the data directory, so a
+/// node that restarts comes back as the same node and takes its old place in the plan.
+fn stored_node_id(data_dir: &Path) -> String {
+    let path = data_dir.join("node-id");
+    let stored = std::fs::read_to_string(&path).unwrap_or_default();
+    let stored = stored.trim();
+    let valid = !stored.is_empty()
+        && stored.len() <= 64
+        && stored
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        return stored.to_string();
+    }
+    let node_id = default_node_id();
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(&path, format!("{node_id}\n"));
+    node_id
+}
+
+/// The last check before layers are loaded: a stage larger than this machine can take now is
+/// refused, whatever the leader planned. The reply carries the free memory, so the leader can
+/// plan again with it.
+fn refuse_stage_past_memory(stage: &Path) -> Result<(), String> {
+    let mut profile = HardwareProfiler::new("check").profile();
+    if profile.loads_into_gpu() {
+        return Ok(());
+    }
+    if std::env::var("BITTY_AVAILABLE_RAM_MB").is_err() {
+        profile.available_ram_mb =
+            bitty_worker::profiler::available_ram_mb_now().min(profile.ram_mb);
+    }
+    let needed = std::fs::metadata(stage).map(|file| file.len()).unwrap_or(0)
+        + bitty_protocol::stage_overhead_bytes();
+    let limit = profile.hard_memory_bytes(bitty_protocol::MEMORY_RESERVE_FRACTION);
+    if needed <= limit {
+        return Ok(());
+    }
+    Err(format!(
+        "these layers need {} MB and this machine can give {} MB now: free_memory_mb={}",
+        needed / (1024 * 1024),
+        limit / (1024 * 1024),
+        profile.available_ram_mb
+    ))
+}
+
 fn default_node_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3185,6 +3237,22 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_keeps_its_id_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("bitty-node-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = stored_node_id(&dir);
+        assert!(first.starts_with("bitty-"));
+        assert_eq!(stored_node_id(&dir), first);
+
+        // A file that is not an id is replaced.
+        std::fs::write(dir.join("node-id"), "not an id / at all\n").unwrap();
+        let replaced = stored_node_id(&dir);
+        assert!(replaced.starts_with("bitty-"));
+        assert_eq!(stored_node_id(&dir), replaced);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_clean_and_reset() {

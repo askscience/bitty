@@ -111,6 +111,13 @@ fn prepare_settle_time() -> Option<Duration> {
 /// them a download of several gigabytes, so the time has to cover what a real network does: a
 /// heartbeat that crosses a relay while the same line is busy fetching layers can take longer
 /// than a quarter of a minute without anything being wrong.
+/// The number that follows `key` in a message, as in `free_memory_mb=2700`.
+fn number_after(message: &str, key: &str) -> Option<u64> {
+    let rest = &message[message.find(key)? + key.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 fn eviction_time() -> Duration {
     let seconds = std::env::var("BITTY_EVICT_SECS")
         .ok()
@@ -212,8 +219,18 @@ impl NetworkCoordinator {
                     _ => continue,
                 };
                 println!(
-                    "preparing {} worker(s) for topology_epoch={seen}",
-                    assignments.len()
+                    "preparing {} worker(s) for topology_epoch={seen}: {}",
+                    assignments.len(),
+                    assignments
+                        .iter()
+                        .map(|assignment| format!(
+                            "{} {}..{}",
+                            assignment.node_id.0,
+                            assignment.range.start_layer,
+                            assignment.range.end_layer_exclusive
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 let started = Instant::now();
                 // A node that joins while layers are still being fetched changes every range:
@@ -309,12 +326,29 @@ impl NetworkCoordinator {
             .map(|cached| cached != &manifest)
             .unwrap_or(true);
         if needs_load {
-            client
+            let loaded = client
                 .load_shard(LoadShardRequest {
                     manifest: Some(ProtoShardManifest::from(&manifest)),
                 })
-                .await
-                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+                .await;
+            if let Err(err) = &loaded {
+                let memory_mb = number_after(err.message(), "free_memory_mb=");
+                let disk_mb = number_after(err.message(), "free_disk_mb=");
+                if memory_mb.is_some() || disk_mb.is_some() {
+                    println!(
+                        "worker {} refused layers {}..{}: {}",
+                        manifest.node_id.0,
+                        manifest.range.start_layer,
+                        manifest.range.end_layer_exclusive,
+                        err.message()
+                    );
+                    self.registry
+                        .lock()
+                        .await
+                        .note_free(&manifest.node_id, memory_mb, disk_mb);
+                }
+            }
+            loaded.map_err(|err| Status::failed_precondition(err.to_string()))?;
             self.shard_cache.lock().await.insert(cache_key, manifest);
         }
         Ok(client)
@@ -864,6 +898,12 @@ impl CoordinatorService for NetworkCoordinator {
         }
         let node_id = profile.node_id.clone();
 
+        // A node that registers again has restarted and holds no layers: it is told to load.
+        let cached = format!("{}@", node_id.0);
+        self.shard_cache
+            .lock()
+            .await
+            .retain(|key, _| !key.starts_with(&cached));
         self.registry.lock().await.register(profile);
         let topology_epoch = self.advance_epoch().await;
         let assignments = self.current_assignments().await?;
@@ -979,6 +1019,19 @@ impl CoordinatorService for NetworkCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_carries_what_the_node_has_free() {
+        let message =
+            "these layers need 6300 MB and this machine can give 2430 MB now: free_memory_mb=2700";
+        assert_eq!(number_after(message, "free_memory_mb="), Some(2700));
+        assert_eq!(number_after(message, "free_disk_mb="), None);
+        assert_eq!(
+            number_after("no space: free_disk_mb=812, needed 5000", "free_disk_mb="),
+            Some(812)
+        );
+        assert_eq!(number_after("free_memory_mb=", "free_memory_mb="), None);
+    }
 
     #[test]
     fn loopback_endpoints_are_recognised() {

@@ -86,6 +86,7 @@ impl HardwareProfiler {
             tier,
             ram_mb,
             available_ram_mb,
+            free_disk_mb: 0,
             vram_mb,
             architecture: architecture(&system),
             gpus,
@@ -108,6 +109,13 @@ fn cpu_count(system: &System) -> usize {
             .map(|count| count.get())
             .unwrap_or(1)
     }
+}
+
+/// The memory free right now, in MB.
+pub fn available_ram_mb_now() -> u64 {
+    let mut system = System::new();
+    system.refresh_memory();
+    system.available_memory() / 1024 / 1024
 }
 
 fn total_ram_mb(system: &System) -> Option<u64> {

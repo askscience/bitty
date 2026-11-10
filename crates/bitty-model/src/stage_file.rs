@@ -46,6 +46,32 @@ pub enum StageFileError {
     Fetch(String),
     #[error("the download was cancelled")]
     Cancelled,
+    #[error("not enough disk for the layers: {needed_mb} MB needed, free_disk_mb={free_mb}")]
+    NoSpace { needed_mb: u64, free_mb: u64 },
+}
+
+/// Space a download leaves alone, so the disk of the machine never fills to the last byte.
+const DISK_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// The free bytes of the disk that holds `path`, or of its nearest folder that exists.
+pub fn free_disk_bytes(path: &Path) -> Option<u64> {
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing.parent()?;
+    }
+    let existing = existing.canonicalize().ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| existing.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
+/// The bytes a download into the folder of `path` may use.
+pub fn usable_disk_bytes(path: &Path) -> Option<u64> {
+    free_disk_bytes(path).map(|free| free.saturating_sub(DISK_MARGIN))
 }
 
 /// Asked while a download runs; `true` stops it.
@@ -447,6 +473,16 @@ pub fn write_stage_file(
         header.extend_from_slice(&offset.to_le_bytes());
     }
     header.resize(align_to(header.len() as u64, alignment) as usize, 0);
+
+    let needed = header.len() as u64 + cursor + runs.len() as u64 * alignment;
+    if let Some(usable) = usable_disk_bytes(dest) {
+        if needed > usable {
+            return Err(StageFileError::NoSpace {
+                needed_mb: needed.div_ceil(1024 * 1024),
+                free_mb: usable / (1024 * 1024),
+            });
+        }
+    }
 
     let mut partial = dest.as_os_str().to_owned();
     partial.push(".partial");

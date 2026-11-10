@@ -12,17 +12,14 @@ pub struct SchedulerConfig {
     /// Memory a stage engine needs on top of its layers: the embeddings or the output head, the
     /// context of every session, the engine itself.
     pub stage_overhead_bytes: u64,
-    /// The share of the memory that is free when a node starts that the planner may fill.
-    pub free_memory_fraction: f64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            memory_reserve_fraction: 0.15,
+            memory_reserve_fraction: bitty_protocol::MEMORY_RESERVE_FRACTION,
             critical_quantization: Quantization::Fp16,
-            stage_overhead_bytes: stage_overhead_bytes(),
-            free_memory_fraction: 0.9,
+            stage_overhead_bytes: bitty_protocol::stage_overhead_bytes(),
         }
     }
 }
@@ -85,7 +82,8 @@ impl Halda {
                 .iter()
                 .filter(|node| {
                     largest + self.config.stage_overhead_bytes
-                        <= free_memory_bytes(node, &self.config)
+                        <= node.free_memory_bytes(self.config.memory_reserve_fraction)
+                        && node.disk_bytes().is_none_or(|disk| largest <= disk)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -104,14 +102,20 @@ impl Halda {
         // Two limits. The free limit is what the node had free when it started: inside it the
         // node keeps working as it did before. The hard limit is its whole memory less a
         // reserve: past it the node swaps. Layers go inside the free limit first.
-        let needed = |start: u32, len: u32| {
-            assignment_weight_bytes(start, start + len, layers) + self.config.stage_overhead_bytes
+        let weights = |start: u32, len: u32| assignment_weight_bytes(start, start + len, layers);
+        let on_disk = |node: &HardwareProfile, start: u32, len: u32| {
+            node.disk_bytes()
+                .is_none_or(|disk| weights(start, len) <= disk)
         };
         let fits = |node: &HardwareProfile, start: u32, len: u32| {
-            needed(start, len) <= free_memory_bytes(node, &self.config)
+            on_disk(node, start, len)
+                && weights(start, len) + self.config.stage_overhead_bytes
+                    <= node.free_memory_bytes(self.config.memory_reserve_fraction)
         };
         let fits_hard = |node: &HardwareProfile, start: u32, len: u32| {
-            needed(start, len) <= available_memory_bytes(node, self.config.memory_reserve_fraction)
+            on_disk(node, start, len)
+                && weights(start, len) + self.config.stage_overhead_bytes
+                    <= available_memory_bytes(node, self.config.memory_reserve_fraction)
         };
 
         // First pass: a share of the layers in proportion to each node's speed.
@@ -325,34 +329,8 @@ fn assignment_weight_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u6
         .sum()
 }
 
-fn stage_overhead_bytes() -> u64 {
-    std::env::var("BITTY_STAGE_OVERHEAD_MB")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(1536)
-        .saturating_mul(1024 * 1024)
-}
-
-/// What the planner may fill without pushing the node into swap: a share of the memory that was
-/// free when the node started, and never more than the hard limit. A node with a graphics card
-/// loads into its card, and an older node does not say how much it has free: both get the hard
-/// limit.
-fn free_memory_bytes(node: &HardwareProfile, config: &SchedulerConfig) -> u64 {
-    let hard = available_memory_bytes(node, config.memory_reserve_fraction);
-    if (node.gpu_tflops > 0.0 && node.vram_mb > 0) || node.available_ram_mb == 0 {
-        return hard;
-    }
-    let free = node.available_ram_mb.saturating_mul(1024 * 1024) as f64;
-    hard.min((free * config.free_memory_fraction).max(0.0) as u64)
-}
-
 fn available_memory_bytes(node: &HardwareProfile, reserve_fraction: f64) -> u64 {
-    let memory_bytes = if node.gpu_tflops > 0.0 && node.vram_mb > 0 {
-        node.vram_mb.saturating_mul(1024 * 1024)
-    } else {
-        node.memory_bytes()
-    };
-    (memory_bytes as f64 * (1.0 - reserve_fraction)).max(0.0) as u64
+    node.hard_memory_bytes(reserve_fraction)
 }
 
 fn estimate_latency_ms(
@@ -403,6 +381,7 @@ mod tests {
             tier,
             ram_mb: (memory_gb * 1024.0) as u64,
             available_ram_mb: 0,
+            free_disk_mb: 0,
             vram_mb: 0,
             architecture: "x86_64".into(),
             gpus: Vec::new(),
@@ -494,11 +473,36 @@ mod tests {
 
     #[test]
     fn a_lone_machine_goes_past_its_free_memory_up_to_the_hard_limit() {
-        // 16 GB free is not enough for 40 layers, 85% of 32 GB is.
+        // 90% of 20 GB free is not enough for 40 layers, 125% is.
         let assignments = Halda::new(SchedulerConfig::default())
-            .assign(&[cpu_node(0, 32, 16)], &big_layers())
+            .assign(&[cpu_node(0, 32, 20)], &big_layers())
             .unwrap();
         assert_eq!(len_of(&assignments, 0), 40);
+    }
+
+    #[test]
+    fn a_machine_never_goes_far_past_its_free_memory() {
+        // 8 GB with 2.7 GB free, as the office machine: 125% of it holds 3 layers at most.
+        let mut small = cpu_node(0, 8, 0);
+        small.available_ram_mb = 2765;
+        let nodes = vec![small, cpu_node(1, 16, 14)];
+        let result = Halda::new(SchedulerConfig::default()).assign(&nodes, &big_layers());
+        assert!(
+            matches!(result, Err(HaldaError::NotEnoughCapacity { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_small_disk_limits_the_layers() {
+        let mut small_disk = cpu_node(1, 32, 28);
+        small_disk.free_disk_mb = 3 * 1024;
+        let nodes = vec![cpu_node(0, 32, 28), small_disk];
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert!(len_of(&assignments, 1) <= 5, "{assignments:?}");
+        assert_eq!(len_of(&assignments, 0) + len_of(&assignments, 1), 40);
     }
 
     #[test]

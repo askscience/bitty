@@ -97,13 +97,26 @@ then only the layers it is given.
 
 ### How many layers a machine gets
 
-The layers are shared in proportion to speed, inside what the memory of each
-machine can hold. A layer of the 35B model is about 0.5 GB, and a node needs
-about 1.5 GB more for the engine and its context. The first limit is 90% of
-the memory that was free when the node started, so a machine that also runs a
-desktop and a browser keeps working. Only when the layers do not fit anywhere
-inside that limit does the planner go up to 85% of the whole memory of a
-machine. A machine with no room for one layer is left out of the ring.
+The layers are shared in proportion to speed, inside what the memory and the
+disk of each machine can hold. A layer of the 35B model is about 0.5 GB on
+disk and about the same in memory, and more than half of that (about 290 MB a
+layer, measured) is memory the system cannot give back under pressure. A node
+needs about 1.5 GB more for the engine and its context.
+
+The first limit is 90% of the memory that is free on the machine, so one that
+also runs a desktop and a browser keeps working. Only when the layers do not
+fit anywhere inside that limit does the planner go further, up to the smaller
+of 85% of the whole memory and 125% of the free memory. A machine with no
+room for one layer is left out of the ring.
+
+The node has the last word. Before it loads its layers it looks at the memory
+free at that moment, and it refuses layers that are past its limit. The leader
+then plans again with the number the node gave. The same holds for the disk:
+a node first removes the layer files of an older plan, and when the new ones
+still do not fit it says how much room it has.
+
+A node keeps its name in `node-id` inside its data directory, so after a
+restart or an update the leader sees the same machine and not a new one.
 
 To give a machine less than it would get, put one of these in its `env` file
 and restart the node:

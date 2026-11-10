@@ -25,6 +25,8 @@ message HardwareProfile {
   uint32 max_layers = 20;
   // Memory free when the node started. Zero: the node did not say.
   uint64 available_ram_mb = 21;
+  // Disk the node can use for layers. Zero: the node did not say, or it holds the whole model.
+  uint64 free_disk_mb = 22;
 }
 
 message GpuInfo {
