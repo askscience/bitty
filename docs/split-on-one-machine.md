@@ -204,9 +204,21 @@ itself (`--top-logits`), in the thread that has just done the decode, and
 sends 8 KB through the pipe. One node, 0.8B: 69 to 63 ms per token, the engine
 alone 60. Eight nodes, 35B: the last hop went from 71 to 66 ms.
 
-The same effect probably explains most of the 5 ms that every other hop adds
-to its engine. Things to try: the `performance` governor (needs root, not
-changed here), or fewer and cheaper steps on the receiving side.
+The frequency guess was then tested and is wrong. With the `performance`
+governor on all cores (and the settings put back afterwards) nothing moved:
+
+| | `powersave` | `performance` |
+|---|---|---|
+| one node, 0.8B, ms per token | 63 | 62 |
+| 0.8B engine alone | 58.5 | 58.8 |
+| stage 10..15 of 35B alone, default / spin 1000 / passive | 27.4 / 28.9 / 35.7 | 27.3 / 28.7 / 35.1 |
+| eight nodes, 35B, 120 tokens | 39.0 s | 39.9 s |
+| the first seven hops, ms each | 32 to 37 | 32 to 36 |
+
+So the governor is not worth changing, and the 5 ms that every hop adds to its
+engine (32 to 36 ms against 27.5) are still unexplained. Next thing to do is
+to time the inside of a middle hop the way the last one was timed: gRPC in,
+pipe, engine, gRPC out.
 
 ### Output layer on the GPU
 
