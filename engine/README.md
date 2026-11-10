@@ -197,6 +197,28 @@ threads: 120 tokens in 33 s, against 40 s on the CPU alone. A whole 10-layer
 stage (about 5 GB) did not fit in the free memory of this card, so a fully
 offloaded stage is not measured.
 
+Per-stage timing (`engine/stage_bench.py`): the 35B model in eight stages of
+five layers, each run alone and fed the hidden states of the one before, 8
+threads, one token at a time after a 16-token prompt.
+
+| Stage | CPU, ms per token | GPU, ms per token |
+| --- | --- | --- |
+| each of the first seven | 26 to 29 | 11 to 12 |
+| 35..40 (with the output layer) | 59 | 17 |
+| sum of the eight | 251 (4.0 tokens/s) | 101 (9.9 tokens/s) |
+
+A fully offloaded 5-layer stage takes 2.9 GB of video memory. The sums leave out
+the network and the coordinator, so they are the ceiling for a chain of eight
+such peers, not a measured cluster speed. The same script with all 40 layers in
+one CPU process needs 357 ms per token, more than the eight separate stages
+together; the cause is not established (memory pressure from holding 21 GB of
+weights on a 32 GB machine, or heat, are the candidates).
+
+```sh
+BITTY_STAGE_BIN=build/bin/bitty-stage python3 engine/stage_bench.py cpu model.gguf 5
+BITTY_STAGE_BIN=build-vk/bin/bitty-stage python3 engine/stage_bench.py gpu model.gguf 5
+```
+
 ## Not done yet
 
 - Requests carry one user message: there is no system prompt, conversation
