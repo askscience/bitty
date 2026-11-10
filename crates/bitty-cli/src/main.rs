@@ -394,13 +394,13 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
             let settings = node_settings.clone();
             let model = config.model.clone();
             let vocabulary = tokio::task::spawn_blocking(move || {
-                model_store::ensure_stage(&settings, &model, 0, 0)
+                model_store::ensure_stage(&settings, &model, 0, 0, None)
             })
             .await??;
             let settings = node_settings.clone();
             let model = config.model.clone();
-            let source: bitty_inference::StageSource = Arc::new(move |start, end| {
-                model_store::ensure_stage(&settings, &model, start, end)
+            let source: bitty_inference::StageSource = Arc::new(move |start, end, stale| {
+                model_store::ensure_stage(&settings, &model, start, end, Some(stale))
             });
             (vocabulary, Some(source))
         }
@@ -518,11 +518,9 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
     }
     let model = model.ok_or_else(|| format!("model not found: {}", config.model))?;
     if !config.local && config.node.is_none() && settings.auto_start_node {
-        let model_path = model.model_path(&settings);
-        if !model_path.exists() && settings.auto_pull {
-            pull_model(&settings, &model.id())?;
-        }
-        ensure_background_runtime(&settings, Some(model_path.display().to_string()), None).await?;
+        // the node decides what it needs on disk: the whole file when it is already here,
+        // otherwise only the stage of its own layers. Nothing is pulled for the client.
+        ensure_background_runtime(&settings, Some(model.id()), None).await?;
         settings = BittySettings::load(settings.data_dir.clone());
     }
     let prompt = config.prompt.unwrap_or_default();
@@ -654,7 +652,7 @@ async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
     )?;
     if let Some((start, end)) = config.layers {
         let output = config.output.as_deref().map(std::path::Path::new);
-        let (path, report) = pull_stage(&settings, &config.model, start, end, output)?;
+        let (path, report) = pull_stage(&settings, &config.model, start, end, output, None)?;
         const MIB: f64 = 1024.0 * 1024.0;
         println!(
             "pulled layers {start}..{end} of {} to {}",
@@ -1179,11 +1177,14 @@ async fn register_and_heartbeat(
             remote,
             token,
         } => {
-            let scheduler = RemoteScheduler::Iroh(IrohSchedulerClient {
-                endpoint: endpoint.clone(),
-                remote: remote.clone(),
-                token: token.clone(),
-            });
+            let scheduler = RemoteScheduler::Iroh {
+                client: IrohSchedulerClient {
+                    endpoint: endpoint.clone(),
+                    remote: remote.clone(),
+                    token: token.clone(),
+                },
+                invite: remote.clone(),
+            };
             stay_registered(scheduler, config, &profile, worker_stats).await
         }
     }
@@ -1196,14 +1197,22 @@ enum RemoteScheduler {
         client: Option<CoordinatorServiceClient<tonic::transport::Channel>>,
         token: String,
     },
-    Iroh(IrohSchedulerClient),
+    Iroh {
+        client: IrohSchedulerClient,
+        /// The addresses written in the invite. They go stale when the leader restarts on
+        /// another port or relay, so after a failure the leader is looked up by its id.
+        invite: EndpointAddr,
+    },
 }
+
+/// A leader that is gone must not hold a worker forever in one call.
+const IROH_SCHEDULER_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl RemoteScheduler {
     fn label(&self) -> String {
         match self {
             Self::Tcp { endpoint, .. } => endpoint.clone(),
-            Self::Iroh(client) => format!("iroh {}", client.remote.id),
+            Self::Iroh { client, .. } => format!("iroh {}", client.remote.id),
         }
     }
 
@@ -1220,6 +1229,36 @@ impl RemoteScheduler {
             *client = Some(connected);
         }
         Ok(client.as_mut().expect("just connected"))
+    }
+
+    /// One call to the leader over iroh. After a failure the next call reaches the leader
+    /// another way: by id alone (its current addresses come from the lookup service), then
+    /// with the invite's addresses again.
+    async fn iroh_request<M, R>(
+        client: &mut IrohSchedulerClient,
+        invite: &EndpointAddr,
+        op: u8,
+        message: &M,
+    ) -> Result<R, String>
+    where
+        M: prost::Message,
+        R: prost::Message + Default,
+    {
+        let result = match timeout(IROH_SCHEDULER_TIMEOUT, client.request(op, message)).await {
+            Ok(result) => result.map_err(|err| err.to_string()),
+            Err(_) => Err(format!(
+                "no answer in {}s",
+                IROH_SCHEDULER_TIMEOUT.as_secs()
+            )),
+        };
+        if result.is_err() {
+            client.remote = if client.remote.is_empty() {
+                invite.clone()
+            } else {
+                EndpointAddr::from_parts(invite.id, Vec::<iroh::TransportAddr>::new())
+            };
+        }
+        result
     }
 
     async fn register(
@@ -1243,10 +1282,9 @@ impl RemoteScheduler {
                     .map(tonic::Response::into_inner)
                     .map_err(|status| bitty_protocol::worker_client::status_text(&status))
             }
-            Self::Iroh(client) => client
-                .request(SCHEDULER_REGISTER_WORKER, &request)
-                .await
-                .map_err(|err| err.to_string()),
+            Self::Iroh { client, invite } => {
+                Self::iroh_request(client, invite, SCHEDULER_REGISTER_WORKER, &request).await
+            }
         }
     }
 
@@ -1268,10 +1306,9 @@ impl RemoteScheduler {
                     .map(tonic::Response::into_inner)
                     .map_err(|status| bitty_protocol::worker_client::status_text(&status))
             }
-            Self::Iroh(client) => client
-                .request(SCHEDULER_HEARTBEAT, &request)
-                .await
-                .map_err(|err| err.to_string()),
+            Self::Iroh { client, invite } => {
+                Self::iroh_request(client, invite, SCHEDULER_HEARTBEAT, &request).await
+            }
         }
     }
 }

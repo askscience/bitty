@@ -44,7 +44,12 @@ pub enum StageFileError {
     TensorOutOfBounds(String),
     #[error("range request failed: {0}")]
     Fetch(String),
+    #[error("the download was cancelled")]
+    Cancelled,
 }
+
+/// Asked while a download runs; `true` stops it.
+pub type CancelCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Random access to the published model.
 pub trait ByteSource {
@@ -89,11 +94,18 @@ impl ByteSource for FileSource {
 /// A model behind HTTP(S), read with range requests through `curl`.
 pub struct HttpSource {
     url: String,
+    cancel: Option<CancelCheck>,
 }
 
 impl HttpSource {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self { url: url.into(), cancel: None }
+    }
+
+    /// Stops a running download as soon as `cancel` answers `true`.
+    pub fn with_cancel(mut self, cancel: Option<CancelCheck>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     fn curl(&self) -> Command {
@@ -145,12 +157,34 @@ impl ByteSource for HttpSource {
             .spawn()?;
         let mut stdout = child.stdout.take().expect("piped stdout");
         // take(len + 1): a server that ignores the range would send the whole file
-        let copied = io::copy(&mut (&mut stdout).take(len + 1), out);
+        let mut limited = (&mut stdout).take(len + 1);
+        let mut buffer = vec![0u8; 1 << 20];
+        let mut cancelled = false;
+        let copied = (|| -> io::Result<u64> {
+            let mut total = 0u64;
+            loop {
+                if self.cancel.as_ref().is_some_and(|cancel| cancel()) {
+                    cancelled = true;
+                    return Ok(total);
+                }
+                let read = match limited.read(&mut buffer) {
+                    Ok(0) => return Ok(total),
+                    Ok(read) => read,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                };
+                out.write_all(&buffer[..read])?;
+                total += read as u64;
+            }
+        })();
         drop(stdout);
-        if matches!(copied, Ok(n) if n > len) {
+        if cancelled || matches!(copied, Ok(n) if n > len) {
             let _ = child.kill();
         }
         let status = child.wait()?;
+        if cancelled {
+            return Err(StageFileError::Cancelled);
+        }
         let copied = copied?;
         if copied != len || !status.success() {
             return Err(StageFileError::Fetch(format!(

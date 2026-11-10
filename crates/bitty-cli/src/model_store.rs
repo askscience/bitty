@@ -211,6 +211,7 @@ pub fn pull_stage(
     start: u32,
     end: u32,
     output: Option<&Path>,
+    cancel: Option<bitty_model::CancelCheck>,
 ) -> Result<(PathBuf, bitty_model::StageFileReport), Box<dyn std::error::Error>> {
     let (spec, is_url) = stage_spec(settings, model)?;
     let dest = match output {
@@ -224,20 +225,30 @@ pub fn pull_stage(
     } else if spec.url.is_empty() {
         return Err(format!("model {} has no download URL", spec.id()).into());
     } else {
-        bitty_model::write_stage_file(&bitty_model::HttpSource::new(&spec.url), start, end, &dest)?
+        let source = bitty_model::HttpSource::new(&spec.url).with_cancel(cancel);
+        bitty_model::write_stage_file(&source, start, end, &dest)?
     };
     Ok((dest, report))
 }
 
 /// The stage file for `[start, end)`, fetched only when it is not on disk yet.
-pub fn ensure_stage(settings: &BittySettings, model: &str, start: u32, end: u32) -> Result<PathBuf, String> {
+pub fn ensure_stage(
+    settings: &BittySettings,
+    model: &str,
+    start: u32,
+    end: u32,
+    cancel: Option<bitty_model::CancelCheck>,
+) -> Result<PathBuf, String> {
     let (spec, _) = stage_spec(settings, model)?;
     let dest = stage_path(settings, &spec, start, end);
     if dest.is_file() {
         return Ok(dest);
     }
     eprintln!("bitty: fetching layers {start}..{end} of {}", spec.id());
-    let (dest, report) = pull_stage(settings, model, start, end, None).map_err(|err| err.to_string())?;
+    let (dest, report) = pull_stage(settings, model, start, end, None, cancel).map_err(|err| {
+        eprintln!("bitty: layers {start}..{end} not fetched: {err}");
+        err.to_string()
+    })?;
     eprintln!(
         "bitty: layers {start}..{end} ready, {} MiB in {}",
         report.bytes / (1024 * 1024),

@@ -110,8 +110,16 @@ struct Engine {
     next_session_id: u64,
 }
 
+/// Asked while a stage file is being fetched; `true` means the range is no longer wanted.
+pub type CancelCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Returns the model file to open for layers `[start, end)`, fetching it first if needed.
-pub type StageSource = Arc<dyn Fn(u32, u32) -> Result<PathBuf, String> + Send + Sync>;
+/// The fetch gives up when the check answers `true`.
+pub type StageSource = Arc<dyn Fn(u32, u32, CancelCheck) -> Result<PathBuf, String> + Send + Sync>;
+
+fn pack_range(range: &AssignedLayerRange) -> u64 {
+    ((range.start_layer as u64) << 32) | range.end_layer_exclusive as u64
+}
 
 #[derive(Clone)]
 pub struct StageExecutor {
@@ -120,6 +128,9 @@ pub struct StageExecutor {
     engine_path: Option<PathBuf>,
     options: StageOptions,
     stage_source: Option<StageSource>,
+    /// The range asked for last. A fetch for any other range is stale and stops, so a node
+    /// that was given new layers does not finish downloading the old ones first.
+    wanted: Arc<std::sync::atomic::AtomicU64>,
     engine: Arc<Mutex<Engine>>,
 }
 
@@ -141,6 +152,7 @@ impl StageExecutor {
             engine_path: None,
             options: StageOptions::from_env(),
             stage_source: None,
+            wanted: Arc::default(),
             engine: Arc::default(),
         }
     }
@@ -244,7 +256,12 @@ impl StageExecutor {
         let fetched;
         let model = match &self.stage_source {
             Some(source) => {
-                fetched = source(range.start_layer, range.end_layer_exclusive)
+                let wanted = self.wanted.clone();
+                let mine = pack_range(range);
+                let stale: CancelCheck = Arc::new(move || {
+                    wanted.load(std::sync::atomic::Ordering::Relaxed) != mine
+                });
+                fetched = source(range.start_layer, range.end_layer_exclusive, stale)
                     .map_err(|err| ExecutorError::Failed(format!("stage file is not available: {err}")))?;
                 &fetched
             }
@@ -290,6 +307,8 @@ impl Engine {
 impl LayerExecutor for StageExecutor {
     async fn prepare_range(&self, range: &AssignedLayerRange) -> Result<(), ExecutorError> {
         let range = range.clone();
+        self.wanted
+            .store(pack_range(&range), std::sync::atomic::Ordering::Relaxed);
         self.blocking(move |this, engine| this.ensure_process(engine, &range)).await
     }
 
@@ -313,6 +332,8 @@ impl LayerExecutor for StageExecutor {
             )));
         }
         let range = range.clone();
+        self.wanted
+            .store(pack_range(&range), std::sync::atomic::Ordering::Relaxed);
         if activation.request_id == KEEPALIVE_REQUEST {
             return self
                 .blocking(move |this, engine| {

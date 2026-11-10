@@ -200,12 +200,27 @@ impl NetworkCoordinator {
                     assignments.len()
                 );
                 let started = Instant::now();
-                match self.prepare_workers(&assignments, &model_path).await {
-                    Ok(_) => println!(
-                        "workers ready in {:.1}s; topology_epoch={seen}",
-                        started.elapsed().as_secs_f64()
+                // A node that joins while layers are still being fetched changes every range:
+                // waiting for the old ones would only delay the new plan.
+                let changed = async {
+                    loop {
+                        ticker.tick().await;
+                        if self.epoch().await != seen {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = self.prepare_workers(&assignments, &model_path) => match result {
+                        Ok(_) => println!(
+                            "workers ready in {:.1}s; topology_epoch={seen}",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(err) => println!("could not prepare the workers: {}", err.message()),
+                    },
+                    _ = changed => println!(
+                        "the network changed while preparing topology_epoch={seen}; planning again"
                     ),
-                    Err(err) => println!("could not prepare the workers: {}", err.message()),
                 }
             }
         });
