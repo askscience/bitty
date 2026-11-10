@@ -461,21 +461,37 @@ impl NetworkCoordinator {
                 break;
             }
 
-            // the final stage answers with the logits of the last token
-            if activation.dtype != ActivationDType::F32
-                || activation.payload.len() != codec.vocab_size() as usize * 4
-            {
+            // the final stage answers with the logits of the last token: the best ones, or
+            // the whole vocabulary from a worker that was told not to cut them
+            let candidates = match activation.dtype {
+                ActivationDType::TopLogits => {
+                    bitty_inference::sampling::decode_top_logits(&activation.payload)
+                }
+                ActivationDType::F32
+                    if activation.payload.len() == codec.vocab_size() as usize * 4 =>
+                {
+                    Some(
+                        activation
+                            .payload
+                            .chunks_exact(4)
+                            .enumerate()
+                            .map(|(token, chunk)| {
+                                let logit =
+                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                                (token as u32, logit)
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
+            let Some(candidates) = candidates else {
                 failure = Some(Status::internal(
                     "the last worker did not return the logits of the model",
                 ));
                 break;
-            }
-            let logits: Vec<f32> = activation
-                .payload
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            let Some(sampled) = sampler.sample(&logits) else {
+            };
+            let Some(sampled) = sampler.sample_candidates(candidates) else {
                 failure = Some(Status::internal("the model returned no usable logits"));
                 break;
             };

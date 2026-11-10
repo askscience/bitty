@@ -2203,19 +2203,27 @@ async fn handle_worker_connection(
     worker: NetworkWorker<StageExecutor>,
     cluster_token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
-    if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
-        return Err("invalid cluster token".into());
+    // the coordinator keeps one connection and opens a stream for every request
+    let mut served = 0u64;
+    loop {
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            Err(_) if served > 0 => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        served += 1;
+        let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
+        if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
+            return Err("invalid cluster token".into());
+        }
+        let response = match handle_worker_frame(frame, worker.clone(), &cluster_token).await {
+            Ok(response) => response,
+            Err(err) => iroh_transport::error_frame(err),
+        };
+        iroh_transport::write_frame(&mut send, &response).await?;
+        send.finish()?;
+        send.stopped().await?;
     }
-    let response = match handle_worker_frame(frame, worker, &cluster_token).await {
-        Ok(response) => response,
-        Err(err) => iroh_transport::error_frame(err),
-    };
-    iroh_transport::write_frame(&mut send, &response).await?;
-    send.finish()?;
-    send.stopped().await?;
-    Ok(())
 }
 
 async fn handle_worker_frame(

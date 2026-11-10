@@ -124,7 +124,19 @@ pub async fn request_addr(
     response_limit: usize,
 ) -> Result<IrohFrame, IrohTransportError> {
     let connection = endpoint.connect(remote, alpn).await?;
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (send, recv) = connection.open_bi().await?;
+    request_on_stream(send, recv, frame, response_limit).await
+}
+
+/// One request and its answer on a stream that is already open. A connection can carry any
+/// number of these, one stream each: opening a stream costs nothing, while a new connection
+/// costs a handshake of several round trips.
+pub async fn request_on_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    frame: IrohFrame,
+    response_limit: usize,
+) -> Result<IrohFrame, IrohTransportError> {
     write_frame(&mut send, &frame).await?;
     send.finish()?;
     send.stopped().await?;

@@ -141,6 +141,30 @@ impl<E> NetworkWorker<E> {
     }
 }
 
+/// The final stage answers with one logit per vocabulary entry, about 1 MB per token for this
+/// model. Only the best ones matter to the sampler, so only those travel.
+fn trim_logits(output: ActivationTensor, limit: usize) -> ActivationTensor {
+    let is_logits = output.dtype == bitty_protocol::ActivationDType::F32 && output.shape.len() == 1;
+    if !is_logits || limit == 0 || output.payload.len() / 4 <= limit {
+        return output;
+    }
+    let logits: Vec<f32> = output
+        .payload
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    let best = bitty_inference::sampling::top_logits(&logits, limit);
+    ActivationTensor::new(
+        output.request_id,
+        output.token_position,
+        output.source_layer,
+        output.target_layer,
+        vec![best.len() as u32],
+        bitty_protocol::ActivationDType::TopLogits,
+        bitty_inference::sampling::encode_top_logits(&best),
+    )
+}
+
 #[tonic::async_trait]
 impl<E> WorkerService for NetworkWorker<E>
 where
@@ -178,6 +202,7 @@ where
             .forward(activation)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        let output = trim_logits(output, bitty_inference::sampling::top_logits_limit());
         metrics::record_activation_bytes("rx", payload_len);
         metrics::record_activation_bytes("tx", output.payload.len() as u64);
         self.stats

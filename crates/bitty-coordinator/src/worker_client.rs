@@ -26,6 +26,7 @@ pub async fn connect_worker(
             endpoint: iroh_endpoint,
             endpoint_addr: target.endpoint_addr,
             token: target.token.or(cluster_token).unwrap_or_default(),
+            connection: None,
         }));
     }
     let client = WorkerServiceClient::connect(normalize_endpoint(endpoint))
@@ -118,11 +119,14 @@ pub struct IrohWorkerClient {
     endpoint: Endpoint,
     endpoint_addr: EndpointAddr,
     token: String,
+    /// Kept between requests: a token is one request to every worker, and a handshake for
+    /// each of them would cost more than the layers.
+    connection: Option<iroh::endpoint::Connection>,
 }
 
 impl IrohWorkerClient {
     async fn request<M, R>(
-        &self,
+        &mut self,
         op: u8,
         message: &M,
     ) -> Result<R, iroh_transport::IrohTransportError>
@@ -131,14 +135,26 @@ impl IrohWorkerClient {
         R: prost::Message + Default,
     {
         let frame = IrohFrame::message(op, self.token.clone(), message);
-        let response = iroh_transport::request_addr(
-            &self.endpoint,
-            self.endpoint_addr.clone(),
-            BITTY_WORKER_ALPN,
-            frame,
-            DEFAULT_FRAME_LIMIT,
-        )
-        .await?;
+        // a connection that died while idle fails here, before anything was sent, so
+        // connecting again cannot run a request twice
+        let open = match &self.connection {
+            Some(connection) => connection.open_bi().await.ok(),
+            None => None,
+        };
+        let (send, recv) = match open {
+            Some(streams) => streams,
+            None => {
+                let connection = self
+                    .endpoint
+                    .connect(self.endpoint_addr.clone(), BITTY_WORKER_ALPN)
+                    .await?;
+                let streams = connection.open_bi().await?;
+                self.connection = Some(connection);
+                streams
+            }
+        };
+        let response =
+            iroh_transport::request_on_stream(send, recv, frame, DEFAULT_FRAME_LIMIT).await?;
         response.decode_message(op)
     }
 }

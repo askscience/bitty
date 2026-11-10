@@ -164,3 +164,26 @@ So over a real network the full logits are the bottleneck, by a wide margin.
 Sending only the top values (a few hundred pairs of id and logit, a few KB)
 should bring a token close to the round trip time plus compute. After that the
 next thing to look at is the iroh path (direct or relay, and its throughput).
+
+### After the two fixes (same day)
+
+| Version | 60 tokens | Received by the leader |
+| --- | --- | --- |
+| full logits, new connection per request | 103 s | 22 MB per 20 tokens |
+| best 1024 logits | 31 to 35 s | 1.4 MB per 60 tokens |
+| best 1024 logits, one kept connection per worker | 16 to 22 s | |
+| one local node, for reference | 5.3 to 8.5 s | |
+
+1. The worker now sends only the best 1024 logits as pairs of id and logit
+   (`BITTY_TOP_LOGITS`, 0 for everything). The text is unchanged.
+2. The coordinator opened a new iroh connection for every request, so every
+   token paid a handshake of several round trips. It now keeps one connection
+   per worker and opens a stream for each request.
+
+About 3.5 s of every `bitty generate` through an iroh invite is the start of
+the client's own iroh endpoint (a plain `bitty status` takes that long). Without
+it a token costs about 0.2 s over this link, against roughly 0.1 s locally.
+
+Still open here: whether the path is direct or through the relay, the start-up
+time of the client, and why one local node needs about 90 ms per token for a
+model this small.

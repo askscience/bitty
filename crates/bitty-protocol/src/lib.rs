@@ -297,6 +297,9 @@ pub enum ActivationDType {
     F32,
     /// Little-endian u32 token ids: the input of the first stage.
     Tokens,
+    /// The best logits of the final stage as pairs of little-endian u32 token id and f32
+    /// logit, best first. The whole vocabulary is about 1 MB per token; this is a few KB.
+    TopLogits,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -611,6 +614,7 @@ impl From<&ActivationTensor> for pb::ActivationTensor {
                 ActivationDType::I8 => "i8",
                 ActivationDType::F32 => "f32",
                 ActivationDType::Tokens => "tokens",
+                ActivationDType::TopLogits => "top_logits",
             }
             .into(),
             payload: activation.payload.clone(),
@@ -630,6 +634,7 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             "i8" => ActivationDType::I8,
             "f32" => ActivationDType::F32,
             "tokens" => ActivationDType::Tokens,
+            "top_logits" => ActivationDType::TopLogits,
             other => return Err(ProtocolConversionError::UnknownDType(other.into())),
         };
         let activation = Self {

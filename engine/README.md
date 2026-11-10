@@ -124,6 +124,11 @@ to change is not worth a download of several gigabytes.
 `BITTY_PREPARE_SETTLE_SECS` changes the wait; 0 turns this off, and the layers
 are loaded by the first request as before.
 
+The final stage sends the coordinator only the best 1024 logits, as pairs of
+token id and logit: a few KB per token where the whole vocabulary is about
+1 MB. `BITTY_TOP_LOGITS` changes the number; 0 sends everything. Sampling gives
+the same text as long as the number is not below `--top-k`.
+
 Engines are started with `OMP_WAIT_POLICY=passive` unless the variable is
 already set, so a stage that waits for its turn does not keep the cores busy.
 See `docs/split-on-one-machine.md` for the measurements behind this.
@@ -238,9 +243,6 @@ BITTY_STAGE_BIN=build-vk/bin/bitty-stage python3 engine/stage_bench.py gpu model
 
 - Requests carry one user message: there is no system prompt, conversation
   history or tool calling in the cluster path yet.
-- The final stage sends the full logits (about 1 MB per token for this
-  vocabulary) to the coordinator; sending only the most likely ones would cut
-  that for slow links.
 - `bitty run --local` is not wired to the engine yet. `bitty chat` sends each
   line as a separate request with the default sampling and no memory of the
   earlier lines.
