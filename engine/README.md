@@ -72,14 +72,16 @@ Weight buffers on that model: whole model 497 MiB; stage `[0,8)` 298 MiB,
 `[8,16)` 99 MiB, `[16,24)` 299 MiB. The first and last stages carry the 199 MiB
 vocabulary matrix, which dominates such a small model.
 
+Qwen3.5-35B-A3B Q4_K_M (`qwen35moe`, 40 layers, the real target), CPU: cuts
+`10,20,30` give logits bit-identical to the whole model. Weight buffers: whole
+model 20986 MiB; the four stages 5537, 5015, 5021 and 5413 MiB.
+
 ## Not done yet
 
 - The coordinator still turns a text prompt into bytes instead of tokens; the
   stage server can tokenize (`StageExecutor::tokenize`) but the cluster path does
   not call it yet. Chat templates and sampling other than greedy are missing too.
 
-- `qwen35moe` (the real 35B-A3B target) carries the same patch but has not been
-  run: no small MoE model of this family exists.
 - GPU offload: `n_gpu_layers` is not rebased to the range.
 - A stage still needs the whole GGUF file on disk; per-stage files are future work.
 - State save/load does not record the range.
