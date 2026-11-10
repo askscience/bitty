@@ -51,7 +51,9 @@ Every minute, and when the machine starts (Linux) or the user logs in
    is what happens after a reboot or a crash.
 
 Steps 3 and 4 do nothing on a machine where no node was started, or where it
-was stopped with `bitty stop`: stopping by hand is remembered.
+was stopped with `bitty stop`: stopping by hand is remembered. A plain `bitty start` after
+that goes back to what the node was doing: a node that had joined a cluster
+joins it again.
 
 A new build is published by the `Release` workflow on every push to the
 `qwen-llama-cpp` branch, after it has built both programs for Linux and

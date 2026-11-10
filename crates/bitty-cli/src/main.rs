@@ -752,7 +752,24 @@ async fn run_start(config: StartConfig) -> Result<(), Box<dyn std::error::Error>
     if config.if_started && read_runtime_state(&settings.data_dir).is_none() {
         return Ok(());
     }
-    ensure_background_runtime(&settings, config.model, config.join).await?;
+    // after `bitty stop` a plain start goes back to what the node was doing: a worker joins
+    // its cluster again and does not come back as the leader of a cluster of its own
+    let stopped = match read_runtime_state(&settings.data_dir) {
+        Some(_) => None,
+        None => read_state_file(&stopped_state_path(&settings.data_dir)),
+    };
+    let join = config.join.or_else(|| {
+        stopped
+            .as_ref()
+            .filter(|state| state.mode == "worker" && !state.target.is_empty())
+            .map(|state| state.target.clone())
+    });
+    let model = config.model.or_else(|| {
+        stopped
+            .map(|state| state.model)
+            .filter(|model| !model.is_empty())
+    });
+    ensure_background_runtime(&settings, model, join).await?;
     print_runtime_summary(&settings);
     Ok(())
 }
@@ -2687,7 +2704,11 @@ fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::
     } else {
         println!("Bitty runtime pid {} was not running.", state.pid);
     }
-    let _ = std::fs::remove_file(runtime_state_path(&settings.data_dir));
+    // kept aside, so that `bitty start` knows what to go back to
+    let state_path = runtime_state_path(&settings.data_dir);
+    if std::fs::rename(&state_path, stopped_state_path(&settings.data_dir)).is_err() {
+        let _ = std::fs::remove_file(state_path);
+    }
     Ok(())
 }
 
@@ -2754,7 +2775,11 @@ fn model_path_for_runtime(
 }
 
 fn read_runtime_state(data_dir: &Path) -> Option<RuntimeState> {
-    let contents = std::fs::read_to_string(runtime_state_path(data_dir)).ok()?;
+    read_state_file(&runtime_state_path(data_dir))
+}
+
+fn read_state_file(path: &Path) -> Option<RuntimeState> {
+    let contents = std::fs::read_to_string(path).ok()?;
     let mut state = RuntimeState::default();
     for line in contents.lines() {
         let Some((key, value)) = settings::parse_assignment(line) else {
@@ -2784,6 +2809,11 @@ fn write_runtime_state(data_dir: &Path, state: &RuntimeState) -> std::io::Result
 
 fn runtime_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime").join("runtime.toml")
+}
+
+/// What the node was doing when `bitty stop` stopped it.
+fn stopped_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("runtime").join("stopped.toml")
 }
 
 /// Whether the saved pid is still a bitty process. The number alone is not enough: after a
@@ -3237,6 +3267,25 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_worker_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("bitty-stopped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runtime")).unwrap();
+        let state = RuntimeState {
+            pid: u32::MAX - 7,
+            mode: "worker".into(),
+            model: "qwen3.5-35b-a3b".into(),
+            target: "iroh://leader?token=abc".into(),
+        };
+        write_runtime_state(&dir, &state).unwrap();
+        let settings = BittySettings::defaults(dir.clone());
+        stop_background_runtime(&settings).unwrap();
+        assert!(read_runtime_state(&dir).is_none());
+        assert_eq!(read_state_file(&stopped_state_path(&dir)), Some(state));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_node_keeps_its_id_across_restarts() {
