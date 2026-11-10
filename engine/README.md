@@ -136,8 +136,26 @@ those four files gives logits bit-identical to the whole model.
 Cluster path: two `bitty node` processes on one machine, each serving half of
 the 0.8B model, answer `bitty generate` requests with the chat template, stop at
 the end of the turn, repeat the same text for the same seed and deliver
-multi-byte characters intact. This has not been run on the 35B model or between
-different machines yet.
+multi-byte characters intact. This has not been run between different machines yet.
+
+35B model, four `bitty node` processes on one machine (8 cores, 32 GB, CPU
+only), ten layers each: the answers are correct in English and Italian and the
+same seed gives the same text as a single node holding all forty layers.
+
+| Setup | 120 tokens | Speed |
+| --- | --- | --- |
+| llama.cpp alone, whole model | 45 s | 2.6 tokens/s |
+| one node, all 40 layers | 49 s | 2.7 tokens/s |
+| four nodes, 10 layers each | 48 s | 2.7 tokens/s |
+| one node, engine with 8 threads | 40 s | 3.1 tokens/s |
+
+Splitting the model costs nothing measurable when the hops are local, so the
+speed is the speed of the processors. Real links between machines add their
+latency four times per token and are not measured yet. The engine runs with
+llama.cpp's default of 4 threads; 8 helped a little and 16 (all hyperthreads)
+was four times slower, and nodes have no setting for it yet. The first request
+after start waits for the stages to load (about 100 s here). The nodes in this
+run opened the whole model file with their layer range, not the stage files.
 
 ## Not done yet
 
