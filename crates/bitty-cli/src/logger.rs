@@ -5,8 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_LOG_BYTES: u64 = 1_048_576;
 const ROTATED_LOGS: usize = 3;
 
+/// The data directory given on the command line, when there is one.
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// A command with `--data-dir` logs there, not in the log of the installed node.
+pub fn use_data_dir(data_dir: PathBuf) {
+    let _ = DATA_DIR.set(data_dir);
+}
+
 pub fn log_default(message: impl AsRef<str>) {
-    let data_dir = default_data_dir();
+    let data_dir = DATA_DIR.get().cloned().unwrap_or_else(default_data_dir);
     let _ = log(&data_dir, message);
 }
 

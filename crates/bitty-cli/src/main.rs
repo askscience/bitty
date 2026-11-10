@@ -51,6 +51,11 @@ const DEFAULT_TCP_CLUSTER: &str = "127.0.0.1:50051";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     load_env_file(&bitty_data_dir(None).join("env"));
+    if let Some(index) = raw_args.iter().position(|arg| arg == "--data-dir") {
+        if let Some(data_dir) = raw_args.get(index + 1) {
+            logger::use_data_dir(PathBuf::from(data_dir));
+        }
+    }
     logger::log_default(format!(
         "bitty command: {}",
         secrets::redact_secret_args(&raw_args).join(" ")
