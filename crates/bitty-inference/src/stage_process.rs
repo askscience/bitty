@@ -128,6 +128,12 @@ impl StageProcess {
         } else {
             Stdio::null()
         };
+        // An engine that waits for its turn must sleep. By default the OpenMP threads of
+        // llama.cpp keep spinning after a batch, and on a machine that runs several stages
+        // they steal the cores from the stage that is working.
+        if std::env::var_os("OMP_WAIT_POLICY").is_none() {
+            command.env("OMP_WAIT_POLICY", "passive");
+        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

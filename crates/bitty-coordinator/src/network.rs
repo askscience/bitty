@@ -50,6 +50,20 @@ pub struct NetworkCoordinator {
     cluster_token: Option<String>,
     shard_cache: Arc<Mutex<HashMap<String, ShardManifestMessage>>>,
     text_codec: Arc<Mutex<Option<Arc<TextCodec>>>>,
+    /// Held while shards are being loaded, so a request waits for a running preparation
+    /// instead of asking the same workers twice.
+    prepare_lock: Arc<Mutex<()>>,
+}
+
+/// How long the topology has to stay unchanged before the workers are asked to load their
+/// layers. `BITTY_PREPARE_SETTLE_SECS` changes it; 0 turns the early preparation off, and
+/// the layers are then loaded by the first request.
+fn prepare_settle_time() -> Option<Duration> {
+    let seconds = std::env::var("BITTY_PREPARE_SETTLE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(10);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
 impl NetworkCoordinator {
@@ -65,6 +79,7 @@ impl NetworkCoordinator {
             cluster_token: None,
             shard_cache: Arc::new(Mutex::new(HashMap::new())),
             text_codec: Arc::new(Mutex::new(None)),
+            prepare_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -94,12 +109,137 @@ impl NetworkCoordinator {
     pub async fn serve(self, listen_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let addr = listen_addr.parse()?;
         println!("bitty-coordinator: listening on {listen_addr}");
-        self.clone().spawn_eviction_loop(Duration::from_secs(15));
+        self.spawn_background_loops();
         let service = CoordinatorServiceServer::new(self)
             .max_decoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES)
             .max_encoding_message_size(MAX_ACTIVATION_PAYLOAD_BYTES);
         Server::builder().add_service(service).serve(addr).await?;
         Ok(())
+    }
+
+    /// Starts the loops that run beside the request handlers: eviction of silent workers and
+    /// early preparation of the shards. `serve` calls it; a coordinator reached only through
+    /// iroh has to call it itself.
+    pub fn spawn_background_loops(&self) {
+        self.clone().spawn_eviction_loop(Duration::from_secs(15));
+        if let Some(settle) = prepare_settle_time() {
+            self.clone().spawn_prepare_loop(settle);
+        }
+    }
+
+    /// Asks the workers to load their layers once the topology has stopped changing, so the
+    /// download and the load of a stage happen before the first request and not during it.
+    /// The wait matters: every node that joins moves the ranges of the others, and a range
+    /// that is about to change is not worth a download of several gigabytes.
+    fn spawn_prepare_loop(self, settle: Duration) {
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(1));
+            let mut seen = self.epoch().await;
+            let mut seen_at = Instant::now();
+            let mut prepared = seen.clone();
+            loop {
+                ticker.tick().await;
+                let epoch = self.epoch().await;
+                if epoch != seen {
+                    seen = epoch;
+                    seen_at = Instant::now();
+                    continue;
+                }
+                if seen == prepared || seen_at.elapsed() < settle {
+                    continue;
+                }
+                prepared = seen.clone();
+                let Some(model_path) = self.model_path.clone() else {
+                    continue;
+                };
+                let assignments = match self.current_assignments().await {
+                    Ok(assignments) if !assignments.is_empty() => assignments,
+                    _ => continue,
+                };
+                println!(
+                    "preparing {} worker(s) for topology_epoch={seen}",
+                    assignments.len()
+                );
+                let started = Instant::now();
+                match self.prepare_workers(&assignments, &model_path).await {
+                    Ok(_) => println!(
+                        "workers ready in {:.1}s; topology_epoch={seen}",
+                        started.elapsed().as_secs_f64()
+                    ),
+                    Err(err) => println!("could not prepare the workers: {}", err.message()),
+                }
+            }
+        });
+    }
+
+    /// Connects to the worker of every assignment and makes it load its layers, unless it
+    /// already holds exactly that range. Workers load in parallel.
+    async fn prepare_workers(
+        &self,
+        assignments: &[bitty_protocol::LayerAssignment],
+        model_path: &std::path::Path,
+    ) -> Result<Vec<WorkerRpcClient>, Status> {
+        let _guard = self.prepare_lock.lock().await;
+        let jobs = assignments
+            .iter()
+            .map(|assignment| self.prepare_worker(assignment, model_path));
+        futures::future::join_all(jobs).await.into_iter().collect()
+    }
+
+    async fn prepare_worker(
+        &self,
+        assignment: &bitty_protocol::LayerAssignment,
+        model_path: &std::path::Path,
+    ) -> Result<WorkerRpcClient, Status> {
+        let profile = self
+            .registry
+            .lock()
+            .await
+            .profile(&assignment.node_id)
+            .ok_or_else(|| Status::failed_precondition("assignment references unknown worker"))?;
+        if profile.worker_endpoint.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "worker {} did not register a reachable endpoint",
+                profile.node_id.0
+            )));
+        }
+        let worker_model_path = if profile.model_path.is_empty() {
+            model_path.to_string_lossy().into_owned()
+        } else {
+            profile.model_path.clone()
+        };
+        let mut client = self.worker_client(&profile.worker_endpoint).await?;
+        let manifest = ShardManifestMessage {
+            shard_id: format!(
+                "{}:{}..{}",
+                assignment.node_id.0,
+                assignment.range.start_layer,
+                assignment.range.end_layer_exclusive
+            ),
+            node_id: assignment.node_id.clone(),
+            range: assignment.range.clone(),
+            byte_len: assignment.assigned_weight_bytes,
+            sha256_hex: String::new(),
+            path: worker_model_path,
+        };
+        let cache_key = format!("{}@{}", manifest.node_id.0, profile.worker_endpoint);
+        let needs_load = self
+            .shard_cache
+            .lock()
+            .await
+            .get(&cache_key)
+            .map(|cached| cached != &manifest)
+            .unwrap_or(true);
+        if needs_load {
+            client
+                .load_shard(LoadShardRequest {
+                    manifest: Some(ProtoShardManifest::from(&manifest)),
+                })
+                .await
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            self.shard_cache.lock().await.insert(cache_key, manifest);
+        }
+        Ok(client)
     }
 
     fn spawn_eviction_loop(self, timeout: Duration) {
@@ -288,60 +428,7 @@ impl NetworkCoordinator {
         });
         let mut text = TextStream::default();
 
-        let mut worker_clients = Vec::with_capacity(assignments.len());
-        for assignment in &assignments {
-            let profile = self
-                .registry
-                .lock()
-                .await
-                .profile(&assignment.node_id)
-                .ok_or_else(|| {
-                    Status::failed_precondition("assignment references unknown worker")
-                })?;
-            if profile.worker_endpoint.is_empty() {
-                return Err(Status::failed_precondition(format!(
-                    "worker {} did not register a reachable endpoint",
-                    profile.node_id.0
-                )));
-            }
-            let worker_model_path = if profile.model_path.is_empty() {
-                model_path.to_string_lossy().into_owned()
-            } else {
-                profile.model_path.clone()
-            };
-            let mut client = self.worker_client(&profile.worker_endpoint).await?;
-            let manifest = ShardManifestMessage {
-                shard_id: format!(
-                    "{}:{}..{}",
-                    assignment.node_id.0,
-                    assignment.range.start_layer,
-                    assignment.range.end_layer_exclusive
-                ),
-                node_id: assignment.node_id.clone(),
-                range: assignment.range.clone(),
-                byte_len: assignment.assigned_weight_bytes,
-                sha256_hex: String::new(),
-                path: worker_model_path,
-            };
-            let cache_key = format!("{}@{}", manifest.node_id.0, profile.worker_endpoint);
-            let needs_load = self
-                .shard_cache
-                .lock()
-                .await
-                .get(&cache_key)
-                .map(|cached| cached != &manifest)
-                .unwrap_or(true);
-            if needs_load {
-                client
-                    .load_shard(LoadShardRequest {
-                        manifest: Some(ProtoShardManifest::from(&manifest)),
-                    })
-                    .await
-                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
-                self.shard_cache.lock().await.insert(cache_key, manifest);
-            }
-            worker_clients.push(client);
-        }
+        let mut worker_clients = self.prepare_workers(&assignments, model_path).await?;
 
         let mut outputs = Vec::with_capacity(max_new_tokens as usize);
         let mut failure = None;

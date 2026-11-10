@@ -11,11 +11,11 @@ if len(sys.argv) < 3:
 BIN = os.environ.get("BITTY_STAGE_BIN", "bitty-stage")
 mode, MODEL = sys.argv[1], sys.argv[2]
 STEP = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-PROMPT, STEPS = 16, 60
+PROMPT, STEPS = 16, int(os.environ.get("BENCH_TOKENS", "60"))  # short runs flatter a machine that heats up
 TEXT = ("A steam engine turns heat into motion. Water is boiled in a closed vessel and the steam "
         "pushes a piston inside a cylinder. The piston moves a rod, the rod turns a wheel, and a "
         "valve lets the used steam out so the cycle can start again. Early engines were slow and "
-        "wasted most of their fuel, but they changed mines, mills, ships and railways for good.") * 2
+        "wasted most of their fuel, but they changed mines, mills, ships and railways for good. ") * (2 + STEPS // 60)
 
 def read(f, n):
     b = b""

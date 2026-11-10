@@ -453,6 +453,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         if let Some(iroh_node) = &iroh_node {
             coordinator =
                 coordinator.with_iroh_endpoint(iroh_node.endpoint.clone(), cluster_token.clone());
+            coordinator.spawn_background_loops();
             scheduler_service = Some(coordinator.clone());
         } else {
             let leader_addr = config.listen.clone();

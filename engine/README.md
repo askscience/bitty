@@ -113,6 +113,21 @@ node:
 Only the tensors of the range that go to the GPU take video memory, so a card
 too small for the model can still hold one stage of it.
 
+## Loading ahead of the first request
+
+The coordinator asks the workers to load their layers as soon as the cluster
+stops changing: when no node has joined or left for 10 seconds, every worker
+gets its range, fetches the stage file if it has none and starts its engine.
+The first request then finds everything in memory. The wait is there because
+every node that joins moves the ranges of the others, and a range that is about
+to change is not worth a download of several gigabytes.
+`BITTY_PREPARE_SETTLE_SECS` changes the wait; 0 turns this off, and the layers
+are loaded by the first request as before.
+
+Engines are started with `OMP_WAIT_POLICY=passive` unless the variable is
+already set, so a stage that waits for its turn does not keep the cores busy.
+See `docs/split-on-one-machine.md` for the measurements behind this.
+
 ## Text and sampling
 
 Workers only see token ids and hidden states. The coordinator, which is the
@@ -229,9 +244,8 @@ BITTY_STAGE_BIN=build-vk/bin/bitty-stage python3 engine/stage_bench.py gpu model
 - `bitty run --local` is not wired to the engine yet. `bitty chat` sends each
   line as a separate request with the default sampling and no memory of the
   earlier lines.
-- A node learns its layers only when a request arrives, so the stage download
-  delays that request; nothing is fetched ahead of time and old stage files are
-  not cleaned up.
+- Stage files are not checked against a hash and old ones are not cleaned up
+  when the range of a node changes.
 - GPU settings come from environment variables only, and nothing checks the
   free video memory before loading.
 - State save/load does not record the range.
