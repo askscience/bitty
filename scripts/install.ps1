@@ -59,17 +59,22 @@ function Assert-Platform {
     }
 }
 
-# Runs bitty quietly and returns its exit code. What bitty prints goes to the update log.
+# Runs bitty and returns its exit code. The output is deliberately not captured: a node that
+# `bitty restart` starts inherits the capture pipe and keeps it open for as long as it lives,
+# and PowerShell would wait on that pipe forever, with the update lock held.
 function Invoke-Bitty([string[]]$Arguments) {
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $output = & $Bitty @Arguments 2>&1 | Out-String
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $Bitty
+    $info.Arguments = ($Arguments -join ' ')
+    $info.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($info)
+    # two minutes are far more than any of these commands needs
+    if (-not $process.WaitForExit(120000)) {
+        Write-Log ("bitty {0} did not finish in two minutes" -f ($Arguments -join ' '))
+        return 1
     }
-    if ($code -ne 0) { Write-Log ("bitty {0} failed: {1}" -f ($Arguments -join ' '), $output.Trim()) }
+    $code = $process.ExitCode
+    if ($code -ne 0) { Write-Log ("bitty {0} failed with exit code {1}" -f ($Arguments -join ' '), $code) }
     return $code
 }
 
