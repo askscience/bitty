@@ -162,5 +162,5 @@ fn demo_layers(count: u32) -> Vec<LayerMetadata> {
 
 fn print_help() {
     println!("Usage: cargo run -p bitty-coordinator -- [--nodes N] [--layers N] [--listen ADDR] [--model PATH] [--token TOKEN]");
-    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /models/ggml-model-i2_s.gguf --layers 30 --token secret");
+    println!("Example: cargo run -p bitty-coordinator -- --listen 0.0.0.0:50051 --model /models/Qwen3.5-35B-A3B-Q4_K_M.gguf --layers 40 --token secret");
 }

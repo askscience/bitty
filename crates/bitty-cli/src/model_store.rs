@@ -111,14 +111,14 @@ pub fn resolve_model(settings: &BittySettings, name_or_path: &str) -> Option<Mod
                 .into(),
             tag: "local".into(),
             display_name: "Local GGUF model".into(),
-            backend: "bitnet-i2s".into(),
-            quantization: "i2_s".into(),
+            backend: "llama-cpp".into(),
+            quantization: "q4_k_m".into(),
             filename: path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("model.gguf")
                 .into(),
-            layers: 30,
+            layers: 40,
             temperature: settings.default_temperature,
             num_predict: settings.default_num_predict,
             num_ctx: settings.default_num_ctx,
@@ -264,8 +264,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_bitnet() {
-        let model = find_registry_model("bitnet-b1.58").unwrap();
-        assert_eq!(model.filename, "ggml-model-i2_s.gguf");
+    fn registry_contains_qwen() {
+        let model = find_registry_model("qwen3.5-35b-a3b").unwrap();
+        assert_eq!(model.filename, "Qwen3.5-35B-A3B-Q4_K_M.gguf");
     }
 }

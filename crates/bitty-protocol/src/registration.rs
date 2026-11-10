@@ -1,7 +1,7 @@
 use crate::pb::RegisterWorkerRequest;
 use crate::BITTY_PROTOCOL_VERSION;
 
-const SUPPORTED_BACKENDS: &[&str] = &["", "bitnet", "stub"];
+const SUPPORTED_BACKENDS: &[&str] = &["", "llama-cpp", "stub"];
 
 pub fn validate_register_worker(request: &RegisterWorkerRequest) -> Result<(), String> {
     let v = request.protocol_version;
@@ -13,7 +13,7 @@ pub fn validate_register_worker(request: &RegisterWorkerRequest) -> Result<(), S
     let backend = request.inference_backend_id.trim();
     if !SUPPORTED_BACKENDS.contains(&backend) {
         return Err(format!(
-            "unsupported inference_backend_id `{backend}` (supported: bitnet, stub)"
+            "unsupported inference_backend_id `{backend}` (supported: llama-cpp, stub)"
         ));
     }
     Ok(())
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn rejects_unknown_backend() {
         assert!(validate_register_worker(&req(1, "llama.cpp")).is_err());
-        assert!(validate_register_worker(&req(1, "bitnet")).is_ok());
+        assert!(validate_register_worker(&req(1, "llama-cpp")).is_ok());
         assert!(validate_register_worker(&req(1, "stub")).is_ok());
     }
 }

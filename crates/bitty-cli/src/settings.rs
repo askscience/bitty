@@ -36,7 +36,7 @@ impl BittySettings {
         Self {
             data_dir,
             models_dir,
-            default_model: "bitnet-b1.58".into(),
+            default_model: "qwen3.5-35b-a3b".into(),
             api_host: "127.0.0.1:11435".into(),
             auto_pull: true,
             auto_start_node: true,

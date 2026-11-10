@@ -77,7 +77,7 @@ message TokenOutput {
   uint64 gen_latency_us = 7;
 }
 
-message BitNetLogits {
+message Logits {
   string request_id = 1;
   uint32 token_position = 2;
   // Legacy path; prefer logits_f32_le when encoding (smaller on the wire for large vocabs).
@@ -103,7 +103,7 @@ message RegisterWorkerRequest {
   HardwareProfile profile = 1;
   // 0 = unspecified (treated as BITTY_PROTOCOL_VERSION 1 by current servers).
   uint32 protocol_version = 2;
-  // e.g. "bitnet", "stub"; empty means default BitNet stack.
+  // e.g. "llama-cpp", "stub"; empty means the default llama.cpp stage engine.
   string inference_backend_id = 3;
 }
 
@@ -184,7 +184,7 @@ service CoordinatorService {
 
 service WorkerService {
   rpc ForwardActivation(ActivationTensor) returns (ActivationTensor);
-  rpc FinalLogits(ActivationTensor) returns (BitNetLogits);
+  rpc FinalLogits(ActivationTensor) returns (Logits);
   rpc SampleToken(SampleTokenRequest) returns (TokenOutput);
   rpc ApplyTopology(TopologyUpdate) returns (HeartbeatResponse);
   rpc LoadShard(LoadShardRequest) returns (LoadShardResponse);

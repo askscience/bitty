@@ -6,7 +6,11 @@ use std::path::Path;
 use thiserror::Error;
 
 pub const GGUF_MAGIC: &[u8; 4] = b"GGUF";
-pub const GGML_TYPE_I2_S: u32 = 36;
+pub const GGML_TYPE_Q4_0: u32 = 2;
+pub const GGML_TYPE_Q4_1: u32 = 3;
+pub const GGML_TYPE_Q2_K: u32 = 10;
+pub const GGML_TYPE_Q3_K: u32 = 11;
+pub const GGML_TYPE_Q4_K: u32 = 12;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GgufFileMetadata {
@@ -32,10 +36,6 @@ impl GgufTensorInfo {
 
     pub fn layer_id(&self) -> Option<u32> {
         layer_id_from_tensor_name(&self.name)
-    }
-
-    pub fn is_i2_s(&self) -> bool {
-        self.ggml_type == GGML_TYPE_I2_S
     }
 }
 
@@ -64,7 +64,12 @@ pub enum GgufError {
 }
 
 pub fn parse_gguf_file(path: impl AsRef<Path>) -> Result<GgufFileMetadata, GgufError> {
-    let bytes = fs::read(path)?;
+    // Model files run to tens of gigabytes and only the header is needed, so map the file
+    // and let the parser touch just the pages it reads.
+    let file = fs::File::open(path)?;
+    // SAFETY: the mapping is read-only and dropped before returning; a concurrent truncate
+    // of a model file is not something the store does.
+    let bytes = unsafe { memmap2::Mmap::map(&file)? };
     parse_gguf_bytes(&bytes)
 }
 
@@ -128,24 +133,6 @@ pub fn parse_gguf_bytes(bytes: &[u8]) -> Result<GgufFileMetadata, GgufError> {
         metadata,
         tensors,
     })
-}
-
-pub fn decode_i2_s_block(block: &[u8; 32]) -> [i8; 128] {
-    let mut decoded = [0_i8; 128];
-    for gp in 0..32 {
-        let byte = block[gp];
-        for group in 0..4 {
-            let shift = 6 - 2 * group;
-            let code = (byte >> shift) & 0b11;
-            decoded[group * 32 + gp] = match code {
-                0b00 => 0,
-                0b01 => 1,
-                0b10 => -1,
-                _ => 0,
-            };
-        }
-    }
-    decoded
 }
 
 pub fn layer_id_from_tensor_name(name: &str) -> Option<u32> {
@@ -277,18 +264,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn i2_s_decodes_interleaved_groups() {
-        let mut block = [0_u8; 32];
-        block[0] = 0b01_10_00_01;
-        let decoded = decode_i2_s_block(&block);
-
-        assert_eq!(decoded[0], 1);
-        assert_eq!(decoded[32], -1);
-        assert_eq!(decoded[64], 0);
-        assert_eq!(decoded[96], 1);
-    }
 
     #[test]
     fn layer_id_parses_common_tensor_names() {

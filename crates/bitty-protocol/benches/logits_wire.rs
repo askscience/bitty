@@ -1,6 +1,6 @@
 //! Compare protobuf encode size and throughput for legacy `repeated float logits` vs `logits_f32_le`.
 use bitty_protocol::logits_codec::logits_f32_le_bytes;
-use bitty_protocol::pb::BitNetLogits;
+use bitty_protocol::pb::Logits;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use prost::Message;
 
@@ -9,7 +9,7 @@ fn sample_logits(len: usize) -> Vec<f32> {
 }
 
 fn encode_repeated(logits: &[f32]) -> Vec<u8> {
-    let msg = BitNetLogits {
+    let msg = Logits {
         request_id: "bench".into(),
         token_position: 0,
         logits: logits.to_vec(),
@@ -20,7 +20,7 @@ fn encode_repeated(logits: &[f32]) -> Vec<u8> {
 }
 
 fn encode_f32_le(logits: &[f32]) -> Vec<u8> {
-    let msg = BitNetLogits {
+    let msg = Logits {
         request_id: "bench".into(),
         token_position: 0,
         logits: Vec::new(),
@@ -35,12 +35,12 @@ fn bench_logits_encode(c: &mut Criterion) {
     let logits = sample_logits(n);
     let repeated_len = encode_repeated(&logits).len();
     let packed_len = encode_f32_le(&logits).len();
-    println!("BitNetLogits encode size n={n}: repeated={repeated_len} bytes, f32_le={packed_len} bytes");
+    println!("Logits encode size n={n}: repeated={repeated_len} bytes, f32_le={packed_len} bytes");
 
-    c.bench_function("bitnet_logits_encode_repeated_f32", |b| {
+    c.bench_function("logits_encode_repeated_f32", |b| {
         b.iter(|| black_box(encode_repeated(&logits)))
     });
-    c.bench_function("bitnet_logits_encode_logits_f32_le", |b| {
+    c.bench_function("logits_encode_logits_f32_le", |b| {
         b.iter(|| black_box(encode_f32_le(&logits)))
     });
 }

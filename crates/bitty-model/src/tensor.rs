@@ -24,7 +24,6 @@ impl LowBitTensor {
             Quantization::Q4 => elements.div_ceil(2),
             Quantization::Q3 => (elements * 3).div_ceil(8),
             Quantization::Q2 => elements.div_ceil(4),
-            Quantization::Bit1 => elements.div_ceil(8),
         }
     }
 

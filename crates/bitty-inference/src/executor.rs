@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, BitNetLogits};
+use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, Logits};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,13 +20,13 @@ pub trait LayerExecutor: Send + Sync {
 
     /// UTF-8 fragment for one sampled token id (cluster streaming). Override on real models.
     async fn decode_token_text(&self, token_id: u32) -> String {
-        format!("<bitnet-rs:{token_id}>")
+        format!("<token:{token_id}>")
     }
 
     async fn final_logits(
         &self,
         activation: ActivationTensor,
-    ) -> Result<BitNetLogits, ExecutorError> {
+    ) -> Result<Logits, ExecutorError> {
         if !activation.verify_checksum() {
             return Err(ExecutorError::ChecksumFailed);
         }
@@ -39,7 +39,7 @@ pub trait LayerExecutor: Send + Sync {
         let mut logits = vec![f32::NEG_INFINITY; 32_000];
         let index = (token as usize + 1) % logits.len();
         logits[index] = 0.0;
-        Ok(BitNetLogits::new(
+        Ok(Logits::new(
             activation.request_id,
             activation.token_position,
             logits,
@@ -151,7 +151,7 @@ impl RangeScale for AssignedLayerRange {
 
 /// Placeholder for a second inference engine: use with `inference_backend_id: "stub"` on
 /// [`bitty_protocol::pb::RegisterWorkerRequest`] so the coordinator rejects unknown backends
-/// without coupling workers to BitNet-only types.
+/// without coupling workers to one engine.
 #[derive(Clone, Debug, Default)]
 pub struct StubLayerExecutor;
 
@@ -178,7 +178,7 @@ mod tests {
         let range = AssignedLayerRange {
             start_layer: 0,
             end_layer_exclusive: 2,
-            quantization: Quantization::Bit1,
+            quantization: Quantization::Q4,
         };
         let activation =
             ActivationTensor::new("req", 0, 0, 0, vec![2], ActivationDType::Fp16, vec![1, 2]);
@@ -196,7 +196,7 @@ mod tests {
         let range = AssignedLayerRange {
             start_layer: 0,
             end_layer_exclusive: 1,
-            quantization: Quantization::Bit1,
+            quantization: Quantization::Q4,
         };
         let activation = ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
         let err = StubLayerExecutor

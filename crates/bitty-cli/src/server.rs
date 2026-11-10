@@ -161,8 +161,8 @@ mod tests {
             name: "demo".into(),
             tag: "latest".into(),
             filename: "demo.gguf".into(),
-            backend: "bitnet-i2s".into(),
-            quantization: "i2_s".into(),
+            backend: "llama-cpp".into(),
+            quantization: "q4_k_m".into(),
             ..Default::default()
         };
         write_manifest(&settings, &spec, &temp.join("demo.gguf")).unwrap();

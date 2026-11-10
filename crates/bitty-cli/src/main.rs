@@ -6,9 +6,8 @@ mod secrets;
 mod server;
 mod settings;
 
-use bitty_bitnet_runtime::BitNetRuntime;
 use bitty_coordinator::network::NetworkCoordinator;
-use bitty_inference::BitNetLayerExecutor;
+use bitty_inference::{StageExecutor, STAGE_BACKEND_ID};
 use bitty_protocol::endpoint::normalize_endpoint;
 use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
@@ -362,7 +361,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         .or_else(|| token_from_join(config.join.as_deref()))
         .unwrap_or_else(|| load_or_create_cluster_token(&data_dir));
     validate_cluster_token(&cluster_token)?;
-    let executor = Arc::new(BitNetLayerExecutor::load(&config.model).await?);
+    let executor = Arc::new(StageExecutor::load(&config.model).await?);
     let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
         .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
     let worker_stats = worker.runtime_stats();
@@ -576,16 +575,20 @@ async fn run_local_model(
         )
         .into());
     }
-    record_running_model(settings, &model.id())?;
-    let runtime = BitNetRuntime::load(&path).await?;
-    let text = runtime
-        .generate_full(
-            prompt,
-            max_tokens as usize,
-            temperature.parse().unwrap_or(model.temperature),
+    let executor = StageExecutor::load(&path).await?;
+    if !executor.engine_available() {
+        return Err(format!(
+            "local inference is not available yet: this build has no llama.cpp stage engine. \
+             {} was read correctly ({} blocks, architecture {}).",
+            path.display(),
+            executor.metadata().layer_count,
+            executor.metadata().architecture
         )
-        .await?;
-    println!("{text}");
+        .into());
+    }
+    // Reached only once the stage engine is linked in.
+    let _ = (prompt, max_tokens, temperature);
+    record_running_model(settings, &model.id())?;
     Ok(())
 }
 
@@ -920,7 +923,7 @@ async fn run_join(config: JoinConfig) -> Result<(), Box<dyn std::error::Error>> 
         worker_listen: None,
         public_endpoint: None,
         join: Some(invite),
-        layers: 30,
+        layers: 40,
         heartbeat_interval_ms: 1000,
         iroh: true,
         data_dir: config.data_dir,
@@ -937,7 +940,7 @@ async fn run_connect(config: JoinConfig) -> Result<(), Box<dyn std::error::Error
     remember_active_cluster(&data_dir, &invite)?;
     ensure_background_runtime(&settings, config.model, Some(invite)).await?;
     println!("connected to cluster `{name}`");
-    println!("You can now run: bitty run bitnet-b1.58 \"hello\"");
+    println!("You can now run: bitty run qwen3.5-35b-a3b \"hello\"");
     Ok(())
 }
 
@@ -1025,7 +1028,7 @@ async fn register_and_heartbeat(
                     RegisterWorkerRequest {
                         profile: Some((&profile).into()),
                         protocol_version: BITTY_PROTOCOL_VERSION,
-                        inference_backend_id: "bitnet".into(),
+                        inference_backend_id: STAGE_BACKEND_ID.into(),
                     },
                     cluster_token,
                 ))
@@ -1075,7 +1078,7 @@ async fn register_and_heartbeat(
                     RegisterWorkerRequest {
                         profile: Some((&profile).into()),
                         protocol_version: BITTY_PROTOCOL_VERSION,
-                        inference_backend_id: "bitnet".into(),
+                        inference_backend_id: STAGE_BACKEND_ID.into(),
                     },
                     cluster_token,
                 ))
@@ -1133,7 +1136,7 @@ async fn register_and_heartbeat(
                     &RegisterWorkerRequest {
                         profile: Some((&profile).into()),
                         protocol_version: BITTY_PROTOCOL_VERSION,
-                        inference_backend_id: "bitnet".into(),
+                        inference_backend_id: STAGE_BACKEND_ID.into(),
                     },
                 )
                 .await?;
@@ -1488,7 +1491,7 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
         worker_listen: None,
         public_endpoint: None,
         join: None,
-        layers: 30,
+        layers: 40,
         heartbeat_interval_ms: 1000,
         iroh: true,
         data_dir: None,
@@ -1933,7 +1936,7 @@ impl IrohNode {
     fn serve_protocols(
         &self,
         coordinator: Option<NetworkCoordinator>,
-        worker: NetworkWorker<BitNetLayerExecutor>,
+        worker: NetworkWorker<StageExecutor>,
         cluster_token: String,
     ) {
         let endpoint = self.endpoint.clone();
@@ -1994,7 +1997,7 @@ async fn start_iroh_client() -> Result<Endpoint, Box<dyn std::error::Error>> {
 async fn handle_iroh_request(
     incoming: iroh::endpoint::Incoming,
     coordinator: Option<NetworkCoordinator>,
-    worker: NetworkWorker<BitNetLayerExecutor>,
+    worker: NetworkWorker<StageExecutor>,
     cluster_token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = incoming.accept()?.await?;
@@ -2084,7 +2087,7 @@ async fn handle_scheduler_frame(
 
 async fn handle_worker_connection(
     connection: iroh::endpoint::Connection,
-    worker: NetworkWorker<BitNetLayerExecutor>,
+    worker: NetworkWorker<StageExecutor>,
     cluster_token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut send, mut recv) = connection.accept_bi().await?;
@@ -2104,7 +2107,7 @@ async fn handle_worker_connection(
 
 async fn handle_worker_frame(
     frame: IrohFrame,
-    worker: NetworkWorker<BitNetLayerExecutor>,
+    worker: NetworkWorker<StageExecutor>,
     cluster_token: &str,
 ) -> Result<IrohFrame, Box<dyn std::error::Error>> {
     let response = match frame.op {
@@ -2499,7 +2502,7 @@ fn default_model_path(data_dir: &Path) -> String {
         .unwrap_or_else(|| {
             settings
                 .models_dir
-                .join("bitnet-b1.58/latest/ggml-model-i2_s.gguf")
+                .join("qwen3.5-35b-a3b/latest/Qwen3.5-35B-A3B-Q4_K_M.gguf")
                 .display()
                 .to_string()
         })
@@ -2913,7 +2916,7 @@ mod tests {
         assert!(matches!(
             Cli::parse(vec![
                 "run".into(),
-                "bitnet-b1.58".into(),
+                "qwen3.5-35b-a3b".into(),
                 "hello".into(),
                 "--num-predict".into(),
                 "4".into()
@@ -2922,11 +2925,11 @@ mod tests {
             CliCommand::Run(RunConfig { max_tokens: 4, .. })
         ));
         assert!(matches!(
-            Cli::parse(vec!["run".into(), "bitnet-b1.58".into(), "--local".into()]).unwrap(),
+            Cli::parse(vec!["run".into(), "qwen3.5-35b-a3b".into(), "--local".into()]).unwrap(),
             CliCommand::Run(RunConfig { local: true, .. })
         ));
         assert!(matches!(
-            Cli::parse(vec!["pull".into(), "bitnet-b1.58".into()]).unwrap(),
+            Cli::parse(vec!["pull".into(), "qwen3.5-35b-a3b".into()]).unwrap(),
             CliCommand::Pull(ModelCommand { .. })
         ));
         assert!(matches!(
@@ -2951,7 +2954,7 @@ mod tests {
                 "settings".into(),
                 "set".into(),
                 "default_model".into(),
-                "bitnet-b1.58".into()
+                "qwen3.5-35b-a3b".into()
             ])
             .unwrap(),
             CliCommand::Settings(SettingsCommand::Set { .. })
@@ -3004,7 +3007,7 @@ mod tests {
             Cli::parse(vec![
                 "start".into(),
                 "--model".into(),
-                "bitnet-b1.58".into()
+                "qwen3.5-35b-a3b".into()
             ])
             .unwrap(),
             CliCommand::Start(StartConfig { model: Some(_), .. })

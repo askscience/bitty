@@ -1,4 +1,4 @@
-use crate::{ActivationTensor, BitNetLogits, GenerateRequest, ProtocolConversionError};
+use crate::{ActivationTensor, Logits, GenerateRequest, ProtocolConversionError};
 
 pub const MAX_ACTIVATION_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ACTIVATION_RANK: usize = 8;
@@ -37,7 +37,7 @@ pub fn validate_generate_request(request: &GenerateRequest) -> Result<(), Protoc
     Ok(())
 }
 
-pub fn validate_logits(logits: &BitNetLogits) -> Result<(), ProtocolConversionError> {
+pub fn validate_logits(logits: &Logits) -> Result<(), ProtocolConversionError> {
     if logits.logits.len() > MAX_LOGITS {
         return Err(ProtocolConversionError::Validation(format!(
             "logits length exceeds {MAX_LOGITS}"

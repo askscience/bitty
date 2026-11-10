@@ -223,7 +223,7 @@ impl NetworkCoordinator {
                 request_id: request_id.clone(),
                 token_position,
                 token_id,
-                text: format!("<bitnet-rs:{token_id}>"),
+                text: format!("<token:{token_id}>"),
                 finished: token_position + 1 == max_new_tokens,
                 log_prob: 0.0,
                 gen_latency_us: started.elapsed().as_micros() as u64,

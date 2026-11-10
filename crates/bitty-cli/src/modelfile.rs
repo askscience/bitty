@@ -19,14 +19,14 @@ impl BittyModelfile {
             name: name.into(),
             tag: "latest".into(),
             display_name: name.into(),
-            backend: "bitnet-i2s".into(),
-            quantization: "i2_s".into(),
+            backend: "llama-cpp".into(),
+            quantization: "q4_k_m".into(),
             filename: Path::new(&self.from)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("model.gguf")
                 .into(),
-            layers: 30,
+            layers: 40,
             temperature: 0.7,
             num_predict: 128,
             num_ctx: 2048,

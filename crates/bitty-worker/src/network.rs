@@ -2,7 +2,7 @@ use crate::{metrics, RingWorker};
 use bitty_inference::{FakeLayerExecutor, LayerExecutor};
 use bitty_protocol::pb::worker_service_server::{WorkerService, WorkerServiceServer};
 use bitty_protocol::pb::{
-    ActivationTensor as ProtoActivationTensor, BitNetLogits as ProtoBitNetLogits, CleanupRequest,
+    ActivationTensor as ProtoActivationTensor, Logits as ProtoLogits, CleanupRequest,
     CleanupResponse, HeartbeatResponse, LoadShardRequest, LoadShardResponse, SampleTokenRequest,
     TokenOutput as ProtoTokenOutput, TopologyUpdate,
 };
@@ -193,7 +193,7 @@ where
     async fn final_logits(
         &self,
         request: Request<ProtoActivationTensor>,
-    ) -> Result<Response<ProtoBitNetLogits>, Status> {
+    ) -> Result<Response<ProtoLogits>, Status> {
         if let Some(status) = self.authorize_status(&request) {
             return Err(status);
         }

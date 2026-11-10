@@ -20,4 +20,3 @@ thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
-wgpu.workspace = true

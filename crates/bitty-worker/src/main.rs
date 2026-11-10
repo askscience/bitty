@@ -1,4 +1,4 @@
-use bitty_inference::{BitNetLayerExecutor, FakeLayerExecutor};
+use bitty_inference::{StageExecutor, FakeLayerExecutor};
 use bitty_protocol::cli::{parse_next_or_exit, required_next_or_exit};
 use bitty_protocol::endpoint::normalize_endpoint;
 use bitty_protocol::BITTY_PROTOCOL_VERSION;
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(listen_addr) = &config.listen {
         if let Some(model_path) = &config.model {
-            let executor = Arc::new(BitNetLayerExecutor::load(model_path).await?);
+            let executor = Arc::new(StageExecutor::load(model_path).await?);
             let worker = NetworkWorker::new(NodeId::new(config.node_id.clone()), executor)
                 .with_auth_mode(config.auth_mode());
             if let Some(coordinator) = &config.coordinator {
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             range: AssignedLayerRange {
                 start_layer: 0,
                 end_layer_exclusive: 1,
-                quantization: Quantization::Bit1,
+                quantization: Quantization::Q4,
             },
             assigned_weight_bytes: 128,
             expected_latency_ms: 1.0,
@@ -108,7 +108,7 @@ async fn run_network_worker(
                 profile: Some((&profile).into()),
                 protocol_version: BITTY_PROTOCOL_VERSION,
                 inference_backend_id: if config.model.is_some() {
-                    "bitnet".into()
+                    bitty_inference::STAGE_BACKEND_ID.into()
                 } else {
                     "stub".into()
                 },

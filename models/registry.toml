@@ -1,15 +1,15 @@
-# Built-in Bitty model registry.
+# Built-in Bitty model registry. Bitty serves a single model, split into layer ranges across peers.
 
 [[model]]
-name = "bitnet-b1.58"
+name = "qwen3.5-35b-a3b"
 tag = "latest"
-display_name = "Microsoft BitNet b1.58 2B 4T"
-backend = "bitnet-i2s"
-quantization = "i2_s"
-filename = "ggml-model-i2_s.gguf"
-layers = 30
-url = "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf"
-source = "microsoft/bitnet-b1.58-2B-4T-gguf"
+display_name = "Qwen3.5 35B A3B (Q4_K_M)"
+backend = "llama-cpp"
+quantization = "q4_k_m"
+filename = "Qwen3.5-35B-A3B-Q4_K_M.gguf"
+layers = 40
+url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf"
+source = "unsloth/Qwen3.5-35B-A3B-GGUF"
 temperature = 0.7
 num_predict = 128
-num_ctx = 2048
+num_ctx = 8192

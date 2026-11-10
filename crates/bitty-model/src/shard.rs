@@ -143,7 +143,7 @@ mod tests {
         let range = AssignedLayerRange {
             start_layer: 0,
             end_layer_exclusive: 1,
-            quantization: Quantization::Bit1,
+            quantization: Quantization::Q4,
         };
         let manifest =
             WeightShardManifest::for_file("shard-0", NodeId::new("node-0"), range, &path).unwrap();

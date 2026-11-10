@@ -27,11 +27,11 @@ Usage:
 
 Common:
   scripts/install_bitty.sh
-  bitty pull bitnet-b1.58
-  bitty node --model ~/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf
-  bitty run bitnet-b1.58
-  scripts/install_bitty.sh --role node --model bitnet-b1.58
-  scripts/install_bitty.sh --role join --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE' --model /models/ggml-model-i2_s.gguf
+  bitty pull qwen3.5-35b-a3b
+  bitty node --model ~/.bitty/models/qwen3.5-35b-a3b/latest/Qwen3.5-35B-A3B-Q4_K_M.gguf
+  bitty run qwen3.5-35b-a3b
+  scripts/install_bitty.sh --role node --model qwen3.5-35b-a3b
+  scripts/install_bitty.sh --role join --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE' --model /models/Qwen3.5-35B-A3B-Q4_K_M.gguf
   scripts/install_bitty.sh --role client --join 'iroh://INVITE_FROM_BITTY_CLUSTER_INVITE'
 
 Options:
@@ -291,7 +291,7 @@ if [ "$RUN_TESTS" = "1" ]; then
 fi
 
 mkdir -p "$BIN_DIR"
-for bin in bitty bitty-coordinator bitty-worker bitty-client bitty-rust-bitnet bitty-sim; do
+for bin in bitty bitty-coordinator bitty-worker bitty-client bitty-sim; do
   if [ -x "$TARGET_DIR/$bin" ]; then
     ln -sf "$TARGET_DIR/$bin" "$BIN_DIR/$bin"
   fi
@@ -330,7 +330,7 @@ fi
 case "$ROLE" in
   node)
     if [ -z "$MODEL_PATH" ]; then
-      MODEL_PATH="$HOME/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf"
+      MODEL_PATH="$HOME/.bitty/models/qwen3.5-35b-a3b/latest/Qwen3.5-35B-A3B-Q4_K_M.gguf"
     fi
     if [ -z "$WORKER_LISTEN" ]; then
       WORKER_LISTEN="0.0.0.0:50061"
@@ -341,7 +341,7 @@ Start Bitty:
   $BIN_DIR/bitty share home
 
 Then use the cluster:
-  $BIN_DIR/bitty run bitnet-b1.58
+  $BIN_DIR/bitty run qwen3.5-35b-a3b
   $BIN_DIR/bitty cluster status
   $BIN_DIR/bitty cluster benchmark
 
@@ -354,7 +354,7 @@ EOF
     ;;
   join)
     if [ -z "$MODEL_PATH" ]; then
-      MODEL_PATH="$HOME/.bitty/models/bitnet-b1.58/latest/ggml-model-i2_s.gguf"
+      MODEL_PATH="$HOME/.bitty/models/qwen3.5-35b-a3b/latest/Qwen3.5-35B-A3B-Q4_K_M.gguf"
     fi
     if [ -z "$JOIN" ]; then
       JOIN="iroh://INVITE_FROM_BITTY_INVITE"
@@ -365,7 +365,7 @@ Join an existing Bitty node:
   $BIN_DIR/bitty connect "$JOIN" --name home --model "$MODEL_PATH"
 
 Then use Bitty without repeating the invite:
-  $BIN_DIR/bitty run bitnet-b1.58
+  $BIN_DIR/bitty run qwen3.5-35b-a3b
   $BIN_DIR/bitty cluster check
   $BIN_DIR/bitty cluster benchmark
 
@@ -382,7 +382,7 @@ Save the cluster target:
   $BIN_DIR/bitty use "$JOIN" --name home
 
 Send requests:
-  $BIN_DIR/bitty run bitnet-b1.58 "Hello"
+  $BIN_DIR/bitty run qwen3.5-35b-a3b "Hello"
   $BIN_DIR/bitty cluster status
   $BIN_DIR/bitty cluster benchmark
 EOF

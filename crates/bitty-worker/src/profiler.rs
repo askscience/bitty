@@ -161,7 +161,7 @@ fn configured_gpu_probe() -> GpuProbe {
         };
     }
     detect_nvml_gpus()
-        .or_else(detect_wgpu_adapters)
+        .or_else(detect_system_gpus)
         .unwrap_or_default()
 }
 
@@ -185,25 +185,72 @@ fn detect_nvml_gpus() -> Option<GpuProbe> {
     })
 }
 
-fn detect_wgpu_adapters() -> Option<GpuProbe> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+/// GPU discovery without a graphics stack: DRM sysfs on Linux, the built-in GPU on Apple
+/// silicon. NVIDIA cards are handled by NVML before this runs.
+fn detect_system_gpus() -> Option<GpuProbe> {
+    #[cfg(target_os = "linux")]
+    {
+        detect_drm_gpus(std::path::Path::new("/sys/class/drm"))
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some(GpuProbe {
+            gpus: vec![GpuInfo {
+                name: "Apple GPU".into(),
+                vram_mb: 0,
+                compute_capability: 0x106b,
+            }],
+            backend_type: Some("metal:apple".into()),
+        })
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    {
+        None
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn detect_drm_gpus(drm_root: &std::path::Path) -> Option<GpuProbe> {
+    let mut cards: Vec<_> = std::fs::read_dir(drm_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            // `card0`, not connectors such as `card0-eDP-1`.
+            entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("card")
+                    .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .map(|entry| entry.path())
+        .collect();
+    cards.sort();
+
     let mut gpus = Vec::new();
     let mut backend_type = None;
-    for adapter in adapters {
-        let info = adapter.get_info();
-        if matches!(info.device_type, wgpu::DeviceType::Cpu) {
+    for card in cards {
+        let device = card.join("device");
+        let Some(vendor_id) = std::fs::read_to_string(device.join("vendor"))
+            .ok()
+            .and_then(|raw| u32::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok())
+        else {
             continue;
-        }
-        let vendor = vendor_name(info.vendor);
-        let backend = format!("{:?}", info.backend).to_ascii_lowercase();
+        };
+        let vendor = vendor_name(vendor_id);
+        // amdgpu exposes dedicated VRAM here; integrated GPUs share system memory and report none.
+        let vram_mb = std::fs::read_to_string(device.join("mem_info_vram_total"))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map_or(0, |bytes| bytes / 1024 / 1024);
         if backend_type.is_none() {
-            backend_type = Some(format!("{backend}:{vendor}"));
+            backend_type = Some(format!("vulkan:{vendor}"));
         }
         gpus.push(GpuInfo {
-            name: format!("{} ({backend}, {vendor})", info.name),
-            vram_mb: 0,
-            compute_capability: info.vendor as u64,
+            name: format!("{vendor} GPU"),
+            vram_mb,
+            compute_capability: vendor_id as u64,
         });
     }
     (!gpus.is_empty()).then_some(GpuProbe { gpus, backend_type })
@@ -286,6 +333,23 @@ fn detect_disk_bandwidth_mbps() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drm_probe_reads_cards_and_skips_connectors() {
+        let root = std::env::temp_dir().join(format!("bitty-drm-{}", std::process::id()));
+        let card = root.join("card1/device");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::create_dir_all(root.join("card1-eDP-1")).unwrap();
+        std::fs::write(card.join("vendor"), "0x1002\n").unwrap();
+        std::fs::write(card.join("mem_info_vram_total"), "8589934592\n").unwrap();
+
+        let probe = detect_drm_gpus(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(probe.gpus.len(), 1);
+        assert_eq!(probe.gpus[0].vram_mb, 8192);
+        assert_eq!(probe.backend_type.as_deref(), Some("vulkan:amd"));
+    }
 
     #[test]
     fn ram_override_populates_profile() {

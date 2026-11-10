@@ -79,7 +79,6 @@ pub enum Quantization {
     Q4,
     Q3,
     Q2,
-    Bit1,
 }
 
 impl Quantization {
@@ -89,7 +88,6 @@ impl Quantization {
             Self::Q4 => 0.5,
             Self::Q3 => 0.375,
             Self::Q2 => 0.25,
-            Self::Bit1 => 0.125,
         }
     }
 
@@ -99,7 +97,6 @@ impl Quantization {
             Self::Q4 => "q4",
             Self::Q3 => "q3",
             Self::Q2 => "q2",
-            Self::Bit1 => "bit1",
         }
     }
 }
@@ -113,7 +110,6 @@ impl TryFrom<&str> for Quantization {
             "q4" => Ok(Self::Q4),
             "q3" => Ok(Self::Q3),
             "q2" => Ok(Self::Q2),
-            "bit1" => Ok(Self::Bit1),
             other => Err(ProtocolConversionError::UnknownQuantization(other.into())),
         }
     }
@@ -367,14 +363,14 @@ pub struct GenerateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BitNetLogits {
+pub struct Logits {
     pub request_id: String,
     pub token_position: u32,
     pub logits: Vec<f32>,
     pub crc32: u32,
 }
 
-impl BitNetLogits {
+impl Logits {
     pub fn new(request_id: impl Into<String>, token_position: u32, logits: Vec<f32>) -> Self {
         let payload = logits
             .iter()
@@ -674,8 +670,8 @@ impl TryFrom<pb::GenerateRequest> for GenerateRequest {
     }
 }
 
-impl From<&BitNetLogits> for pb::BitNetLogits {
-    fn from(logits: &BitNetLogits) -> Self {
+impl From<&Logits> for pb::Logits {
+    fn from(logits: &Logits) -> Self {
         Self {
             request_id: logits.request_id.clone(),
             token_position: logits.token_position,
@@ -686,10 +682,10 @@ impl From<&BitNetLogits> for pb::BitNetLogits {
     }
 }
 
-impl TryFrom<pb::BitNetLogits> for BitNetLogits {
+impl TryFrom<pb::Logits> for Logits {
     type Error = ProtocolConversionError;
 
-    fn try_from(logits: pb::BitNetLogits) -> Result<Self, Self::Error> {
+    fn try_from(logits: pb::Logits) -> Result<Self, Self::Error> {
         let vec = if !logits.logits_f32_le.is_empty() {
             logits_codec::logits_from_f32_le_bytes(&logits.logits_f32_le)?
         } else {
@@ -819,7 +815,7 @@ mod tests {
             range: AssignedLayerRange {
                 start_layer: 0,
                 end_layer_exclusive: 2,
-                quantization: Quantization::Bit1,
+                quantization: Quantization::Q4,
             },
             byte_len: 128,
             sha256_hex: "abc123".into(),
@@ -869,12 +865,12 @@ mod tests {
     }
 
     #[test]
-    fn bitnet_logits_round_trips_through_f32_le_wire() {
-        let logits = BitNetLogits::new("r", 1, vec![1.0, -2.5, f32::NAN]);
-        let proto = pb::BitNetLogits::from(&logits);
+    fn logits_round_trips_through_f32_le_wire() {
+        let logits = Logits::new("r", 1, vec![1.0, -2.5, f32::NAN]);
+        let proto = pb::Logits::from(&logits);
         assert!(proto.logits.is_empty());
         assert_eq!(proto.logits_f32_le.len(), 12);
-        let decoded = BitNetLogits::try_from(proto).unwrap();
+        let decoded = Logits::try_from(proto).unwrap();
         assert_eq!(decoded.request_id, logits.request_id);
         assert_eq!(decoded.token_position, logits.token_position);
         assert_eq!(decoded.crc32, logits.crc32);
@@ -889,15 +885,15 @@ mod tests {
     }
 
     #[test]
-    fn bitnet_logits_legacy_repeated_float_still_decodes() {
-        let proto = pb::BitNetLogits {
+    fn logits_legacy_repeated_float_still_decodes() {
+        let proto = pb::Logits {
             request_id: "x".into(),
             token_position: 0,
             logits: vec![1.0, 2.0],
             crc32: 0,
             logits_f32_le: Vec::new(),
         };
-        let decoded = BitNetLogits::try_from(proto).unwrap();
+        let decoded = Logits::try_from(proto).unwrap();
         assert_eq!(decoded.logits, vec![1.0, 2.0]);
     }
 }
