@@ -21,6 +21,8 @@ process load and run only a layer range.
 - Non-final stages return the raw residual stream through
   `llama_get_embeddings` (context created with `embeddings = true` and
   `LLAMA_POOLING_TYPE_NONE`). The final stage returns logits as usual.
+- Tensors outside the range are also not required to exist, so a stage can load a
+  file that holds only its own tensors (see "Stage files" below).
 - KV cache and recurrent (Gated DeltaNet) state are allocated only for the
   layers in the range.
 - Only the `qwen35` and `qwen35moe` architectures are supported; other
@@ -61,6 +63,32 @@ BITTY_STAGE_BIN=$PWD/build/bin/bitty-stage BITTY_TEST_MODEL=/path/to/Qwen3.5-0.8
 greedy generation through a chain of stages cut at the given layers, and compares
 the logits at every position.
 
+## Stage files
+
+A peer does not need the whole model on disk. A stage file is a normal GGUF with
+the full metadata (hyperparameters, tokenizer) and only the tensors of one layer
+range, plus the keys `bitty.stage.layer_start` / `bitty.stage.layer_end`:
+
+```sh
+bitty pull qwen3.5-35b-a3b --layers 10..20      # END is not included
+bitty pull /path/to/model.gguf --layers 0..10 --output stage-0-10.gguf
+bitty pull https://host/model.gguf --layers 30..40
+```
+
+When the whole model is already on disk it is used as the source. Otherwise bitty
+reads the header of the published file and then only the byte ranges of the
+stage's tensors, with HTTP range requests through `curl`; neighbouring tensors
+are fetched as one request. The code is in `crates/bitty-model/src/stage_file.rs`.
+
+The stage process is started on the stage file exactly as on the whole model,
+with the same `--start` / `--end`. `llama-stage-check -s a.gguf,b.gguf,...` runs
+the chain with one file per stage and compares it with the whole model given by
+`-m`.
+
+Limits: the downloaded ranges are protected only by TLS, there is no hash check
+of a stage file against the published model yet, and an interrupted pull starts
+again from the beginning.
+
 ## Verified so far
 
 Qwen3.5-0.8B Q4_K_M (dense `qwen35`, 24 layers), CPU: logits are bit-identical
@@ -76,6 +104,13 @@ Qwen3.5-35B-A3B Q4_K_M (`qwen35moe`, 40 layers, the real target), CPU: cuts
 `10,20,30` give logits bit-identical to the whole model. Weight buffers: whole
 model 20986 MiB; the four stages 5537, 5015, 5021 and 5413 MiB.
 
+Stage files: on the 0.8B model the three files for cuts `8,16` are 309, 109 and
+310 MiB (whole file 508 MiB) and give bit-identical logits; the middle one pulled
+from HuggingFace with range requests is byte-identical to the one built from the
+local copy. On the 35B model the four files for cuts `10,20,30` are 5547, 5025,
+5032 and 5423 MiB (whole file 20996 MiB): the chain running on
+those four files gives logits bit-identical to the whole model.
+
 ## Not done yet
 
 - The coordinator still turns a text prompt into bytes instead of tokens; the
@@ -83,7 +118,7 @@ model 20986 MiB; the four stages 5537, 5015, 5021 and 5413 MiB.
   not call it yet. Chat templates and sampling other than greedy are missing too.
 
 - GPU offload: `n_gpu_layers` is not rebased to the range.
-- A stage still needs the whole GGUF file on disk; per-stage files are future work.
+- Workers do not fetch their stage file on their own when they get a layer
+  assignment; `bitty pull --layers` is a manual step for now.
 - State save/load does not record the range.
-- `llama_model_size` (and the "MiB of weights" line of the check tool) still
-  reports the whole file.
+- `llama_model_size` still reports the whole file for a stage loaded from it.

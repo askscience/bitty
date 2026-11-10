@@ -74,6 +74,25 @@ pub fn parse_gguf_file(path: impl AsRef<Path>) -> Result<GgufFileMetadata, GgufE
 }
 
 pub fn parse_gguf_bytes(bytes: &[u8]) -> Result<GgufFileMetadata, GgufError> {
+    parse_gguf_prefix(bytes, bytes.len() as u64).map(|layout| layout.header)
+}
+
+/// Where the sections of a GGUF file sit, so that a file can be rewritten without decoding
+/// every metadata value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GgufLayout {
+    pub header: GgufFileMetadata,
+    pub metadata_count: u64,
+    /// Byte range of the raw key/value section.
+    pub metadata_start: u64,
+    pub metadata_end: u64,
+    /// File offset the tensor offsets are relative to.
+    pub data_start: u64,
+}
+
+/// Parses the header from the first bytes of a file that is `file_len` bytes long.
+/// Returns [`GgufError::UnexpectedEof`] when `bytes` does not hold the whole header yet.
+pub fn parse_gguf_prefix(bytes: &[u8], file_len: u64) -> Result<GgufLayout, GgufError> {
     let mut reader = Reader::new(bytes);
     if reader.read_bytes(4)? != GGUF_MAGIC {
         return Err(GgufError::InvalidMagic);
@@ -82,6 +101,7 @@ pub fn parse_gguf_bytes(bytes: &[u8]) -> Result<GgufFileMetadata, GgufError> {
     let version = reader.read_u32()?;
     let tensor_count = reader.read_u64()?;
     let metadata_count = reader.read_u64()?;
+    let metadata_start = reader.offset() as u64;
     let mut metadata = HashMap::new();
     let mut alignment = 32_u64;
 
@@ -91,15 +111,17 @@ pub fn parse_gguf_bytes(bytes: &[u8]) -> Result<GgufFileMetadata, GgufError> {
         let value = reader.read_metadata_value(value_type)?;
         if key == "general.alignment" {
             alignment = match value {
-                GgufMetadataValue::U64(value) => value,
+                GgufMetadataValue::U64(value) => value.max(1),
                 GgufMetadataValue::I64(value) => value.max(1) as u64,
                 _ => alignment,
             };
         }
         metadata.insert(key, value);
     }
+    let metadata_end = reader.offset() as u64;
 
-    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    // the count comes from the file: do not trust it for the allocation
+    let mut tensors = Vec::with_capacity(tensor_count.min(65_536) as usize);
     for _ in 0..tensor_count {
         let name = reader.read_string()?;
         let dimension_count = reader.read_u32()?;
@@ -118,20 +140,30 @@ pub fn parse_gguf_bytes(bytes: &[u8]) -> Result<GgufFileMetadata, GgufError> {
     }
 
     let data_start = align_to(reader.offset() as u64, alignment);
-    for index in 0..tensors.len() {
-        let start = data_start + tensors[index].offset;
-        let end = tensors
-            .get(index + 1)
-            .map(|next| data_start + next.offset)
-            .unwrap_or(bytes.len() as u64);
-        tensors[index].byte_len = end.saturating_sub(start);
+    // a tensor ends where the next one in the file begins
+    let mut starts: Vec<u64> = tensors.iter().map(|tensor| tensor.offset).collect();
+    starts.sort_unstable();
+    for tensor in &mut tensors {
+        let next = starts.partition_point(|start| *start <= tensor.offset);
+        let end = starts
+            .get(next)
+            .map(|offset| data_start + offset)
+            .unwrap_or(file_len);
+        tensor.byte_len = end.saturating_sub(data_start + tensor.offset);
     }
 
-    Ok(GgufFileMetadata {
+    let header = GgufFileMetadata {
         version,
         alignment,
         metadata,
         tensors,
+    };
+    Ok(GgufLayout {
+        header,
+        metadata_count,
+        metadata_start,
+        metadata_end,
+        data_start,
     })
 }
 

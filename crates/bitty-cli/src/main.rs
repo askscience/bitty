@@ -33,7 +33,9 @@ use bitty_worker::{
     HardwareProfiler,
 };
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
-use model_store::{copy_model, installed_models, pull_model, remove_model, resolve_model};
+use model_store::{
+    copy_model, installed_models, pull_model, pull_stage, remove_model, resolve_model,
+};
 use settings::BittySettings;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -191,6 +193,9 @@ struct RunConfig {
 struct ModelCommand {
     model: String,
     data_dir: Option<String>,
+    /// `pull --layers A..B`: fetch only that layer range.
+    layers: Option<(u32, u32)>,
+    output: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -598,6 +603,28 @@ async fn run_pull(config: ModelCommand) -> Result<(), Box<dyn std::error::Error>
         &settings.data_dir,
         format!("pulling model {}", config.model),
     )?;
+    if let Some((start, end)) = config.layers {
+        let output = config.output.as_deref().map(std::path::Path::new);
+        let (path, report) = pull_stage(&settings, &config.model, start, end, output)?;
+        const MIB: f64 = 1024.0 * 1024.0;
+        println!(
+            "pulled layers {start}..{end} of {} to {}",
+            config.model,
+            path.display()
+        );
+        println!(
+            "{} of {} tensors, {:.0} MiB of {:.0} MiB ({:.0} MiB read from the source)",
+            report.tensors,
+            report.source_tensors,
+            report.bytes as f64 / MIB,
+            report.source_bytes as f64 / MIB,
+            report.fetched_bytes as f64 / MIB
+        );
+        return Ok(());
+    }
+    if config.output.is_some() {
+        return Err("--output needs --layers".into());
+    }
     let model = pull_model(&settings, &config.model)?;
     println!(
         "pulled {} to {}",
@@ -1626,6 +1653,18 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
     Ok(config)
 }
 
+/// `A..B`: layers from A up to, not including, B.
+fn parse_layer_range(value: &str) -> Result<(u32, u32), String> {
+    let invalid = || format!("--layers expects START..END (end not included), got {value}");
+    let (start, end) = value.split_once("..").ok_or_else(invalid)?;
+    let start: u32 = start.trim().parse().map_err(|_| invalid())?;
+    let end: u32 = end.trim().parse().map_err(|_| invalid())?;
+    if start >= end {
+        return Err(invalid());
+    }
+    Ok((start, end))
+}
+
 fn parse_model_command(
     args: &mut impl Iterator<Item = String>,
     command: &str,
@@ -1633,10 +1672,18 @@ fn parse_model_command(
     let mut config = ModelCommand {
         model: String::new(),
         data_dir: None,
+        layers: None,
+        output: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
+            "--layers" if command == "pull" => {
+                config.layers = Some(parse_layer_range(&required_next(args, "--layers")?)?)
+            }
+            "--output" if command == "pull" => {
+                config.output = Some(required_next(args, "--output")?)
+            }
             value if config.model.is_empty() => config.model = value.into(),
             other => return Err(format!("unknown {command} argument: {other}")),
         }
@@ -2748,6 +2795,7 @@ fn print_help() {
     println!("  bitty restart");
     println!("  bitty run MODEL [PROMPT] [--local|--node TARGET]");
     println!("  bitty pull MODEL");
+    println!("  bitty pull MODEL --layers START..END [--output FILE]");
     println!("  bitty ls | bitty list");
     println!("  bitty show MODEL");
     println!("  bitty ps");
@@ -3126,5 +3174,25 @@ mod tests {
         assert!(matches!(leader, CliCommand::Node(_)));
         assert!(matches!(joined, CliCommand::Node(_)));
         assert!(matches!(generate, CliCommand::Generate(_)));
+    }
+
+    #[test]
+    fn parses_pull_with_a_layer_range() {
+        let command = Cli::parse(vec![
+            "pull".into(),
+            "qwen3.5-35b-a3b".into(),
+            "--layers".into(),
+            "10..20".into(),
+        ])
+        .unwrap();
+        match command {
+            CliCommand::Pull(config) => assert_eq!(config.layers, Some((10, 20))),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        for bad in ["20..10", "5", "a..b", "3..3"] {
+            assert!(parse_layer_range(bad).is_err(), "{bad}");
+        }
+        // only pull takes a range
+        assert!(Cli::parse(vec!["show".into(), "m".into(), "--layers".into(), "0..1".into()]).is_err());
     }
 }

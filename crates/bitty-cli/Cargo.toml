@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 bitty-coordinator.workspace = true
 bitty-inference.workspace = true
+bitty-model.workspace = true
 bitty-protocol.workspace = true
 bitty-worker.workspace = true
 futures.workspace = true

@@ -161,6 +161,66 @@ pub fn pull_model(
     Ok(spec)
 }
 
+/// Where the stage file for layers `[start, end)` of a model lives.
+pub fn stage_path(settings: &BittySettings, spec: &ModelSpec, start: u32, end: u32) -> PathBuf {
+    let stem = Path::new(&spec.filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("model");
+    spec.model_dir(settings)
+        .join("stages")
+        .join(format!("{stem}.layers-{start}-{end}.gguf"))
+}
+
+/// Fetches only the layers `[start, end)` of a model into a stage file.
+///
+/// `model` is a registry name, a local GGUF or an http(s) URL. A whole copy already on disk is
+/// used as the source, otherwise the tensors come from the model URL with range requests.
+pub fn pull_stage(
+    settings: &BittySettings,
+    model: &str,
+    start: u32,
+    end: u32,
+    output: Option<&Path>,
+) -> Result<(PathBuf, bitty_model::StageFileReport), Box<dyn std::error::Error>> {
+    let is_url = model.starts_with("https://") || model.starts_with("http://");
+    let spec = if is_url {
+        let filename = model
+            .split(['?', '#'])
+            .next()
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("model.gguf");
+        ModelSpec {
+            name: Path::new(filename)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model")
+                .into(),
+            tag: "remote".into(),
+            filename: filename.into(),
+            url: model.into(),
+            ..Default::default()
+        }
+    } else {
+        resolve_model(settings, model).ok_or_else(|| format!("unknown model: {model}"))?
+    };
+    let dest = match output {
+        Some(path) => path.to_path_buf(),
+        None => stage_path(settings, &spec, start, end),
+    };
+    ensure_parent(&dest)?;
+    let whole = spec.model_path(settings);
+    let report = if !is_url && whole.exists() {
+        bitty_model::write_stage_file(&bitty_model::FileSource::new(whole), start, end, &dest)?
+    } else if spec.url.is_empty() {
+        return Err(format!("model {} has no download URL", spec.id()).into());
+    } else {
+        bitty_model::write_stage_file(&bitty_model::HttpSource::new(&spec.url), start, end, &dest)?
+    };
+    Ok((dest, report))
+}
+
 pub fn write_manifest(
     settings: &BittySettings,
     spec: &ModelSpec,

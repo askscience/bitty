@@ -296,6 +296,7 @@ version = "0.1.0"
 dependencies = [
  "bitty-coordinator",
  "bitty-inference",
+ "bitty-model",
  "bitty-protocol",
  "bitty-worker",
  "futures",

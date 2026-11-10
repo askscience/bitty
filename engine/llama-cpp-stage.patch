@@ -24,16 +24,18 @@ index 0000000..74beb1a
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-check/stage-check.cpp b/examples/stage-check/stage-check.cpp
 new file mode 100644
-index 0000000..b8ebe85
+index 0000000..ccd2967
 --- /dev/null
 +++ b/examples/stage-check/stage-check.cpp
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,301 @@
 +// Checks stage execution: the model split into layer ranges and chained through hidden states
 +// must give the same logits as the whole model.
 +//
-+//   llama-stage-check -m model.gguf [-c 8,16] [-p prompt] [-n 16] [-t threads]
++//   llama-stage-check -m model.gguf [-c 8,16] [-s a.gguf,b.gguf,c.gguf] [-p prompt] [-n 16] [-t threads]
 +//
 +// -c lists the cut points: "8,16" on a 24-layer model runs the stages [0,8) [8,16) [16,24).
++// -s gives one model file per stage (files that hold only the tensors of their stage);
++//    without it every stage loads its range from the whole model.
 +
 +#include "llama.h"
 +
@@ -172,6 +174,7 @@ index 0000000..b8ebe85
 +    std::string model_path;
 +    std::string prompt = "The capital of Italy is Rome. The capital of France is";
 +    std::string cuts_arg;
++    std::string stage_files_arg;
 +    int n_predict = 16;
 +
 +    for (int i = 1; i < argc; ++i) {
@@ -183,6 +186,7 @@ index 0000000..b8ebe85
 +        if      (a == "-m") model_path = argv[++i];
 +        else if (a == "-p") prompt     = argv[++i];
 +        else if (a == "-c") cuts_arg   = argv[++i];
++        else if (a == "-s") stage_files_arg = argv[++i];
 +        else if (a == "-n") n_predict  = atoi(argv[++i]);
 +        else if (a == "-t") g_threads  = atoi(argv[++i]);
 +        else {
@@ -255,9 +259,20 @@ index 0000000..b8ebe85
 +    std::vector<stage> chain;
 +    int begin = 0;
 +    cuts.push_back(n_layer);
++    std::vector<std::string> stage_files;
++    for (size_t at = 0; !stage_files_arg.empty() && at <= stage_files_arg.size();) {
++        const size_t comma = std::min(stage_files_arg.find(',', at), stage_files_arg.size());
++        stage_files.push_back(stage_files_arg.substr(at, comma - at));
++        at = comma + 1;
++    }
++    if (!stage_files.empty() && stage_files.size() != cuts.size()) {
++        fprintf(stderr, "-s needs one file per stage (%zu stages)\n", cuts.size());
++        return 2;
++    }
 +    for (int end : cuts) {
 +        stage st;
-+        if (!load_stage(st, model_path.c_str(), begin, end, n_layer, n_ctx)) {
++        const std::string & path = stage_files.empty() ? model_path : stage_files[chain.size()];
++        if (!load_stage(st, path.c_str(), begin, end, n_layer, n_ctx)) {
 +            fprintf(stderr, "failed to load stage [%d, %d)\n", begin, end);
 +            return 1;
 +        }
@@ -852,7 +867,7 @@ index 7b73840..6bad6a1 100644
      // note: inlined on purpose for performance reasons
      // TODO: think of a better place for this function
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index dbc91a1..89fa726 100644
+index dbc91a1..aecdd1e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1651,6 +1651,20 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
@@ -876,19 +891,20 @@ index dbc91a1..89fa726 100644
      pimpl->n_bytes = ml.n_bytes;
  
      pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
-@@ -2485,6 +2499,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+@@ -2485,6 +2499,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
      if (tn.bid != -1) {
          // blocks that are not model layers (e.g. the blocks of a head) go with the output
          buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
 +
 +        // stage execution: the weights of layers outside the stage are never allocated or read
 +        if (!hparams.stage_has_layer(tn.bid)) {
-+            flags |= llama_model_loader::TENSOR_SKIP;
++            // a per-stage model file does not carry the tensors of other stages at all
++            flags |= llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED;
 +        }
      }
      return ml.create_tensor(
          hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-@@ -3289,10 +3308,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3289,10 +3309,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                          // DSA layers keep a K-only MLA cache plus a per-token indexer key cache,
                          // the KDA layers stay recurrent
                          filter_attn = [&](uint32_t il) {
@@ -901,7 +917,7 @@ index dbc91a1..89fa726 100644
                          };
                          filter_idx = [&](uint32_t il) {
                              return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
-@@ -3309,10 +3328,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3309,10 +3329,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                          };
                      } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                          filter_attn = [&](uint32_t il) {
@@ -914,7 +930,7 @@ index dbc91a1..89fa726 100644
                          };
  
                          if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-@@ -3547,6 +3566,8 @@ llama_model_params llama_model_default_params() {
+@@ -3547,6 +3567,8 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -924,7 +940,7 @@ index dbc91a1..89fa726 100644
  
      return result;
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 736e23f..1fab52e 100644
+index 736e23f..0500168 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -37,18 +37,24 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
@@ -936,9 +952,9 @@ index 736e23f..1fab52e 100644
 +    const std::string output_name = tn(LLM_TENSOR_OUTPUT, "weight").str();
 +    const bool output_is_tied = ml.get_tensor_meta(output_name.c_str()) == nullptr;
 +    const bool need_tok_embd  = hparams.stage_has_input() || (hparams.stage_has_output() && output_is_tied);
-+    const int  out_flags      = hparams.stage_has_output() ? 0 : TENSOR_SKIP;
++    const int  out_flags      = hparams.stage_has_output() ? 0 : (TENSOR_SKIP | TENSOR_NOT_REQUIRED);
 +
-+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : TENSOR_SKIP);
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : (TENSOR_SKIP | TENSOR_NOT_REQUIRED));
  
      // output
 -    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -1003,7 +1019,7 @@ index 736e23f..1fab52e 100644
  
      cb(cur, "h_nextn", -1);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index c4da3e2..8d20ebc 100644
+index c4da3e2..7f1a558 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -40,14 +40,20 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
@@ -1015,9 +1031,9 @@ index c4da3e2..8d20ebc 100644
 +    const std::string output_name = tn(LLM_TENSOR_OUTPUT, "weight").str();
 +    const bool output_is_tied = ml.get_tensor_meta(output_name.c_str()) == nullptr;
 +    const bool need_tok_embd  = hparams.stage_has_input() || (hparams.stage_has_output() && output_is_tied);
-+    const int  out_flags      = hparams.stage_has_output() ? 0 : TENSOR_SKIP;
++    const int  out_flags      = hparams.stage_has_output() ? 0 : (TENSOR_SKIP | TENSOR_NOT_REQUIRED);
 +
-+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : TENSOR_SKIP);
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : (TENSOR_SKIP | TENSOR_NOT_REQUIRED));
  
      // output
 -    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
