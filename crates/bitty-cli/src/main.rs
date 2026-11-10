@@ -463,6 +463,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         let leader = listen_as_connect_endpoint(&config.listen);
         let mut coordinator = NetworkCoordinator::new(leader_layers(&model_file, config.layers))
             .with_model_path(&model_file)
+            .with_plan_file(data_dir.join("plan"))
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         // The small model that guesses tokens for the ring. It is used from the moment the
         // file is whole on disk; until then requests go without it.
@@ -2365,7 +2366,8 @@ async fn handle_scheduler_connection(
     };
     iroh_transport::write_frame(&mut send, &response).await?;
     send.finish()?;
-    send.stopped().await?;
+    // the answer is on its way; how the caller ends the connection is not an error
+    let _ = send.stopped().await;
     Ok(())
 }
 

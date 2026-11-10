@@ -21,7 +21,7 @@ use bitty_protocol::pb::{
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
 use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
 use bitty_protocol::{
-    ActivationDType, ActivationTensor, HardwareProfile, Heartbeat, LayerMetadata,
+    ActivationDType, ActivationTensor, HardwareProfile, Heartbeat, LayerMetadata, NodeId,
     ShardManifestMessage,
 };
 use futures::stream;
@@ -60,6 +60,44 @@ pub struct NetworkCoordinator {
     /// The small model that guesses tokens for the workers to check, opened on first use.
     draft_path: Option<PathBuf>,
     draft: Arc<Mutex<DraftSlot>>,
+    /// The plan in use. It is kept while it holds, also across a restart of the leader.
+    plan: Arc<Mutex<KeptPlan>>,
+}
+
+/// The ranges of the last plan, and the file they are written to.
+#[derive(Debug)]
+struct KeptPlan {
+    ranges: Vec<(NodeId, u32, u32)>,
+    file: Option<PathBuf>,
+    /// Until then a node of the plan that is missing is waited for.
+    wait_until: Instant,
+}
+
+/// How long the leader waits for a node of its plan to come back before it plans without
+/// it: `BITTY_PLAN_WAIT_SECS`, 600 by default. A node that restarts for an update is back
+/// well within that, and its layers stay where they are.
+fn plan_wait_time() -> Duration {
+    let seconds = std::env::var("BITTY_PLAN_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+    Duration::from_secs(seconds)
+}
+
+fn read_plan(file: &std::path::Path) -> Vec<(NodeId, u32, u32)> {
+    let Ok(contents) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let node = parts.next()?;
+            let start = parts.next()?.parse().ok()?;
+            let end = parts.next()?.parse().ok()?;
+            Some((NodeId::new(node), start, end))
+        })
+        .collect()
 }
 
 type SharedDraft = Arc<std::sync::Mutex<DraftModel>>;
@@ -169,7 +207,27 @@ impl NetworkCoordinator {
             chain_broken: Arc::new(Mutex::new(None)),
             draft_path: None,
             draft: Arc::default(),
+            plan: Arc::new(Mutex::new(KeptPlan {
+                ranges: Vec::new(),
+                file: None,
+                wait_until: Instant::now(),
+            })),
         }
+    }
+
+    /// Where the plan is written. A leader that starts again finds it there and waits a
+    /// while for the nodes it names, so that no layer has to move because of the restart.
+    pub fn with_plan_file(self, file: impl Into<PathBuf>) -> Self {
+        let file = file.into();
+        let ranges = read_plan(&file);
+        if let Ok(mut plan) = self.plan.try_lock() {
+            if !ranges.is_empty() {
+                plan.wait_until = Instant::now() + plan_wait_time();
+            }
+            plan.ranges = ranges;
+            plan.file = Some(file);
+        }
+        self
     }
 
     /// A small model with the vocabulary of the served one. It guesses the next tokens and
@@ -252,10 +310,12 @@ impl NetworkCoordinator {
                     Ok(assignments) if !assignments.is_empty() => assignments,
                     Ok(_) => continue,
                     Err(err) => {
-                        println!(
-                            "no plan for topology_epoch={seen}: {}; waiting for more machines",
-                            err.message()
-                        );
+                        println!("no plan for topology_epoch={seen}: {}", err.message());
+                        // a plan that waits for a node is asked for again
+                        if err.code() == tonic::Code::Unavailable {
+                            prepared = String::new();
+                            seen_at = Instant::now();
+                        }
                         continue;
                     }
                 };
@@ -402,6 +462,8 @@ impl NetworkCoordinator {
                 ticker.tick().await;
                 let evicted = self.registry.lock().await.evict_missing(timeout);
                 if !evicted.is_empty() {
+                    // a node that went away may be restarting: its layers wait for it
+                    self.plan.lock().await.wait_until = Instant::now() + plan_wait_time();
                     let epoch = self.advance_epoch().await;
                     println!(
                         "evicted {} missing worker(s); topology_epoch={epoch}",
@@ -419,10 +481,69 @@ impl NetworkCoordinator {
         }
 
         let started = Instant::now();
-        let assignments = Halda::new(SchedulerConfig::default())
-            .assign(&profiles, &self.layers)
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let halda = Halda::new(SchedulerConfig::default());
+        let fresh = halda.assign(&profiles, &self.layers);
         record_halda_run(started.elapsed().as_secs_f64() * 1000.0);
+
+        let mut plan = self.plan.lock().await;
+        if !plan.ranges.is_empty() {
+            let missing = plan
+                .ranges
+                .iter()
+                .filter(|(node, _, _)| profiles.iter().all(|profile| &profile.node_id != node))
+                .map(|(node, _, _)| node.0.clone())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() && Instant::now() < plan.wait_until {
+                return Err(Status::unavailable(format!(
+                    "waiting {}s more for {} to come back with its layers",
+                    plan.wait_until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs(),
+                    missing.join(", ")
+                )));
+            }
+            // The plan stays unless a machine outside it would now get layers, or it no
+            // longer fits its own machines. Measured speeds alone do not move layers.
+            let no_new_node = fresh.as_ref().map_or(true, |fresh| {
+                fresh.iter().all(|assignment| {
+                    plan.ranges
+                        .iter()
+                        .any(|(node, _, _)| node == &assignment.node_id)
+                })
+            });
+            if missing.is_empty() && no_new_node {
+                if let Ok(kept) = halda.keep(&plan.ranges, &profiles, &self.layers) {
+                    return Ok(kept);
+                }
+            }
+        }
+
+        let assignments = fresh.map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let ranges = assignments
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.node_id.clone(),
+                    assignment.range.start_layer,
+                    assignment.range.end_layer_exclusive,
+                )
+            })
+            .collect::<Vec<_>>();
+        if ranges != plan.ranges {
+            if let Some(file) = &plan.file {
+                let text = ranges
+                    .iter()
+                    .map(|(node, start, end)| format!("{} {start} {end}\n", node.0))
+                    .collect::<String>();
+                if let Err(err) = std::fs::write(file, text) {
+                    eprintln!(
+                        "bitty-coordinator: the plan was not written to {}: {err}",
+                        file.display()
+                    );
+                }
+            }
+            plan.ranges = ranges;
+        }
         Ok(assignments)
     }
 

@@ -127,7 +127,10 @@ pub async fn request_addr(
 ) -> Result<IrohFrame, IrohTransportError> {
     let connection = endpoint.connect(remote, alpn).await?;
     let (send, recv) = connection.open_bi().await?;
-    request_on_stream(send, recv, frame, response_limit).await
+    let response = request_on_stream(send, recv, frame, response_limit).await;
+    // said aloud, so the other side does not keep the connection until it times out
+    connection.close(0u32.into(), b"done");
+    response
 }
 
 /// One request and its answer on a stream that is already open. A connection can carry any

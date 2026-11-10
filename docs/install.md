@@ -123,6 +123,15 @@ drops, goes on from where it was the next time.
 A node keeps its name in `node-id` inside its data directory, so after a
 restart or an update the leader sees the same machine and not a new one.
 
+The leader keeps its plan, which machine holds which layers, in the file
+`plan` of its data directory. The plan changes when a machine joins, when one
+stays away, or when a range no longer fits its machine, and for nothing else:
+every range that moves is a download of gigabytes. After a restart of the
+leader, or when a machine drops out, the leader waits 10 minutes for the
+missing machines of the plan before it plans without them
+(`BITTY_PLAN_WAIT_SECS`); an update restarts a node in far less. Requests in
+that time are answered with what the leader is waiting for.
+
 To give a machine less than it would get, put one of these in its `env` file
 and restart the node:
 

@@ -175,10 +175,60 @@ impl Halda {
             });
         }
 
-        let mut assignments = Vec::new();
         let mut cursor = 0_u32;
-        for (node, len) in ranked.iter().zip(lens) {
-            let end = cursor + len;
+        let ranges = ranked
+            .iter()
+            .zip(lens)
+            .map(|(node, len)| {
+                let start = cursor;
+                cursor += len;
+                (node, start, cursor)
+            })
+            .collect::<Vec<_>>();
+        self.build(&ranges, nodes, layers)
+    }
+
+    /// A plan made earlier, as it stands on the nodes of now: the same ranges on the same
+    /// nodes, or an error when a node is gone or a range no longer fits where it was. A plan
+    /// that still holds is worth keeping: every range that moves is a download of gigabytes.
+    pub fn keep(
+        &self,
+        ranges: &[(NodeId, u32, u32)],
+        nodes: &[HardwareProfile],
+        layers: &[LayerMetadata],
+    ) -> Result<Vec<LayerAssignment>, HaldaError> {
+        let mut placed = Vec::new();
+        for (node_id, start, end) in ranges {
+            let node = nodes
+                .iter()
+                .find(|node| &node.node_id == node_id)
+                .ok_or_else(|| HaldaError::InvalidAssignment(format!("node {node_id} is gone")))?;
+            let len = end.saturating_sub(*start);
+            if !node.layer_eligible || len > node.max_layers {
+                return Err(HaldaError::InvalidAssignment(format!(
+                    "node {node_id} no longer takes {len} layers"
+                )));
+            }
+            let weights = assignment_weight_bytes(*start, *end, layers);
+            if node.disk_bytes().is_some_and(|disk| weights > disk) {
+                return Err(HaldaError::InvalidAssignment(format!(
+                    "the disk of node {node_id} no longer holds its layers"
+                )));
+            }
+            placed.push((node, *start, *end));
+        }
+        placed.sort_by_key(|(_, start, _)| *start);
+        self.build(&placed, nodes, layers)
+    }
+
+    fn build(
+        &self,
+        ranges: &[(&HardwareProfile, u32, u32)],
+        nodes: &[HardwareProfile],
+        layers: &[LayerMetadata],
+    ) -> Result<Vec<LayerAssignment>, HaldaError> {
+        let mut assignments = Vec::new();
+        for &(node, cursor, end) in ranges {
             let quantization = quantization_for(node, cursor, end, layers, &self.config);
             let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers);
             assignments.push(LayerAssignment {
@@ -197,7 +247,6 @@ impl Halda {
                 ),
                 model_stage: ModelStage::LayerRange,
             });
-            cursor = end;
         }
 
         self.link_ring(&mut assignments);
@@ -504,6 +553,41 @@ mod tests {
             .unwrap();
         assert!(len_of(&assignments, 1) <= 5, "{assignments:?}");
         assert_eq!(len_of(&assignments, 0) + len_of(&assignments, 1), 40);
+    }
+
+    #[test]
+    fn a_plan_is_kept_while_its_nodes_hold_it() {
+        let halda = Halda::new(SchedulerConfig::default());
+        let layers = big_layers();
+        let nodes = vec![cpu_node(0, 32, 24), cpu_node(1, 16, 12)];
+        let plan = halda.assign(&nodes, &layers).unwrap();
+        let ranges = plan
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.node_id.clone(),
+                    assignment.range.start_layer,
+                    assignment.range.end_layer_exclusive,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // the nodes come back in another order and with a little less memory free
+        let again = vec![cpu_node(1, 16, 11), cpu_node(0, 32, 23)];
+        let kept = halda.keep(&ranges, &again, &layers).unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|a| (&a.node_id, &a.range))
+                .collect::<Vec<_>>(),
+            plan.iter()
+                .map(|a| (&a.node_id, &a.range))
+                .collect::<Vec<_>>()
+        );
+
+        // one node is gone, or has far too little memory left: the plan does not hold
+        assert!(halda.keep(&ranges, &again[1..], &layers).is_err());
+        let squeezed = vec![cpu_node(0, 32, 24), cpu_node(1, 16, 1)];
+        assert!(halda.keep(&ranges, &squeezed, &layers).is_err());
     }
 
     #[test]
