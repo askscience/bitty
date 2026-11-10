@@ -104,6 +104,20 @@ fn prepare_settle_time() -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
+/// How long a worker may stay silent before it is taken out of the plan
+/// (`BITTY_EVICT_SECS`). Taking a node out moves the layers of every other node, which costs
+/// them a download of several gigabytes, so the time has to cover what a real network does: a
+/// heartbeat that crosses a relay while the same line is busy fetching layers can take longer
+/// than a quarter of a minute without anything being wrong.
+fn eviction_time() -> Duration {
+    let seconds = std::env::var("BITTY_EVICT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(90);
+    Duration::from_secs(seconds)
+}
+
 impl NetworkCoordinator {
     pub fn new(layers: Vec<LayerMetadata>) -> Self {
         Self {
@@ -160,7 +174,7 @@ impl NetworkCoordinator {
     /// early preparation of the shards. `serve` calls it; a coordinator reached only through
     /// iroh has to call it itself.
     pub fn spawn_background_loops(&self) {
-        self.clone().spawn_eviction_loop(Duration::from_secs(15));
+        self.clone().spawn_eviction_loop(eviction_time());
         if let Some(settle) = prepare_settle_time() {
             self.clone().spawn_prepare_loop(settle);
         }
