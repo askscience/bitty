@@ -31,10 +31,10 @@ the time per token minus the time the same layers take on one machine.
 | leader and one other machine | one hop |
 | three machines | two hops, the ring as it is |
 
-Not possible yet without going to the machines: every node is started with its
-model, and today that is the 35B. These runs wait for "the network chooses the
-model", where the leader names the model and the nodes follow. The model itself
-needs no entry in the registry, a node takes the URL of a GGUF as `--model`.
+`bitty restart --model qwen3.5-0.8b` on the leader moves the whole network: each
+node is told the model when it registers and comes back with it within about a
+minute. `bitty restart --model qwen3.5-35b-a3b` goes back, and the layers of the
+35B are still on the disks.
 
 ## 3. What a machine adds
 

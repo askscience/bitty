@@ -89,6 +89,41 @@ for pid in "${PIDS[@]}"; do kill "$pid" 2> /dev/null || true; done
 PIDS=()
 sleep 3
 
+echo "== the leader names the model"
+# both names are the same small file here: what counts is that the names differ
+put() { mkdir -p "$1"; ln "$3" "$1/$2" 2> /dev/null || cp "$3" "$1/$2"; }
+put "$WORK/m0/models/qwen3.5-0.8b/latest" Qwen3.5-0.8B-Q4_K_M.gguf "$3"
+put "$WORK/m1/models/qwen3.5-0.8b/latest" Qwen3.5-0.8B-Q4_K_M.gguf "$3"
+put "$WORK/m1/models/qwen3.5-35b-a3b/latest" Qwen3.5-35B-A3B-Q4_K_M.gguf "$3"
+"$BITTY" node --no-iroh --model qwen3.5-0.8b --layers 24 --listen 127.0.0.1:50551 --worker-listen 127.0.0.1:50561 \
+    --node-id m0 --cluster-token tok --data-dir "$DATA/m0" > "$WORK/m0.log" 2>&1 &
+PIDS+=("$!")
+follower() {
+    "$BITTY" node --no-iroh --model "$1" --layers 24 --join 127.0.0.1:50551 --listen 127.0.0.1:50571 \
+        --node-id m1 --cluster-token tok --data-dir "$DATA/m1" >> "$WORK/m1.log" 2>&1
+}
+other=""
+for _ in $(seq 1 20); do
+    follower qwen3.5-35b-a3b || true
+    if grep -q "the leader serves qwen3.5-0.8b" "$WORK/m1.log"; then other=seen; break; fi
+    sleep 2
+done
+[ -n "$other" ] || die "a node with another model was not told the model of the leader"
+"$BITTY" node --no-iroh --model qwen3.5-0.8b --layers 24 --join 127.0.0.1:50551 --listen 127.0.0.1:50571 \
+    --node-id m1 --cluster-token tok --data-dir "$DATA/m1" > "$WORK/m1-again.log" 2>&1 &
+PIDS+=("$!")
+named=""
+for _ in $(seq 1 40); do
+    if grep -q "joined scheduler" "$WORK/m1-again.log" && named="$(generate)" && [ -n "$named" ]; then break; fi
+    sleep 3
+done
+[ -n "$named" ] || die "no text after the node took the model of the leader"
+sleep 6
+kill -0 "${PIDS[1]}" 2> /dev/null || die "the node with the model of the leader did not stay"
+for pid in "${PIDS[@]}"; do kill "$pid" 2> /dev/null || true; done
+PIDS=()
+sleep 3
+
 echo "== background runtime"
 state="$WORK/runtime/runtime/runtime.toml"
 pid_of() { grep -o 'pid = [0-9]*' "$state" | grep -o '[0-9]*'; }

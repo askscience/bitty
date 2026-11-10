@@ -466,9 +466,11 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         resolve_scheduler_target(&join, iroh_node.as_ref(), &cluster_token).await?
     } else {
         let leader = listen_as_connect_endpoint(&config.listen);
+        let network_model = model_store::network_name(&node_settings, &config.model);
         let mut coordinator = NetworkCoordinator::new(leader_layers(&model_file, config.layers))
             .with_model_path(&model_file)
-            .with_plan_file(data_dir.join("plan"))
+            .with_plan_file(data_dir.join(plan_file_name(network_model.as_deref())))
+            .with_model_name(network_model)
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         // The small model that guesses tokens for the ring. It is used from the moment the
         // file is whole on disk; until then requests go without it.
@@ -1236,6 +1238,61 @@ async fn register_and_heartbeat(
     }
 }
 
+/// The plan of each model has its own file, so going to another model and back finds the
+/// layers where they were.
+fn plan_file_name(model: Option<&str>) -> String {
+    match model {
+        Some(model) => {
+            let name: String = model
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!("plan-{name}")
+        }
+        None => "plan".into(),
+    }
+}
+
+/// The model the leader serves, when this node runs another one and both can be named.
+/// A node started with a file of its own keeps it.
+fn other_model_of_the_leader(config: &NodeConfig, leader_model: &str) -> Option<String> {
+    if leader_model.is_empty() {
+        return None;
+    }
+    let settings = BittySettings::load(bitty_data_dir(config.data_dir.as_deref()));
+    let mine = model_store::network_name(&settings, &config.model)?;
+    (mine != leader_model).then(|| leader_model.to_string())
+}
+
+/// Writes the model of the leader as the model of this node and says why the node ends.
+/// The background node is started again by `bitty start --if-started`, which the updater
+/// runs every minute, and comes back with that model.
+fn take_model_of_the_leader(config: &NodeConfig, model: &str) -> String {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    match read_runtime_state(&data_dir) {
+        Some(mut state) if state.pid == std::process::id() => {
+            state.model = model.into();
+            match write_runtime_state(&data_dir, &state) {
+                Ok(()) => format!(
+                    "the leader serves {model}, this node ran {}: starting again with {model}",
+                    config.model
+                ),
+                Err(err) => format!("the leader serves {model}, cannot save it: {err}"),
+            }
+        }
+        _ => format!(
+            "the leader serves {model}, this node runs {}: start it again with --model {model}",
+            config.model
+        ),
+    }
+}
+
 /// What this node holds of its model, for the log of the leader.
 fn node_holdings(config: &NodeConfig) -> String {
     let settings = BittySettings::load(bitty_data_dir(config.data_dir.as_deref()));
@@ -1395,6 +1452,9 @@ async fn stay_registered(
                     registration.topology_epoch,
                     registration.assignments.len()
                 );
+                if let Some(model) = other_model_of_the_leader(config, &registration.model) {
+                    return Err(take_model_of_the_leader(config, &model).into());
+                }
                 retry = Duration::from_secs(1);
             }
             Err(err) => {
@@ -3377,6 +3437,72 @@ mod tests {
             layers[0].weight_bytes >> 20,
             layers[layers.len() - 1].weight_bytes >> 20
         );
+    }
+
+    #[test]
+    fn a_node_takes_the_model_of_the_leader() {
+        let dir = std::env::temp_dir().join(format!("bitty-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runtime")).unwrap();
+        let config = NodeConfig {
+            model: "qwen3.5-35b-a3b".into(),
+            data_dir: Some(dir.display().to_string()),
+            node_id: "n".into(),
+            listen: String::new(),
+            worker_listen: None,
+            public_endpoint: None,
+            join: None,
+            layers: 40,
+            heartbeat_interval_ms: 1000,
+            iroh: false,
+            cluster_token: None,
+        };
+        // the same model, by name or by the path of the installed file, is not another model
+        assert_eq!(other_model_of_the_leader(&config, "qwen3.5-35b-a3b"), None);
+        assert_eq!(other_model_of_the_leader(&config, ""), None);
+        let installed = NodeConfig {
+            model: dir
+                .join("models/qwen3.5-35b-a3b/latest/Qwen3.5-35B-A3B-Q4_K_M.gguf")
+                .display()
+                .to_string(),
+            ..config.clone()
+        };
+        assert_eq!(
+            other_model_of_the_leader(&installed, "qwen3.5-35b-a3b"),
+            None
+        );
+        // a file of this machine alone is kept
+        let own = NodeConfig {
+            model: "/somewhere/else.gguf".into(),
+            ..config.clone()
+        };
+        assert_eq!(other_model_of_the_leader(&own, "qwen3.5-0.8b"), None);
+        assert_eq!(
+            other_model_of_the_leader(&installed, "qwen3.5-0.8b"),
+            Some("qwen3.5-0.8b".into())
+        );
+
+        // a node started by hand is only told, the background node saves the model
+        let said = take_model_of_the_leader(&config, "qwen3.5-0.8b");
+        assert!(said.contains("--model qwen3.5-0.8b"), "{said}");
+        let state = RuntimeState {
+            pid: std::process::id(),
+            mode: "worker".into(),
+            model: "qwen3.5-35b-a3b".into(),
+            target: "iroh://leader?token=abc".into(),
+        };
+        write_runtime_state(&dir, &state).unwrap();
+        let said = take_model_of_the_leader(&config, "qwen3.5-0.8b");
+        assert!(said.contains("starting again"), "{said}");
+        let saved = read_runtime_state(&dir).unwrap();
+        assert_eq!(saved.model, "qwen3.5-0.8b");
+        assert_eq!(saved.target, state.target);
+        assert_eq!(plan_file_name(Some("qwen3.5-0.8b")), "plan-qwen3.5-0.8b");
+        assert_eq!(
+            plan_file_name(Some("https://a/b.gguf")),
+            "plan-https___a_b.gguf"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

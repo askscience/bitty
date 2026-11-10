@@ -136,6 +136,9 @@ message RegisterWorkerRequest {
 message RegisterWorkerResponse {
   repeated LayerAssignment assignments = 1;
   string topology_epoch = 2;
+  // The model the leader serves, as any node can fetch it: a name of the registry or the
+  // URL of a GGUF. Empty when the leader runs a file of its own.
+  string model = 3;
 }
 
 message HeartbeatRequest {

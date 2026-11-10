@@ -328,6 +328,27 @@ pub fn disk_for_stages_mb(settings: &BittySettings, model: &str) -> Option<u64> 
     Some((free + held) / (1024 * 1024))
 }
 
+/// The model as any node of the network can fetch it: its name in the registry, also when
+/// it was given as the path of the installed file, or the URL of a GGUF. `None` for a file
+/// of this machine alone.
+pub fn network_name(settings: &BittySettings, model: &str) -> Option<String> {
+    if model.starts_with("https://") || model.starts_with("http://") {
+        return Some(model.into());
+    }
+    let name = match Path::new(model).strip_prefix(&settings.models_dir) {
+        Ok(inside) => inside
+            .components()
+            .next()?
+            .as_os_str()
+            .to_str()?
+            .to_string(),
+        Err(_) => model.to_string(),
+    };
+    find_registry_model(&name)
+        .filter(|spec| !spec.url.is_empty())
+        .map(|spec| spec.name)
+}
+
 /// What a node holds of a model and what it is still fetching, in words: the leader logs it,
 /// so the state of a far machine can be read without going there.
 pub fn holdings(settings: &BittySettings, model: &str) -> String {

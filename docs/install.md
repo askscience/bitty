@@ -124,13 +124,23 @@ A node keeps its name in `node-id` inside its data directory, so after a
 restart or an update the leader sees the same machine and not a new one.
 
 The leader keeps its plan, which machine holds which layers, in the file
-`plan` of its data directory. The plan changes when a machine joins, when one
+`plan-NAME` of its data directory, one for each model. The plan changes when a machine joins, when one
 stays away, or when a range no longer fits its machine, and for nothing else:
 every range that moves is a download of gigabytes. After a restart of the
 leader, or when a machine drops out, the leader waits 10 minutes for the
 missing machines of the plan before it plans without them
 (`BITTY_PLAN_WAIT_SECS`); an update restarts a node in far less. Requests in
 that time are answered with what the leader is waiting for.
+
+The leader names the model. A node that registers is told the model of the
+leader, by its name in the registry or by the URL of the GGUF. A background node
+that runs another model saves that name, ends, and is started again with it by
+`bitty start --if-started`, which the updater runs every minute. So the whole
+network goes to another model with one command on the leader, for example
+`bitty restart --model qwen3.5-0.8b`, and comes back the same way. The layers of
+the first model stay on the disks, and the plan of each model has its own file
+(`plan-NAME`), so coming back fetches nothing again. A node started with a file
+of its own, a path outside the model directory, keeps that file.
 
 Each node tells the leader, with every heartbeat, what it holds of the model and
 what it is still fetching. The leader writes it in its log when it changes, and

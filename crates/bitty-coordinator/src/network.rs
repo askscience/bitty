@@ -62,6 +62,8 @@ pub struct NetworkCoordinator {
     draft: Arc<Mutex<DraftSlot>>,
     /// The plan in use. It is kept while it holds, also across a restart of the leader.
     plan: Arc<Mutex<KeptPlan>>,
+    /// The model as the nodes can fetch it, told to each node that registers.
+    model_name: Option<String>,
     /// What each node last said it holds, and when that was logged.
     holdings: Arc<Mutex<HashMap<NodeId, (String, Instant)>>>,
 }
@@ -227,8 +229,15 @@ impl NetworkCoordinator {
                 file: None,
                 wait_until: Instant::now(),
             })),
+            model_name: None,
             holdings: Arc::default(),
         }
+    }
+
+    /// The name or URL of the model. A node that runs another model takes this one.
+    pub fn with_model_name(mut self, name: Option<String>) -> Self {
+        self.model_name = name;
+        self
     }
 
     /// Where the plan is written. A leader that starts again finds it there and waits a
@@ -1291,6 +1300,7 @@ impl CoordinatorService for NetworkCoordinator {
         Ok(Response::new(RegisterWorkerResponse {
             assignments: assignments.iter().map(Into::into).collect(),
             topology_epoch,
+            model: self.model_name.clone().unwrap_or_default(),
         }))
     }
 
@@ -1401,7 +1411,10 @@ mod tests {
         let later = "holds 0..4; fetching 4..10, 900 MiB so far";
         assert_eq!(holdings_kind(early), holdings_kind(later));
         assert_eq!(holdings_kind(early), "holds 0..4; fetching 4..10");
-        assert_ne!(holdings_kind(later), holdings_kind("holds 0..4; holds 4..10"));
+        assert_ne!(
+            holdings_kind(later),
+            holdings_kind("holds 0..4; holds 4..10")
+        );
     }
 
     #[test]
