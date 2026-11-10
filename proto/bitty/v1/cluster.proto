@@ -92,7 +92,18 @@ message GenerateRequest {
   repeated uint32 prompt_tokens = 2;
   string prompt = 3;
   uint32 max_new_tokens = 4;
+  // 0 always takes the most likely token.
   float temperature = 5;
+  // 0 selects the default (20).
+  uint32 top_k = 6;
+  // 0 selects the default (0.95).
+  float top_p = 7;
+  // 0 draws a new seed for every request.
+  uint64 seed = 8;
+  // Send `prompt` to the model as it is, without the chat template.
+  bool raw = 9;
+  // Let the model reason before it answers; the reasoning is part of the output.
+  bool thinking = 10;
 }
 
 message GenerateResponse {

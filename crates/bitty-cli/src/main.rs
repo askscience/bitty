@@ -159,6 +159,21 @@ struct GenerateConfig {
     max_tokens: u32,
     temperature: String,
     data_dir: Option<String>,
+    options: GenerateOptions,
+}
+
+/// Optional settings of a request; zero and empty values leave the coordinator's defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GenerateOptions {
+    top_k: u32,
+    top_p: String,
+    seed: u64,
+    /// Send the prompt as it is, without the chat template.
+    raw: bool,
+    /// Let the model reason before it answers.
+    thinking: bool,
+    /// Token of the cluster, for a scheduler reached over plain TCP.
+    cluster_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,6 +527,7 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
                     prompt: line.into(),
                     max_tokens: config.max_tokens,
                     temperature: config.temperature.clone(),
+                    options: GenerateOptions::default(),
                     data_dir: config.data_dir.clone(),
                 })
                 .await?;
@@ -523,6 +539,7 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
             prompt,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            options: GenerateOptions::default(),
             data_dir: config.data_dir,
         })
         .await;
@@ -1275,6 +1292,11 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                     prompt: config.prompt,
                     max_new_tokens: config.max_tokens,
                     temperature: config.temperature.parse().unwrap_or(0.0),
+                    top_k: config.options.top_k,
+                    top_p: config.options.top_p.parse().unwrap_or(0.0),
+                    seed: config.options.seed,
+                    raw: config.options.raw,
+                    thinking: config.options.thinking,
                 },
             )
             .await?;
@@ -1289,13 +1311,21 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
 
     let mut client = CoordinatorServiceClient::connect(normalize_endpoint(&node)).await?;
     let mut stream = client
-        .generate(GenerateRequest {
+        .generate(request_with_token(
+            GenerateRequest {
             request_id: request_id(),
             prompt_tokens: Vec::new(),
             prompt: config.prompt,
             max_new_tokens: config.max_tokens,
             temperature: config.temperature.parse().unwrap_or(0.0),
-        })
+            top_k: config.options.top_k,
+            top_p: config.options.top_p.parse().unwrap_or(0.0),
+            seed: config.options.seed,
+            raw: config.options.raw,
+            thinking: config.options.thinking,
+        },
+            config.options.cluster_token.as_deref().unwrap_or_default(),
+        ))
         .await?
         .into_inner();
 
@@ -1333,6 +1363,7 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
             prompt,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            options: GenerateOptions::default(),
             data_dir: config.data_dir,
         })
         .await;
@@ -1358,6 +1389,7 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
             prompt: prompt.into(),
             max_tokens: config.max_tokens,
             temperature: config.temperature.clone(),
+            options: GenerateOptions::default(),
             data_dir: config.data_dir.clone(),
         })
         .await?;
@@ -1560,6 +1592,7 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
         prompt: String::new(),
         max_tokens: 32,
         temperature: "0".into(),
+        options: GenerateOptions::default(),
         data_dir: None,
     };
     while let Some(arg) = args.next() {
@@ -1568,6 +1601,14 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
             "--prompt" => config.prompt = required_next(args, "--prompt")?,
             "--max-tokens" => config.max_tokens = parse_next(args, "--max-tokens")?,
             "--temperature" => config.temperature = required_next(args, "--temperature")?,
+            "--top-k" => config.options.top_k = parse_next(args, "--top-k")?,
+            "--top-p" => config.options.top_p = required_next(args, "--top-p")?,
+            "--seed" => config.options.seed = parse_next(args, "--seed")?,
+            "--raw" => config.options.raw = true,
+            "--think" => config.options.thinking = true,
+            "--cluster-token" => {
+                config.options.cluster_token = Some(required_next(args, "--cluster-token")?)
+            }
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
             other => return Err(format!("unknown generate argument: {other}")),
         }
@@ -2813,7 +2854,8 @@ fn print_help() {
     println!("  bitty node --model PATH");
     println!("  bitty node --join 'iroh://INVITE' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
-    println!("  bitty generate --prompt TEXT [--node TARGET]");
+    println!("  bitty generate --prompt TEXT [--node TARGET] [--max-tokens N] [--temperature T]");
+    println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--cluster-token TOKEN]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
     println!("  bitty clean [--data-dir DIR]   # models + cluster state + secrets; keeps config.toml");

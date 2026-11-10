@@ -15,6 +15,8 @@ const OP_END: u32 = 3;
 const OP_PING: u32 = 4;
 const OP_TOKEN_TEXT: u32 = 5;
 const OP_TOKENIZE: u32 = 6;
+const OP_CHAT_PROMPT: u32 = 7;
+const OP_EOG_TOKENS: u32 = 8;
 
 const KIND_HIDDEN: u32 = 1;
 const KIND_LOGITS: u32 = 2;
@@ -104,6 +106,18 @@ impl StageProcess {
         if config.threads > 0 {
             command.arg("-t").arg(config.threads.to_string());
         }
+        Self::start(command, &config.engine)
+    }
+
+    /// Starts the engine on the vocabulary alone: no weights are loaded, and only the text calls
+    /// (`tokenize`, `token_text`, `chat_prompt`, `eog_tokens`) work.
+    pub fn spawn_vocab(engine: &Path, model: &Path) -> Result<Self, StageProcessError> {
+        let mut command = Command::new(engine);
+        command.arg("-m").arg(model).arg("--vocab-only");
+        Self::start(command, engine)
+    }
+
+    fn start(mut command: Command, engine: &Path) -> Result<Self, StageProcessError> {
         let stderr = if std::env::var_os("BITTY_STAGE_LOG").is_some() {
             Stdio::inherit()
         } else {
@@ -115,7 +129,7 @@ impl StageProcess {
             .stderr(stderr)
             .spawn()
             .map_err(|source| StageProcessError::Spawn {
-                path: config.engine.clone(),
+                path: engine.to_path_buf(),
                 source,
             })?;
         let stdin = child.stdin.take().expect("piped stdin");
@@ -216,6 +230,33 @@ impl StageProcess {
 
     pub fn tokenize(&mut self, text: &str, add_special: bool) -> Result<Vec<u32>, StageProcessError> {
         let (_, _, bytes) = self.call(OP_TOKENIZE, 0, 0, add_special as u32, text.as_bytes())?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect())
+    }
+
+    /// Builds the prompt text for a conversation with the model's chat template, ending with an
+    /// open assistant turn. `thinking` lets a reasoning model think before it answers.
+    pub fn chat_prompt(
+        &mut self,
+        messages: &[(&str, &str)],
+        thinking: bool,
+    ) -> Result<String, StageProcessError> {
+        let mut payload = Vec::new();
+        for (role, content) in messages {
+            for part in [role, content] {
+                payload.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                payload.extend_from_slice(part.as_bytes());
+            }
+        }
+        let (_, _, bytes) = self.call(OP_CHAT_PROMPT, 0, thinking as u32, 1, &payload)?;
+        String::from_utf8(bytes).map_err(|_| StageProcessError::BadReply)
+    }
+
+    /// Every token id that ends generation (end of turn, end of text).
+    pub fn eog_tokens(&mut self) -> Result<Vec<u32>, StageProcessError> {
+        let (_, _, bytes) = self.call(OP_EOG_TOKENS, 0, 0, 0, &[])?;
         Ok(bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))

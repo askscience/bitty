@@ -17,6 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prompt: config.prompt,
                 max_new_tokens: config.max_tokens,
                 temperature: config.temperature,
+                ..Default::default()
             },
             config.token.as_deref(),
         )?)

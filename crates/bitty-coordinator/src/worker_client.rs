@@ -1,12 +1,11 @@
 use bitty_protocol::endpoint::{normalize_endpoint, validate_worker_endpoint_for_dial};
 use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT, WORKER_CLEANUP,
-    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
+    WORKER_FORWARD_ACTIVATION, WORKER_LOAD_SHARD,
 };
 use bitty_protocol::pb::worker_service_client::WorkerServiceClient;
 use bitty_protocol::pb::{
-    ActivationTensor as ProtoActivationTensor, LoadShardRequest, SampleTokenRequest,
-    TokenOutput as ProtoTokenOutput,
+    ActivationTensor as ProtoActivationTensor, LoadShardRequest,
 };
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
 use bitty_protocol::ActivationTensor;
@@ -92,23 +91,6 @@ impl WorkerRpcClient {
                 ActivationTensor::try_from(response)
                     .map_err(|err| Status::internal(err.to_string()))
             }
-        }
-    }
-
-    pub async fn sample_token(
-        &mut self,
-        request: SampleTokenRequest,
-    ) -> Result<ProtoTokenOutput, Status> {
-        match self {
-            Self::Tcp { client, token } => Ok(client
-                .sample_token(request_with_token(request, token.as_deref()))
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .into_inner()),
-            Self::Iroh(client) => client
-                .request(WORKER_SAMPLE_TOKEN, &request)
-                .await
-                .map_err(|err| Status::internal(err.to_string())),
         }
     }
 

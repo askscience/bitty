@@ -1,7 +1,9 @@
 pub mod executor;
 pub mod lifecycle;
+pub mod sampling;
 pub mod stage;
 pub mod stage_process;
+pub mod text;
 pub mod tiny_lm;
 
 pub use executor::{
@@ -15,3 +17,5 @@ pub use lifecycle::{
 pub use stage::{StageError, StageExecutor, StageOptions, STAGE_BACKEND_ID};
 pub use stage_process::{find_stage_engine, StageInfo, StageOutput, StageProcess, StageProcessConfig, StageProcessError};
 pub use tiny_lm::TinyLanguageModel;
+pub use sampling::{Sampled, Sampler, SamplingOptions, DEFAULT_TOP_K, DEFAULT_TOP_P};
+pub use text::{TextCodec, TextStream};

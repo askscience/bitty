@@ -3,6 +3,9 @@ use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
 #[cfg(test)]
 use bitty_inference::{LayerExecutor, LowBitReferenceExecutor};
+use bitty_inference::{
+    Sampler, SamplingOptions, TextCodec, TextStream, DEFAULT_TOP_K, DEFAULT_TOP_P,
+};
 use bitty_observability::record_halda_run;
 use bitty_protocol::endpoint::validate_worker_endpoint_for_dial;
 use bitty_protocol::pb::coordinator_service_server::{
@@ -11,7 +14,7 @@ use bitty_protocol::pb::coordinator_service_server::{
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, ClusterStatusRequest, ClusterStatusResponse,
     GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
-    RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
+    RegisterWorkerRequest, RegisterWorkerResponse,
     ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
 };
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
@@ -46,6 +49,7 @@ pub struct NetworkCoordinator {
     iroh_endpoint: Option<Endpoint>,
     cluster_token: Option<String>,
     shard_cache: Arc<Mutex<HashMap<String, ShardManifestMessage>>>,
+    text_codec: Arc<Mutex<Option<Arc<TextCodec>>>>,
 }
 
 impl NetworkCoordinator {
@@ -60,6 +64,7 @@ impl NetworkCoordinator {
             iroh_endpoint: None,
             cluster_token: None,
             shard_cache: Arc::new(Mutex::new(HashMap::new())),
+            text_codec: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -252,14 +257,36 @@ impl NetworkCoordinator {
         } else {
             request.request_id
         };
-        let mut current_input = if request.prompt_tokens.is_empty() {
-            request.prompt.bytes().map(u32::from).collect::<Vec<_>>()
-        } else {
+        let codec = self.text_codec(model_path).await?;
+        let text_error =
+            |err: bitty_inference::StageProcessError| Status::internal(err.to_string());
+        let mut current_input = if !request.prompt_tokens.is_empty() {
             request.prompt_tokens
+        } else if request.raw {
+            codec.tokenize(&request.prompt).map_err(text_error)?
+        } else {
+            codec
+                .chat_tokens(&[("user", request.prompt.as_str())], request.thinking)
+                .map_err(text_error)?
         };
         if current_input.is_empty() {
-            current_input.push(0);
+            return Err(Status::invalid_argument("the prompt is empty"));
         }
+        let mut sampler = Sampler::new(SamplingOptions {
+            temperature: request.temperature,
+            top_k: if request.top_k == 0 {
+                DEFAULT_TOP_K
+            } else {
+                request.top_k
+            },
+            top_p: if request.top_p <= 0.0 {
+                DEFAULT_TOP_P
+            } else {
+                request.top_p
+            },
+            seed: request.seed,
+        });
+        let mut text = TextStream::default();
 
         let mut worker_clients = Vec::with_capacity(assignments.len());
         for assignment in &assignments {
@@ -317,6 +344,7 @@ impl NetworkCoordinator {
         }
 
         let mut outputs = Vec::with_capacity(max_new_tokens as usize);
+        let mut failure = None;
         for token_position in 0..max_new_tokens {
             let started = Instant::now();
             let payload = current_input
@@ -334,28 +362,72 @@ impl NetworkCoordinator {
             );
 
             for client in &mut worker_clients {
-                activation = client.forward_activation(&activation).await?;
+                match client.forward_activation(&activation).await {
+                    Ok(output) => activation = output,
+                    Err(err) => {
+                        failure = Some(err);
+                        break;
+                    }
+                }
+            }
+            if failure.is_some() {
+                break;
             }
 
-            let last = worker_clients
-                .last_mut()
-                .ok_or_else(|| Status::failed_precondition("no last worker"))?;
-            let mut token = last
-                .sample_token(SampleTokenRequest {
-                    activation: Some((&activation).into()),
-                    temperature: request.temperature,
-                    finished: token_position + 1 == max_new_tokens,
-                })
-                .await?;
-            token.gen_latency_us = started.elapsed().as_micros() as u64;
+            // the final stage answers with the logits of the last token
+            if activation.dtype != ActivationDType::F32
+                || activation.payload.len() != codec.vocab_size() as usize * 4
+            {
+                failure = Some(Status::internal(
+                    "the last worker did not return the logits of the model",
+                ));
+                break;
+            }
+            let logits: Vec<f32> = activation
+                .payload
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            let Some(sampled) = sampler.sample(&logits) else {
+                failure = Some(Status::internal("the model returned no usable logits"));
+                break;
+            };
+            let ended = codec.is_end(sampled.token);
+            let finished = ended || token_position + 1 == max_new_tokens;
+            let mut piece = if ended {
+                String::new()
+            } else {
+                match codec.piece(sampled.token) {
+                    Ok(bytes) => text.push(&bytes),
+                    Err(err) => {
+                        failure = Some(text_error(err));
+                        break;
+                    }
+                }
+            };
+            if finished {
+                piece.push_str(&text.finish());
+            }
+            let token = ProtoTokenOutput {
+                request_id: request_id.clone(),
+                token_position,
+                token_id: sampled.token,
+                text: piece,
+                finished,
+                log_prob: sampled.log_prob,
+                gen_latency_us: started.elapsed().as_micros() as u64,
+            };
             current_input.clear();
-            current_input.push(token.token_id);
+            current_input.push(sampled.token);
             if let Some(sender) = &sender {
                 if sender.send(Ok(token.clone())).await.is_err() {
                     break;
                 }
             }
             outputs.push(token);
+            if finished {
+                break;
+            }
         }
 
         for client in &mut worker_clients {
@@ -366,7 +438,32 @@ impl NetworkCoordinator {
                 .await;
         }
 
-        Ok(outputs)
+        match failure {
+            Some(status) => Err(status),
+            None => Ok(outputs),
+        }
+    }
+
+    /// The vocabulary of the model, opened on first use. Text is handled here, on the machine
+    /// that takes the request: workers only see token ids and hidden states.
+    async fn text_codec(&self, model_path: &std::path::Path) -> Result<Arc<TextCodec>, Status> {
+        let mut slot = self.text_codec.lock().await;
+        if let Some(codec) = slot.as_ref() {
+            return Ok(codec.clone());
+        }
+        let path = model_path.to_path_buf();
+        let codec = tokio::task::spawn_blocking(move || TextCodec::open(&path))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "cannot open the vocabulary of {}: {err}",
+                    model_path.display()
+                ))
+            })?;
+        let codec = Arc::new(codec);
+        *slot = Some(codec.clone());
+        Ok(codec)
     }
 
     async fn worker_client(&self, endpoint: &str) -> Result<WorkerRpcClient, Status> {
@@ -538,6 +635,7 @@ mod tests {
             prompt: String::new(),
             max_new_tokens: 2,
             temperature: 0.0,
+            ..Default::default()
         };
 
         let first = coordinator

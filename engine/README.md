@@ -89,6 +89,28 @@ Limits: the downloaded ranges are protected only by TLS, there is no hash check
 of a stage file against the published model yet, and an interrupted pull starts
 again from the beginning.
 
+## Text and sampling
+
+Workers only see token ids and hidden states. The coordinator, which is the
+machine that takes the request, turns the prompt into tokens and the tokens back
+into text with `bitty-stage --vocab-only`: a process that reads the vocabulary
+and loads no weights (any stage file of the model is enough for it). It formats
+the prompt with the model's chat template, picks each token from the logits of
+the final stage (temperature, top-k, top-p, seed) and stops at the end of the
+turn.
+
+```sh
+bitty generate --prompt "What is the capital of France?" --max-tokens 64
+bitty generate --prompt "..." --temperature 0.7 --top-k 20 --top-p 0.95 --seed 3
+bitty generate --prompt "..." --think        # the model reasons first
+bitty generate --prompt "The capital of Italy is" --raw   # no chat template
+```
+
+Defaults: top-k 20, top-p 0.95, a new seed per request, thinking off.
+`--temperature 0` always takes the most likely token. The chat prompt is built
+by llama.cpp's built-in ChatML formatter, not by the Jinja template of the
+model, with the opening of the reasoning block added as the template does.
+
 ## Verified so far
 
 Qwen3.5-0.8B Q4_K_M (dense `qwen35`, 24 layers), CPU: logits are bit-identical
@@ -111,12 +133,21 @@ local copy. On the 35B model the four files for cuts `10,20,30` are 5547, 5025,
 5032 and 5423 MiB (whole file 20996 MiB): the chain running on
 those four files gives logits bit-identical to the whole model.
 
+Cluster path: two `bitty node` processes on one machine, each serving half of
+the 0.8B model, answer `bitty generate` requests with the chat template, stop at
+the end of the turn, repeat the same text for the same seed and deliver
+multi-byte characters intact. This has not been run on the 35B model or between
+different machines yet.
+
 ## Not done yet
 
-- The coordinator still turns a text prompt into bytes instead of tokens; the
-  stage server can tokenize (`StageExecutor::tokenize`) but the cluster path does
-  not call it yet. Chat templates and sampling other than greedy are missing too.
-
+- Requests carry one user message: there is no system prompt, conversation
+  history or tool calling in the cluster path yet.
+- The final stage sends the full logits (about 1 MB per token for this
+  vocabulary) to the coordinator; sending only the most likely ones would cut
+  that for slow links.
+- `bitty run --local` and `bitty chat` are not wired to the engine yet; use
+  `bitty generate` against a cluster.
 - GPU offload: `n_gpu_layers` is not rebased to the range.
 - Workers do not fetch their stage file on their own when they get a layer
   assignment; `bitty pull --layers` is a manual step for now.

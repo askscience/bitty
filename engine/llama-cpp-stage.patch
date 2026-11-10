@@ -342,13 +342,17 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..a798df6
+index 0000000..60a3430
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,471 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
++//   bitty-stage -m model.gguf --vocab-only
++//
++// With --vocab-only no weights are loaded: the process only serves the text ops (5 to 8) and
++// reports the range [0, 0).
 +//
 +// All integers are little-endian. Logs go to stderr, stdout carries only frames.
 +//
@@ -369,6 +373,11 @@ index 0000000..a798df6
 +//   4 PING           answers kind NONE
 +//   5 TOKEN_TEXT     payload = token ids, answers kind BYTES with their UTF-8 text
 +//   6 TOKENIZE       payload = UTF-8 text, answers kind TOKENS with u32 token ids
++//   7 CHAT_PROMPT    payload = messages, each u32 role_len, role, u32 content_len, content;
++//                    answers kind BYTES with the prompt text built by the model's chat template
++//                    (n_tokens != 0 opens the assistant turn at the end; pos != 0 lets a
++//                    reasoning model think before it answers)
++//   8 EOG_TOKENS     answers kind TOKENS with every token id that ends generation
 +
 +#include "llama.h"
 +
@@ -384,7 +393,7 @@ index 0000000..a798df6
 +
 +#include <unistd.h>
 +
-+enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6 };
++enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8 };
 +enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4 };
 +
 +static const uint32_t PROTOCOL_VERSION = 1;
@@ -561,9 +570,14 @@ index 0000000..a798df6
 +    std::string model_path;
 +    server      srv;
 +    int         threads = 0;
++    bool        vocab_only = false;
 +
 +    for (int i = 1; i < argc; ++i) {
 +        const std::string a = argv[i];
++        if (a == "--vocab-only") {
++            vocab_only = true;
++            continue;
++        }
 +        if (i + 1 >= argc) {
 +            fprintf(stderr, "missing value for %s\n", a.c_str());
 +            return 2;
@@ -580,8 +594,12 @@ index 0000000..a798df6
 +            return 2;
 +        }
 +    }
-+    if (model_path.empty() || srv.end <= srv.begin || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
-+        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]\n", argv[0]);
++    if (vocab_only) {
++        srv.begin = srv.end = 0;
++    }
++    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]\n"
++                        "       %s -m model.gguf --vocab-only\n", argv[0], argv[0]);
 +        return 2;
 +    }
 +
@@ -595,6 +613,7 @@ index 0000000..a798df6
 +    mparams.n_gpu_layers      = 0;
 +    mparams.stage_layer_start = srv.begin;
 +    mparams.stage_layer_end   = srv.end;
++    mparams.vocab_only        = vocab_only;
 +    srv.model = llama_model_load_from_file(model_path.c_str(), mparams);
 +    if (!srv.model) {
 +        fprintf(stderr, "bitty-stage: failed to load %s\n", model_path.c_str());
@@ -607,6 +626,7 @@ index 0000000..a798df6
 +    srv.first   = srv.begin == 0;
 +    srv.last    = srv.end == srv.n_layer;
 +
++    if (!vocab_only) {
 +    llama_context_params cparams = llama_context_default_params();
 +    cparams.n_ctx        = (uint32_t) srv.n_ctx_seq * srv.n_sessions;
 +    cparams.n_seq_max    = srv.n_sessions;
@@ -623,6 +643,7 @@ index 0000000..a798df6
 +    if (!srv.ctx) {
 +        fprintf(stderr, "bitty-stage: failed to create the context\n");
 +        return 1;
++    }
 +    }
 +
 +    {
@@ -656,6 +677,10 @@ index 0000000..a798df6
 +            case OP_DECODE_TOKENS:
 +            case OP_DECODE_HIDDEN: {
 +                const bool   is_tokens = op == OP_DECODE_TOKENS;
++                if (!srv.ctx) {
++                    ok = respond_error(out_fd, "this process only serves the vocabulary");
++                    break;
++                }
 +                const size_t want      = is_tokens ? (size_t) n_tokens * 4 : (size_t) n_tokens * srv.n_embd * 4;
 +                if (n_tokens == 0 || len != want) {
 +                    ok = respond_error(out_fd, "payload size does not match n_tokens");
@@ -695,7 +720,7 @@ index 0000000..a798df6
 +                break;
 +            }
 +            case OP_END:
-+                srv.drop(sid);
++                if (srv.ctx) srv.drop(sid);
 +                ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
 +                break;
 +            case OP_PING:
@@ -729,6 +754,57 @@ index 0000000..a798df6
 +                ok = n < 0 ? respond_error(out_fd, "tokenization failed") : respond(out_fd, 0, KIND_TOKENS, (uint32_t) n, tokens.data(), (size_t) n * 4);
 +                break;
 +            }
++            case OP_CHAT_PROMPT: {
++                std::vector<std::string> parts;
++                size_t at  = 0;
++                bool   bad = false;
++                while (at < len) {
++                    uint32_t n;
++                    if (len - at < 4) { bad = true; break; }
++                    memcpy(&n, payload.data() + at, 4);
++                    at += 4;
++                    if (len - at < n) { bad = true; break; }
++                    parts.emplace_back((const char *) payload.data() + at, n);
++                    at += n;
++                }
++                if (bad || parts.empty() || parts.size() % 2 != 0) {
++                    ok = respond_error(out_fd, "bad message list");
++                    break;
++                }
++                std::vector<llama_chat_message> chat;
++                size_t                          chars = 0;
++                for (size_t i = 0; i < parts.size(); i += 2) {
++                    chat.push_back({ parts[i].c_str(), parts[i + 1].c_str() });
++                    chars += parts[i].size() + parts[i + 1].size();
++                }
++                const char * tmpl = llama_model_chat_template(srv.model, nullptr);
++                std::string  text(2 * chars + 256, '\0');
++                int32_t      n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), n_tokens != 0, &text[0], (int32_t) text.size());
++                if (n > (int32_t) text.size()) {
++                    text.resize(n);
++                    n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), n_tokens != 0, &text[0], (int32_t) text.size());
++                }
++                if (n < 0) {
++                    ok = respond_error(out_fd, "the model's chat template is not supported");
++                    break;
++                }
++                text.resize((size_t) n);
++                // The built-in ChatML formatter stops at the assistant header. Qwen's own template
++                // goes on to open the reasoning block, or to close it at once when thinking is off.
++                if (n_tokens != 0 && tmpl && strstr(tmpl, "enable_thinking")) {
++                    text += pos != 0 ? "<think>\n" : "<think>\n\n</think>\n\n";
++                }
++                ok = respond(out_fd, 0, KIND_BYTES, 0, text.data(), text.size());
++                break;
++            }
++            case OP_EOG_TOKENS: {
++                std::vector<llama_token> tokens;
++                for (llama_token t = 0; t < srv.n_vocab; ++t) {
++                    if (llama_vocab_is_eog(srv.vocab, t)) tokens.push_back(t);
++                }
++                ok = respond(out_fd, 0, KIND_TOKENS, (uint32_t) tokens.size(), tokens.data(), tokens.size() * 4);
++                break;
++            }
 +            default:
 +                ok = respond_error(out_fd, "unknown op " + std::to_string(op));
 +                break;
@@ -736,7 +812,7 @@ index 0000000..a798df6
 +        if (!ok) break; // parent is gone
 +    }
 +
-+    llama_free(srv.ctx);
++    if (srv.ctx) llama_free(srv.ctx);
 +    llama_model_free(srv.model);
 +    llama_backend_free();
 +    return 0;

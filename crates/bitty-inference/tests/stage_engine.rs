@@ -136,3 +136,38 @@ async fn chained_stages_match_the_whole_model() {
         .await;
     assert!(stray.is_err());
 }
+
+#[test]
+fn vocabulary_process_handles_text_without_weights() {
+    let (Some(engine), Some(model)) = (
+        std::env::var_os("BITTY_STAGE_BIN"),
+        std::env::var_os("BITTY_TEST_MODEL"),
+    ) else {
+        eprintln!("skipped: set BITTY_STAGE_BIN and BITTY_TEST_MODEL");
+        return;
+    };
+    let codec = bitty_inference::TextCodec::open_with_engine(engine.as_ref(), model.as_ref()).unwrap();
+    assert!(codec.vocab_size() > 1000);
+
+    let text = |tokens: &[u32]| {
+        let mut stream = bitty_inference::TextStream::default();
+        let mut text = String::new();
+        for token in tokens {
+            text.push_str(&stream.push(&codec.piece(*token).unwrap()));
+        }
+        text + &stream.finish()
+    };
+    let raw = codec.tokenize("Perché no? 🙂").unwrap();
+    assert_eq!(text(&raw), "Perché no? 🙂");
+
+    let quiet = text(&codec.chat_tokens(&[("user", "Hi")], false).unwrap());
+    assert!(quiet.contains("<|im_start|>user\nHi<|im_end|>"), "{quiet}");
+    assert!(quiet.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{quiet}");
+    let thinking = text(&codec.chat_tokens(&[("user", "Hi")], true).unwrap());
+    assert!(thinking.ends_with("<|im_start|>assistant\n<think>\n"), "{thinking}");
+
+    // the end of a turn stops generation, ordinary text does not
+    let end = codec.tokenize("<|im_end|>").unwrap();
+    assert!(codec.is_end(*end.last().unwrap()));
+    assert!(!codec.is_end(raw[0]));
+}
