@@ -146,7 +146,11 @@ RandomizedDelaySec=1min
 WantedBy=timers.target
 EOF
         systemctl --user daemon-reload
-        systemctl --user enable --now bitty-update.timer > /dev/null 2>&1
+        if ! systemctl --user enable --now bitty-update.timer > /dev/null 2>&1; then
+            say "auto update: the systemd timer could not be enabled"
+            say "  run '$PREFIX/bin/bitty-update --update' whenever you want the current build"
+            return 0
+        fi
         remove_cron
         # without lingering the timer only runs while this user is logged in
         if loginctl enable-linger "$(id -un)" > /dev/null 2>&1; then

@@ -129,7 +129,9 @@ the engine as in [engine/README.md](../engine/README.md).
 
 Checked on Linux, on a real machine: install, update, restart of a running
 node on update, restart after the node was killed, nothing started after
-`bitty stop`, a refused archive with a wrong checksum, uninstall.
+`bitty stop`, a refused archive with a wrong checksum, uninstall. All of this
+by running `bitty-update --update` by hand. Not checked: the systemd timer
+itself firing, and the cron fallback.
 
 Checked on Windows only on the GitHub runner, never on a real desktop: the
 build, two nodes generating through each other, the leader restart, start,

@@ -70,17 +70,22 @@ impl Halda {
             .iter()
             .map(HardwareProfile::effective_compute_score)
             .sum::<f64>()
-            .max(1.0);
+            .max(f64::MIN_POSITIVE);
 
         let total_layers = layers.len() as u32;
-        let mut assignments = Vec::new();
-        let mut cursor = 0_u32;
+        let fits = |node: &HardwareProfile, start: u32, len: u32| {
+            let quantization = quantization_for(node, start, start + len, layers, &self.config);
+            assigned_weight_bytes_for_len(start, len, layers, quantization)
+                <= available_memory_bytes(node, self.config.memory_reserve_fraction)
+        };
 
+        // First pass: a share of the layers in proportion to each node's speed.
+        let mut lens: Vec<u32> = Vec::new();
+        let mut cursor = 0_u32;
         for (index, node) in ranked.iter().enumerate() {
             if cursor >= total_layers {
                 break;
             }
-
             let remaining_nodes = ranked.len() - index;
             let remaining_layers = total_layers - cursor;
             let score_share = node.effective_compute_score() / total_score;
@@ -89,89 +94,67 @@ impl Halda {
                 .max(1)
                 .min(node.max_layers.max(1))
                 .min(remaining_layers);
-
             if remaining_layers > remaining_nodes as u32 {
                 len = len.min(remaining_layers.saturating_sub((remaining_nodes - 1) as u32));
             }
-
-            let quantization = quantization_for(node, cursor, cursor + len, layers, &self.config);
-            let memory_budget = available_memory_bytes(node, self.config.memory_reserve_fraction);
-
-            while len > 1
-                && assigned_weight_bytes_for_len(cursor, len, layers, quantization) > memory_budget
-            {
+            while len > 1 && !fits(node, cursor, len) {
                 len -= 1;
             }
+            lens.push(len);
+            cursor += len;
+        }
 
-            let assigned_weight_bytes =
-                assignment_weight_bytes(cursor, cursor + len, layers, quantization);
-            if assigned_weight_bytes > memory_budget {
-                return Err(HaldaError::InsufficientMemory {
-                    node_id: node.node_id.clone(),
-                    required: assigned_weight_bytes,
-                    available: memory_budget,
-                });
+        // Rounding, layer caps and memory limits can leave layers over. A node runs one stage
+        // engine, so it can hold only one range: the layers left over make the existing ranges
+        // longer, fastest node first, and are never handed out as a second range.
+        let mut left_over = total_layers - cursor;
+        for index in 0..lens.len() {
+            if left_over == 0 {
+                break;
             }
+            let node = &ranked[index];
+            let start: u32 = lens[..index].iter().sum();
+            while left_over > 0
+                && lens[index] < node.max_layers.max(1)
+                && fits(node, start, lens[index] + 1)
+            {
+                lens[index] += 1;
+                left_over -= 1;
+            }
+        }
+        if left_over > 0 {
+            return Err(HaldaError::NotEnoughCapacity {
+                layers: total_layers,
+                unplaced: left_over,
+                nodes: ranked.len(),
+            });
+        }
 
+        let mut assignments = Vec::new();
+        let mut cursor = 0_u32;
+        for (node, len) in ranked.iter().zip(lens) {
+            let end = cursor + len;
+            let quantization = quantization_for(node, cursor, end, layers, &self.config);
+            let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers, quantization);
             assignments.push(LayerAssignment {
                 node_id: node.node_id.clone(),
                 range: AssignedLayerRange {
                     start_layer: cursor,
-                    end_layer_exclusive: cursor + len,
+                    end_layer_exclusive: end,
                     quantization,
                 },
                 assigned_weight_bytes,
-                expected_latency_ms: estimate_latency_ms(node, cursor, cursor + len, layers),
+                expected_latency_ms: estimate_latency_ms(node, cursor, end, layers),
                 next_node_id: None,
                 disk_offload_fraction: disk_offload_fraction(node, assigned_weight_bytes),
                 model_stage: ModelStage::LayerRange,
             });
-            cursor += len;
-        }
-
-        if cursor < total_layers {
-            self.append_remaining_to_fastest(&mut assignments, &ranked[0], cursor, layers)?;
+            cursor = end;
         }
 
         self.link_ring(&mut assignments);
         self.validate(&assignments, nodes, layers)?;
         Ok(assignments)
-    }
-
-    fn append_remaining_to_fastest(
-        &self,
-        assignments: &mut Vec<LayerAssignment>,
-        node: &HardwareProfile,
-        cursor: u32,
-        layers: &[LayerMetadata],
-    ) -> Result<(), HaldaError> {
-        let end = layers.len() as u32;
-        let quantization = quantization_for(node, cursor, end, layers, &self.config);
-        let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers, quantization);
-        let memory_budget = available_memory_bytes(node, self.config.memory_reserve_fraction);
-
-        if assigned_weight_bytes > memory_budget {
-            return Err(HaldaError::InsufficientMemory {
-                node_id: node.node_id.clone(),
-                required: assigned_weight_bytes,
-                available: memory_budget,
-            });
-        }
-
-        assignments.push(LayerAssignment {
-            node_id: node.node_id.clone(),
-            range: AssignedLayerRange {
-                start_layer: cursor,
-                end_layer_exclusive: end,
-                quantization,
-            },
-            assigned_weight_bytes,
-            expected_latency_ms: estimate_latency_ms(node, cursor, end, layers),
-            next_node_id: None,
-            disk_offload_fraction: disk_offload_fraction(node, assigned_weight_bytes),
-            model_stage: ModelStage::LayerRange,
-        });
-        Ok(())
     }
 
     fn link_ring(&self, assignments: &mut [LayerAssignment]) {
@@ -199,7 +182,14 @@ impl Halda {
         layers: &[LayerMetadata],
     ) -> Result<(), HaldaError> {
         let mut covered = HashSet::new();
+        let mut holders = HashSet::new();
         for assignment in assignments {
+            if !holders.insert(&assignment.node_id) {
+                return Err(HaldaError::InvalidAssignment(format!(
+                    "node {} was given two layer ranges",
+                    assignment.node_id
+                )));
+            }
             if assignment.range.is_empty() {
                 return Err(HaldaError::InvalidAssignment("empty layer range".into()));
             }
@@ -249,6 +239,12 @@ pub enum HaldaError {
         node_id: NodeId,
         required: u64,
         available: u64,
+    },
+    #[error("{unplaced} of {layers} layers do not fit on the {nodes} available nodes")]
+    NotEnoughCapacity {
+        layers: u32,
+        unplaced: u32,
+        nodes: usize,
     },
     #[error("invalid assignment: {0}")]
     InvalidAssignment(String),
@@ -397,6 +393,34 @@ mod tests {
                 .validate(&assignments, &nodes, &layers)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_slow_node_alone_gets_every_layer_as_one_range() {
+        let mut slow = node(0, NodeTier::D, 16.0);
+        slow.cpu_tflops = 0.05;
+        slow.gpu_tflops = 0.0;
+        slow.vram_mb = 0;
+        slow.backend_type = "cpu".into();
+        assert!(slow.effective_compute_score() < 1.0);
+
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&[slow], &layers(24))
+            .unwrap();
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].range.len(), 24);
+    }
+
+    #[test]
+    fn layers_that_fit_nowhere_are_an_error_not_a_second_range() {
+        let mut capped = node(0, NodeTier::A, 16.0);
+        capped.max_layers = 4;
+        let result = Halda::new(SchedulerConfig::default()).assign(&[capped], &layers(24));
+        assert!(matches!(
+            result,
+            Err(HaldaError::NotEnoughCapacity { unplaced: 20, .. })
+        ));
     }
 
     #[test]
