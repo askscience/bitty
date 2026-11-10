@@ -262,6 +262,69 @@ Qwen3.5-0.8B on one node needed about 83 ms per token with the default 4
 threads and 69 with 8; the engine alone 72 and 58. With the logits fix: 63 ms
 with 8 threads.
 
+## Would a small draft model help? (2026-11-10)
+
+Speculative decoding: a small model proposes a few tokens, the chain checks
+them in one pass and keeps the leading ones that match, plus its own token at
+the first miss. Two things decide whether it pays, both measured with
+`engine/spec_probe.py`. Nothing of this is implemented.
+
+### How often the draft is right
+
+Target Qwen3.5-35B-A3B, draft Qwen3.5-0.8B (same vocabulary, same prompt
+tokens), greedy on both, six prompts, 659 tokens.
+
+| Prompt | Same token |
+|---|---|
+| steam engine, Italian | 58% |
+| fall of Rome | 68% |
+| Python function | 91% |
+| short story, Italian | 48% |
+| list of tips | 65% |
+| TCP and UDP | 64% |
+| all | 64% |
+
+| Tokens the draft proposes | Tokens per pass of the chain |
+|---|---|
+| 2 | 1.63 |
+| 3 | 2.00 |
+| 4 | 2.26 |
+| 6 | 2.47 |
+| 8 | 2.63 |
+
+Greedy matching only; with sampling the acceptance rule is different and was
+not measured.
+
+### What a pass with several tokens costs
+
+One decode call, median ms, random inputs after 32 tokens of context:
+
+| Tokens | CPU 10..15 | CPU 35..40 | GPU 10..15 | 0.8B whole, CPU | 0.8B whole, GPU |
+|---|---|---|---|---|---|
+| 1 | 28.9 | 57.9 | 16.3 | 62.4 | 38.8 |
+| 2 | 36.5 | 64.3 | 19.5 | 77.7 | 40.2 |
+| 4 | 57.0 | 81.2 | 21.8 | 103.0 | 44.4 |
+| 8 | 94.9 | 114.0 | 32.4 | 163.9 | 50.4 |
+
+The final stage here computed the logits of the last token only; checking a
+draft needs them for every token, so its real cost is higher (about 30 ms per
+extra token on CPU if the output layer does not batch well; not measured).
+
+### What follows
+
+Estimates, not measurements. With a draft of 4 a pass of the eight CPU stages
+costs about 590 ms (seven times 57, the last about 150, hop overhead), and the
+draft another 250 ms on CPU: about 840 ms for 2.26 tokens, 370 ms per token.
+Today the same cluster needs 305. On one machine with CPU stages it is a loss.
+
+It pays when the time of a pass is mostly not compute. If the network adds N
+ms per pass: now 305 + N per token, with the draft (840 + N) / 2.26. The two
+are equal at N of about 120 ms, and at N = 500 it is 805 against 590 ms per
+token. With GPU stages (a pass of 4 tokens costs about 1.3 times a pass of
+one) the gain is larger. The weak point is the draft itself: the 0.8B model
+needs 62 ms per token on CPU and 39 on this GPU, a large share of it in the
+output layer over 248320 tokens.
+
 ## How to repeat
 
 ```sh
