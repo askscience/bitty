@@ -1,12 +1,13 @@
 diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
-index 39f802d..8704fa8 100644
+index 39f802d..74c476a 100644
 --- a/examples/CMakeLists.txt
 +++ b/examples/CMakeLists.txt
-@@ -28,6 +28,7 @@ else()
+@@ -28,6 +28,8 @@ else()
      add_subdirectory(passkey)
      add_subdirectory(retrieval)
      add_subdirectory(simple)
 +    add_subdirectory(stage-check)
++    add_subdirectory(stage-server)
      add_subdirectory(simple-chat)
      add_subdirectory(speculative)
      add_subdirectory(speculative-simple)
@@ -312,6 +313,418 @@ index 0000000..b8ebe85
 +    const bool ok = n_mismatch == 0 && n_token_diff == 0 && max_diff < 1e-3;
 +    printf("%s\n", ok ? "PASS" : "FAIL");
 +    return ok ? 0 : 1;
++}
+diff --git a/examples/stage-server/CMakeLists.txt b/examples/stage-server/CMakeLists.txt
+new file mode 100644
+index 0000000..05d762d
+--- /dev/null
++++ b/examples/stage-server/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET bitty-stage)
++add_executable(${TARGET} stage-server.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
+new file mode 100644
+index 0000000..a798df6
+--- /dev/null
++++ b/examples/stage-server/stage-server.cpp
+@@ -0,0 +1,395 @@
++// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
++//
++//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
++//
++// All integers are little-endian. Logs go to stderr, stdout carries only frames.
++//
++// On start, once the weights are loaded:
++//   "BSTG" u32 version u32 n_layer u32 n_embd u32 n_vocab u32 start u32 end
++//
++// Request:  u32 op, u64 session, u32 pos, u32 n_tokens, u32 payload_len, payload
++// Response: u32 status (0 = ok), u32 kind, u32 rows, u32 payload_len, payload
++//           on error the payload is a UTF-8 message
++//
++// Ops:
++//   1 DECODE_TOKENS  payload = n_tokens u32 token ids (first stage only)
++//   2 DECODE_HIDDEN  payload = n_tokens * n_embd f32
++//        `pos` is the position of the first token in the session; it must continue the session
++//        (0 opens a new session). A non-final stage answers kind HIDDEN with n_tokens * n_embd
++//        f32; the final stage answers kind LOGITS with the n_vocab f32 logits of the last token.
++//   3 END            drops the session state
++//   4 PING           answers kind NONE
++//   5 TOKEN_TEXT     payload = token ids, answers kind BYTES with their UTF-8 text
++//   6 TOKENIZE       payload = UTF-8 text, answers kind TOKENS with u32 token ids
++
++#include "llama.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++#include <unistd.h>
++
++enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6 };
++enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4 };
++
++static const uint32_t PROTOCOL_VERSION = 1;
++static const uint32_t MAX_PAYLOAD      = 1u << 30;
++
++static bool read_all(int fd, void * buf, size_t len) {
++    uint8_t * p = (uint8_t *) buf;
++    while (len > 0) {
++        const ssize_t n = read(fd, p, len);
++        if (n == 0) return false;
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return false;
++        }
++        p   += n;
++        len -= (size_t) n;
++    }
++    return true;
++}
++
++static bool write_all(int fd, const void * buf, size_t len) {
++    const uint8_t * p = (const uint8_t *) buf;
++    while (len > 0) {
++        const ssize_t n = write(fd, p, len);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return false;
++        }
++        p   += n;
++        len -= (size_t) n;
++    }
++    return true;
++}
++
++static bool respond(int fd, uint32_t status, uint32_t kind, uint32_t rows, const void * payload, size_t len) {
++    const uint32_t head[4] = { status, kind, rows, (uint32_t) len };
++    return write_all(fd, head, sizeof(head)) && (len == 0 || write_all(fd, payload, len));
++}
++
++static bool respond_error(int fd, const std::string & message) {
++    fprintf(stderr, "bitty-stage: %s\n", message.c_str());
++    return respond(fd, 1, KIND_BYTES, 0, message.data(), message.size());
++}
++
++struct session {
++    llama_seq_id seq      = 0;
++    uint32_t     next_pos = 0;
++    uint64_t     last_use = 0;
++};
++
++struct server {
++    llama_model *       model = nullptr;
++    llama_context *     ctx   = nullptr;
++    const llama_vocab * vocab = nullptr;
++
++    int  n_layer = 0, n_embd = 0, n_vocab = 0;
++    int  begin = 0, end = 0;
++    int  n_batch = 512, n_ctx_seq = 4096, n_sessions = 4;
++    bool first = false, last = false;
++
++    std::map<uint64_t, session> sessions;
++    uint64_t                    clock = 0;
++
++    void drop(uint64_t id) {
++        auto it = sessions.find(id);
++        if (it == sessions.end()) return;
++        llama_memory_seq_rm(llama_get_memory(ctx), it->second.seq, -1, -1);
++        sessions.erase(it);
++    }
++
++    // returns the session that continues at `pos`, opening it when pos is 0
++    session * open(uint64_t id, uint32_t pos, std::string & err) {
++        auto it = sessions.find(id);
++        if (pos == 0) {
++            if (it != sessions.end()) drop(id);
++            if ((int) sessions.size() >= n_sessions) {
++                // evict the least recently used session
++                auto lru = sessions.begin();
++                for (auto s = sessions.begin(); s != sessions.end(); ++s) {
++                    if (s->second.last_use < lru->second.last_use) lru = s;
++                }
++                fprintf(stderr, "bitty-stage: evicting session %llu\n", (unsigned long long) lru->first);
++                drop(lru->first);
++            }
++            std::vector<bool> used(n_sessions, false);
++            for (auto & s : sessions) used[s.second.seq] = true;
++            session fresh;
++            for (int i = 0; i < n_sessions; ++i) {
++                if (!used[i]) { fresh.seq = i; break; }
++            }
++            llama_memory_seq_rm(llama_get_memory(ctx), fresh.seq, -1, -1);
++            it = sessions.emplace(id, fresh).first;
++        } else if (it == sessions.end()) {
++            err = "session state is not on this stage (never opened, ended or evicted)";
++            return nullptr;
++        } else if (it->second.next_pos != pos) {
++            err = "session is at position " + std::to_string(it->second.next_pos) + ", request starts at " + std::to_string(pos);
++            return nullptr;
++        }
++        it->second.last_use = ++clock;
++        return &it->second;
++    }
++
++    // runs n tokens of one session; out receives the hidden states or the last token's logits
++    bool decode(session & s, const llama_token * tokens, const float * hidden, int n, std::vector<float> & out, std::string & err) {
++        if ((int64_t) s.next_pos + n > n_ctx_seq) {
++            err = "session would exceed the stage context of " + std::to_string(n_ctx_seq) + " tokens";
++            return false;
++        }
++        out.clear();
++        for (int off = 0; off < n; off += n_batch) {
++            const int  m          = std::min(n_batch, n - off);
++            const int  pos0       = (int) s.next_pos + off;
++            const bool last_chunk = off + m == n;
++
++            // embedding batches carry 4 positions per token, section-major; text uses [p, p, p, 0]
++            std::vector<llama_pos> pos((size_t) m * (tokens ? 1 : 4));
++            for (int i = 0; i < m; ++i) {
++                pos[i] = pos0 + i;
++                if (!tokens) {
++                    pos[(size_t) 1 * m + i] = pos0 + i;
++                    pos[(size_t) 2 * m + i] = pos0 + i;
++                    pos[(size_t) 3 * m + i] = 0;
++                }
++            }
++            std::vector<llama_token>    tok;
++            std::vector<int32_t>        n_seq(m, 1);
++            std::vector<llama_seq_id>   seq0(1, s.seq);
++            std::vector<llama_seq_id *> seq(m, seq0.data());
++            // a non-final stage outputs every token; the final stage only the last one
++            std::vector<int8_t> outputs(m, last ? 0 : 1);
++            if (last && last_chunk) outputs[m - 1] = 1;
++
++            llama_batch batch = {};
++            batch.n_tokens = m;
++            if (tokens) {
++                tok.assign(tokens + off, tokens + off + m);
++                batch.token = tok.data();
++            } else {
++                batch.embd = const_cast<float *>(hidden + (size_t) off * n_embd);
++            }
++            batch.pos      = pos.data();
++            batch.n_seq_id = n_seq.data();
++            batch.seq_id   = seq.data();
++            batch.logits   = outputs.data();
++
++            const int rc = llama_decode(ctx, batch);
++            if (rc != 0) {
++                err = "llama_decode failed with code " + std::to_string(rc);
++                return false;
++            }
++            if (!last) {
++                const float * h = llama_get_embeddings(ctx);
++                if (!h) {
++                    err = "the stage returned no hidden states";
++                    return false;
++                }
++                out.insert(out.end(), h, h + (size_t) m * n_embd);
++            } else if (last_chunk) {
++                const float * l = llama_get_logits_ith(ctx, -1);
++                if (!l) {
++                    err = "the stage returned no logits";
++                    return false;
++                }
++                out.assign(l, l + n_vocab);
++            }
++        }
++        s.next_pos += (uint32_t) n;
++        return true;
++    }
++};
++
++int main(int argc, char ** argv) {
++    std::string model_path;
++    server      srv;
++    int         threads = 0;
++
++    for (int i = 1; i < argc; ++i) {
++        const std::string a = argv[i];
++        if (i + 1 >= argc) {
++            fprintf(stderr, "missing value for %s\n", a.c_str());
++            return 2;
++        }
++        if      (a == "-m")         model_path     = argv[++i];
++        else if (a == "--start")    srv.begin      = atoi(argv[++i]);
++        else if (a == "--end")      srv.end        = atoi(argv[++i]);
++        else if (a == "-t")         threads        = atoi(argv[++i]);
++        else if (a == "--ctx")      srv.n_ctx_seq  = atoi(argv[++i]);
++        else if (a == "--sessions") srv.n_sessions = atoi(argv[++i]);
++        else if (a == "--batch")    srv.n_batch    = atoi(argv[++i]);
++        else {
++            fprintf(stderr, "unknown argument %s\n", a.c_str());
++            return 2;
++        }
++    }
++    if (model_path.empty() || srv.end <= srv.begin || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]\n", argv[0]);
++        return 2;
++    }
++
++    // keep stdout for frames only: anything a library prints there would corrupt the stream
++    const int out_fd = dup(STDOUT_FILENO);
++    dup2(STDERR_FILENO, STDOUT_FILENO);
++
++    llama_backend_init();
++
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers      = 0;
++    mparams.stage_layer_start = srv.begin;
++    mparams.stage_layer_end   = srv.end;
++    srv.model = llama_model_load_from_file(model_path.c_str(), mparams);
++    if (!srv.model) {
++        fprintf(stderr, "bitty-stage: failed to load %s\n", model_path.c_str());
++        return 1;
++    }
++    srv.vocab   = llama_model_get_vocab(srv.model);
++    srv.n_layer = llama_model_n_layer(srv.model);
++    srv.n_embd  = llama_model_n_embd(srv.model);
++    srv.n_vocab = llama_vocab_n_tokens(srv.vocab);
++    srv.first   = srv.begin == 0;
++    srv.last    = srv.end == srv.n_layer;
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx        = (uint32_t) srv.n_ctx_seq * srv.n_sessions;
++    cparams.n_seq_max    = srv.n_sessions;
++    cparams.n_batch      = srv.n_batch;
++    cparams.n_ubatch     = srv.n_batch;
++    cparams.no_perf      = true;
++    cparams.embeddings   = !srv.last;
++    cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
++    if (threads > 0) {
++        cparams.n_threads       = threads;
++        cparams.n_threads_batch = threads;
++    }
++    srv.ctx = llama_init_from_model(srv.model, cparams);
++    if (!srv.ctx) {
++        fprintf(stderr, "bitty-stage: failed to create the context\n");
++        return 1;
++    }
++
++    {
++        const uint32_t hello[6] = { PROTOCOL_VERSION, (uint32_t) srv.n_layer, (uint32_t) srv.n_embd, (uint32_t) srv.n_vocab, (uint32_t) srv.begin, (uint32_t) srv.end };
++        if (!write_all(out_fd, "BSTG", 4) || !write_all(out_fd, hello, sizeof(hello))) return 1;
++    }
++    fprintf(stderr, "bitty-stage: serving layers [%d, %d) of %d\n", srv.begin, srv.end, srv.n_layer);
++
++    std::vector<uint8_t> payload;
++    std::vector<float>   result;
++    for (;;) {
++        uint8_t head[24];
++        if (!read_all(STDIN_FILENO, head, sizeof(head))) break; // parent closed the pipe
++        uint32_t op, pos, n_tokens, len;
++        uint64_t sid;
++        memcpy(&op, head, 4);
++        memcpy(&sid, head + 4, 8);
++        memcpy(&pos, head + 12, 4);
++        memcpy(&n_tokens, head + 16, 4);
++        memcpy(&len, head + 20, 4);
++        if (len > MAX_PAYLOAD) {
++            fprintf(stderr, "bitty-stage: oversized frame, closing\n");
++            break;
++        }
++        payload.resize(len);
++        if (len > 0 && !read_all(STDIN_FILENO, payload.data(), len)) break;
++
++        bool ok = true;
++        std::string err;
++        switch (op) {
++            case OP_DECODE_TOKENS:
++            case OP_DECODE_HIDDEN: {
++                const bool   is_tokens = op == OP_DECODE_TOKENS;
++                const size_t want      = is_tokens ? (size_t) n_tokens * 4 : (size_t) n_tokens * srv.n_embd * 4;
++                if (n_tokens == 0 || len != want) {
++                    ok = respond_error(out_fd, "payload size does not match n_tokens");
++                    break;
++                }
++                if (is_tokens != srv.first) {
++                    ok = respond_error(out_fd, is_tokens ? "only the first stage takes tokens" : "the first stage takes tokens, not hidden states");
++                    break;
++                }
++                if (is_tokens) {
++                    const llama_token * t   = (const llama_token *) payload.data();
++                    bool                bad = false;
++                    for (uint32_t i = 0; i < n_tokens; ++i) bad |= t[i] < 0 || t[i] >= srv.n_vocab;
++                    if (bad) {
++                        ok = respond_error(out_fd, "token id out of range");
++                        break;
++                    }
++                }
++                session * s = srv.open(sid, pos, err);
++                if (!s) {
++                    ok = respond_error(out_fd, err);
++                    break;
++                }
++                const bool done = srv.decode(*s,
++                        is_tokens ? (const llama_token *) payload.data() : nullptr,
++                        is_tokens ? nullptr : (const float *) payload.data(),
++                        (int) n_tokens, result, err);
++                if (!done) {
++                    // the state may hold part of the request: the session cannot continue
++                    srv.drop(sid);
++                    ok = respond_error(out_fd, err);
++                    break;
++                }
++                ok = srv.last
++                    ? respond(out_fd, 0, KIND_LOGITS, 1, result.data(), result.size() * sizeof(float))
++                    : respond(out_fd, 0, KIND_HIDDEN, n_tokens, result.data(), result.size() * sizeof(float));
++                break;
++            }
++            case OP_END:
++                srv.drop(sid);
++                ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
++                break;
++            case OP_PING:
++                ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
++                break;
++            case OP_TOKEN_TEXT: {
++                std::string text;
++                bool        bad = len % 4 != 0;
++                for (size_t i = 0; !bad && i + 4 <= len; i += 4) {
++                    llama_token t;
++                    memcpy(&t, payload.data() + i, 4);
++                    if (t < 0 || t >= srv.n_vocab) {
++                        bad = true;
++                        break;
++                    }
++                    char      buf[256];
++                    const int n = llama_token_to_piece(srv.vocab, t, buf, sizeof(buf), 0, true);
++                    if (n > 0) text.append(buf, n);
++                }
++                ok = bad ? respond_error(out_fd, "bad token list") : respond(out_fd, 0, KIND_BYTES, 0, text.data(), text.size());
++                break;
++            }
++            case OP_TOKENIZE: {
++                // n_tokens != 0 asks for the BOS/special prefix the model expects
++                std::vector<llama_token> tokens(len + 16);
++                int n = llama_tokenize(srv.vocab, (const char *) payload.data(), (int32_t) len, tokens.data(), (int32_t) tokens.size(), n_tokens != 0, true);
++                if (n < 0) {
++                    tokens.resize((size_t) -n);
++                    n = llama_tokenize(srv.vocab, (const char *) payload.data(), (int32_t) len, tokens.data(), (int32_t) tokens.size(), n_tokens != 0, true);
++                }
++                ok = n < 0 ? respond_error(out_fd, "tokenization failed") : respond(out_fd, 0, KIND_TOKENS, (uint32_t) n, tokens.data(), (size_t) n * 4);
++                break;
++            }
++            default:
++                ok = respond_error(out_fd, "unknown op " + std::to_string(op));
++                break;
++        }
++        if (!ok) break; // parent is gone
++    }
++
++    llama_free(srv.ctx);
++    llama_model_free(srv.model);
++    llama_backend_free();
++    return 0;
 +}
 diff --git a/include/llama.h b/include/llama.h
 index 428f51f..c84b44e 100644

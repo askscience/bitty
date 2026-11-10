@@ -329,7 +329,7 @@ impl NetworkCoordinator {
                 0,
                 0,
                 vec![current_input.len() as u32],
-                ActivationDType::Fp16,
+                ActivationDType::Tokens,
                 payload,
             );
 

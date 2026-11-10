@@ -1,0 +1,285 @@
+//! Client side of the `bitty-stage` process: a patched llama.cpp serving one layer range over
+//! stdin/stdout. The frame format is documented at the top of `examples/stage-server/stage-server.cpp` in `engine/llama-cpp-stage.patch`.
+
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use thiserror::Error;
+
+const PROTOCOL_VERSION: u32 = 1;
+const MAX_PAYLOAD: u32 = 1 << 30;
+
+const OP_DECODE_TOKENS: u32 = 1;
+const OP_DECODE_HIDDEN: u32 = 2;
+const OP_END: u32 = 3;
+const OP_PING: u32 = 4;
+const OP_TOKEN_TEXT: u32 = 5;
+const OP_TOKENIZE: u32 = 6;
+
+const KIND_HIDDEN: u32 = 1;
+const KIND_LOGITS: u32 = 2;
+
+#[derive(Debug, Error)]
+pub enum StageProcessError {
+    #[error("cannot start the stage engine {path}: {source}")]
+    Spawn { path: PathBuf, source: io::Error },
+    #[error("the stage engine exited or closed its pipe: {0}")]
+    Io(#[from] io::Error),
+    #[error("the stage engine sent an invalid handshake")]
+    BadHandshake,
+    #[error("the stage engine speaks protocol {0}, this build expects {PROTOCOL_VERSION}")]
+    Version(u32),
+    #[error("stage engine: {0}")]
+    Engine(String),
+    #[error("the stage engine sent an unexpected reply")]
+    BadReply,
+}
+
+/// What the engine reported about the model and its range once the weights were loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageInfo {
+    pub layer_count: u32,
+    pub hidden_size: u32,
+    pub vocab_size: u32,
+    pub start_layer: u32,
+    pub end_layer_exclusive: u32,
+}
+
+impl StageInfo {
+    pub fn is_first(&self) -> bool {
+        self.start_layer == 0
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.end_layer_exclusive == self.layer_count
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StageProcessConfig {
+    pub engine: PathBuf,
+    pub model: PathBuf,
+    pub start_layer: u32,
+    pub end_layer_exclusive: u32,
+    /// 0 lets the engine choose.
+    pub threads: u32,
+    /// Context length of one session, in tokens.
+    pub context: u32,
+    /// Sessions the stage keeps state for at the same time.
+    pub sessions: u32,
+}
+
+/// Output of one decode call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StageOutput {
+    /// `tokens * hidden_size` values: the residual stream after the last layer of the range.
+    Hidden(Vec<f32>),
+    /// `vocab_size` logits of the last token; only the final stage returns them.
+    Logits(Vec<f32>),
+}
+
+/// One running `bitty-stage` child. Calls block; the process dies with this value.
+pub struct StageProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    info: StageInfo,
+}
+
+impl StageProcess {
+    /// Starts the engine and waits until its weights are loaded.
+    pub fn spawn(config: &StageProcessConfig) -> Result<Self, StageProcessError> {
+        let mut command = Command::new(&config.engine);
+        command
+            .arg("-m")
+            .arg(&config.model)
+            .arg("--start")
+            .arg(config.start_layer.to_string())
+            .arg("--end")
+            .arg(config.end_layer_exclusive.to_string())
+            .arg("--ctx")
+            .arg(config.context.to_string())
+            .arg("--sessions")
+            .arg(config.sessions.to_string());
+        if config.threads > 0 {
+            command.arg("-t").arg(config.threads.to_string());
+        }
+        let stderr = if std::env::var_os("BITTY_STAGE_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .map_err(|source| StageProcessError::Spawn {
+                path: config.engine.clone(),
+                source,
+            })?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+
+        let mut hello = [0u8; 28];
+        if let Err(err) = stdout.read_exact(&mut hello) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageProcessError::Io(err));
+        }
+        let word = |index: usize| u32::from_le_bytes(hello[4 + index * 4..8 + index * 4].try_into().unwrap());
+        if &hello[..4] != b"BSTG" {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageProcessError::BadHandshake);
+        }
+        if word(0) != PROTOCOL_VERSION {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageProcessError::Version(word(0)));
+        }
+        let info = StageInfo {
+            layer_count: word(1),
+            hidden_size: word(2),
+            vocab_size: word(3),
+            start_layer: word(4),
+            end_layer_exclusive: word(5),
+        };
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            info,
+        })
+    }
+
+    pub fn info(&self) -> StageInfo {
+        self.info
+    }
+
+    /// Runs token ids through the first stage. `position` is where they sit in the session;
+    /// 0 opens a new session.
+    pub fn decode_tokens(
+        &mut self,
+        session: u64,
+        position: u32,
+        tokens: &[u32],
+    ) -> Result<StageOutput, StageProcessError> {
+        let payload: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
+        self.decode(OP_DECODE_TOKENS, session, position, tokens.len() as u32, &payload)
+    }
+
+    /// Runs hidden states (`tokens * hidden_size` values) through a later stage.
+    pub fn decode_hidden(
+        &mut self,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        hidden: &[u8],
+    ) -> Result<StageOutput, StageProcessError> {
+        self.decode(OP_DECODE_HIDDEN, session, position, tokens, hidden)
+    }
+
+    fn decode(
+        &mut self,
+        op: u32,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        payload: &[u8],
+    ) -> Result<StageOutput, StageProcessError> {
+        let (kind, _, bytes) = self.call(op, session, position, tokens, payload)?;
+        let values = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        match kind {
+            KIND_HIDDEN => Ok(StageOutput::Hidden(values)),
+            KIND_LOGITS => Ok(StageOutput::Logits(values)),
+            _ => Err(StageProcessError::BadReply),
+        }
+    }
+
+    /// Drops the state of a session.
+    pub fn end_session(&mut self, session: u64) -> Result<(), StageProcessError> {
+        self.call(OP_END, session, 0, 0, &[]).map(|_| ())
+    }
+
+    pub fn ping(&mut self) -> Result<(), StageProcessError> {
+        self.call(OP_PING, 0, 0, 0, &[]).map(|_| ())
+    }
+
+    pub fn token_text(&mut self, tokens: &[u32]) -> Result<Vec<u8>, StageProcessError> {
+        let payload: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
+        self.call(OP_TOKEN_TEXT, 0, 0, 0, &payload).map(|reply| reply.2)
+    }
+
+    pub fn tokenize(&mut self, text: &str, add_special: bool) -> Result<Vec<u32>, StageProcessError> {
+        let (_, _, bytes) = self.call(OP_TOKENIZE, 0, 0, add_special as u32, text.as_bytes())?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect())
+    }
+
+    fn call(
+        &mut self,
+        op: u32,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        payload: &[u8],
+    ) -> Result<(u32, u32, Vec<u8>), StageProcessError> {
+        let mut head = [0u8; 24];
+        head[0..4].copy_from_slice(&op.to_le_bytes());
+        head[4..12].copy_from_slice(&session.to_le_bytes());
+        head[12..16].copy_from_slice(&position.to_le_bytes());
+        head[16..20].copy_from_slice(&tokens.to_le_bytes());
+        head[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        self.stdin.write_all(&head)?;
+        self.stdin.write_all(payload)?;
+        self.stdin.flush()?;
+
+        let mut reply = [0u8; 16];
+        self.stdout.read_exact(&mut reply)?;
+        let word = |index: usize| u32::from_le_bytes(reply[index * 4..index * 4 + 4].try_into().unwrap());
+        let (status, kind, rows, len) = (word(0), word(1), word(2), word(3));
+        if len > MAX_PAYLOAD {
+            return Err(StageProcessError::BadReply);
+        }
+        let mut bytes = vec![0u8; len as usize];
+        self.stdout.read_exact(&mut bytes)?;
+        if status != 0 {
+            return Err(StageProcessError::Engine(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        Ok((kind, rows, bytes))
+    }
+}
+
+impl Drop for StageProcess {
+    fn drop(&mut self) {
+        // closing stdin makes the engine exit on its own; kill covers a stuck one
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Finds the `bitty-stage` binary: `BITTY_STAGE_BIN`, then next to this executable, then `PATH`.
+pub fn find_stage_engine() -> Option<PathBuf> {
+    const NAME: &str = "bitty-stage";
+    if let Some(path) = std::env::var_os("BITTY_STAGE_BIN") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(candidate) = exe.parent().map(|dir| dir.join(NAME)) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| Path::new(&dir).join(NAME))
+        .find(|candidate| candidate.is_file())
+}

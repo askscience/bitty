@@ -355,6 +355,7 @@ where
         if request_id.is_empty() {
             return Err(Status::invalid_argument("missing request_id"));
         }
+        self.executor.end_request(&request_id).await;
         Ok(Response::new(CleanupResponse { cleaned: true }))
     }
 }

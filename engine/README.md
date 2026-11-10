@@ -35,8 +35,26 @@ git checkout 45c8ea837489be1304500dd1d298f2a671c985d4
 git apply ../llama-cpp-stage.patch
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_EXAMPLES=ON \
       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
-cmake --build build --target llama-stage-check
+cmake --build build --target llama-stage-check bitty-stage
 build/bin/llama-stage-check -m model.gguf -c 8,16 -n 16
+```
+
+The patch adds two programs:
+
+- `bitty-stage` is the stage server. A bitty worker starts it as a child process
+  for its layer range and talks to it over stdin/stdout (frame format at the top
+  of `examples/stage-server/stage-server.cpp`). It keeps the KV cache and the
+  recurrent state of each request, evicting the least recently used one when it
+  runs out of slots. Bitty finds it through `BITTY_STAGE_BIN`, next to its own
+  binary, or on `PATH`.
+- `llama-stage-check` is the correctness check described below.
+
+The Rust side has an end-to-end test that chains three stage processes and
+compares them with the whole model:
+
+```sh
+BITTY_STAGE_BIN=$PWD/build/bin/bitty-stage BITTY_TEST_MODEL=/path/to/Qwen3.5-0.8B-Q4_K_M.gguf \
+    cargo test -p bitty-inference --test stage_engine -- --nocapture
 ```
 
 `llama-stage-check` runs the whole model as a reference, then the same prompt and
@@ -55,6 +73,10 @@ Weight buffers on that model: whole model 497 MiB; stage `[0,8)` 298 MiB,
 vocabulary matrix, which dominates such a small model.
 
 ## Not done yet
+
+- The coordinator still turns a text prompt into bytes instead of tokens; the
+  stage server can tokenize (`StageExecutor::tokenize`) but the cluster path does
+  not call it yet. Chat templates and sampling other than greedy are missing too.
 
 - `qwen35moe` (the real 35B-A3B target) carries the same patch but has not been
   run: no small MoE model of this family exists.

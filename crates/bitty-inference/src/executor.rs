@@ -23,6 +23,9 @@ pub trait LayerExecutor: Send + Sync {
         format!("<token:{token_id}>")
     }
 
+    /// Drops any per-request state (KV cache, recurrent state) held for `request_id`.
+    async fn end_request(&self, _request_id: &str) {}
+
     async fn final_logits(
         &self,
         activation: ActivationTensor,

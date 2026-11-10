@@ -293,6 +293,10 @@ pub enum ActivationDType {
     Fp16,
     Fp8,
     I8,
+    /// Little-endian f32 hidden states or logits, as produced by the stage engine.
+    F32,
+    /// Little-endian u32 token ids: the input of the first stage.
+    Tokens,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -605,6 +609,8 @@ impl From<&ActivationTensor> for pb::ActivationTensor {
                 ActivationDType::Fp16 => "fp16",
                 ActivationDType::Fp8 => "fp8",
                 ActivationDType::I8 => "i8",
+                ActivationDType::F32 => "f32",
+                ActivationDType::Tokens => "tokens",
             }
             .into(),
             payload: activation.payload.clone(),
@@ -622,6 +628,8 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             "" | "fp16" => ActivationDType::Fp16,
             "fp8" => ActivationDType::Fp8,
             "i8" => ActivationDType::I8,
+            "f32" => ActivationDType::F32,
+            "tokens" => ActivationDType::Tokens,
             other => return Err(ProtocolConversionError::UnknownDType(other.into())),
         };
         let activation = Self {
