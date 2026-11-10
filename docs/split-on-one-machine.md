@@ -140,3 +140,27 @@ BENCH_TOKENS=400 python3 engine/stage_bench.py cpu model.gguf 5   # sustained
 The eight-node run: one `bitty node --no-iroh --model ... --layers 40` as
 leader and seven with `--join`, all with `BITTY_STAGE_THREADS=8`, then
 `bitty generate --seed 7 --max-tokens 120`.
+
+## First run over the Internet (2026-11-10)
+
+Two machines, Qwen3.5-0.8B: the laptop above as leader with layers 0..15, and a
+small VPS (1 core, 1.8 GB RAM, Debian 13) with layers 15..24. The VPS had no
+model: it joined through an iroh invite, fetched the vocabulary (10 MiB) and
+its stage (319 MiB) from HuggingFace and loaded it before the first request.
+Its engine was built without `-march=native` and without OpenMP so that it runs
+on any x86_64 with AVX2.
+
+- The text is the same as on one local node with the same seed.
+- 60 tokens took 103 s, about 1.7 s per token, against 9.3 s on one local
+  node.
+- The VPS engine used about 1% of its core: compute is not the cost.
+- The laptop received 22 MB for 20 tokens, at 4.9 Mbit/s. That is the logits
+  of the last stage, about 1 MB per token (248320 floats).
+- The plain link between the two machines carries 43 Mbit/s (measured with
+  ssh) with a 33 ms round trip, so the iroh path gave a ninth of the link.
+  Whether the connection was direct or went through the relay was not checked.
+
+So over a real network the full logits are the bottleneck, by a wide margin.
+Sending only the top values (a few hundred pairs of id and logit, a few KB)
+should bring a token close to the round trip time plus compute. After that the
+next thing to look at is the iroh path (direct or relay, and its throughput).
