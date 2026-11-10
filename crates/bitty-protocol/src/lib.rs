@@ -366,6 +366,9 @@ pub enum ActivationDType {
     /// The best logits of the final stage as pairs of little-endian u32 token id and f32
     /// logit, best first. The whole vocabulary is about 1 MB per token; this is a few KB.
     TopLogits,
+    /// [`ActivationDType::TopLogits`] for every token of the payload: each row is a
+    /// little-endian u32 count followed by that many pairs.
+    TopLogitRows,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -379,6 +382,12 @@ pub struct ActivationTensor {
     pub payload: Vec<u8>,
     pub crc32: u32,
     pub compression: CompressionKind,
+    /// Not zero: the request goes back to this position before the payload is run.
+    #[serde(default)]
+    pub rewind_to: u32,
+    /// The final stage answers for every token of the payload, not only for the last one.
+    #[serde(default)]
+    pub every_row: bool,
 }
 
 impl ActivationTensor {
@@ -402,6 +411,8 @@ impl ActivationTensor {
             payload,
             crc32,
             compression: CompressionKind::None,
+            rewind_to: 0,
+            every_row: false,
         }
     }
 
@@ -687,11 +698,14 @@ impl From<&ActivationTensor> for pb::ActivationTensor {
                 ActivationDType::F32 => "f32",
                 ActivationDType::Tokens => "tokens",
                 ActivationDType::TopLogits => "top_logits",
+                ActivationDType::TopLogitRows => "top_logit_rows",
             }
             .into(),
             payload: activation.payload.clone(),
             crc32: activation.crc32,
             compression: activation.compression.as_str().into(),
+            rewind_to: activation.rewind_to,
+            every_row: activation.every_row,
         }
     }
 }
@@ -707,6 +721,7 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             "f32" => ActivationDType::F32,
             "tokens" => ActivationDType::Tokens,
             "top_logits" => ActivationDType::TopLogits,
+            "top_logit_rows" => ActivationDType::TopLogitRows,
             other => return Err(ProtocolConversionError::UnknownDType(other.into())),
         };
         let activation = Self {
@@ -719,6 +734,8 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             payload: activation.payload,
             crc32: activation.crc32,
             compression: CompressionKind::try_from(activation.compression.as_str())?,
+            rewind_to: activation.rewind_to,
+            every_row: activation.every_row,
         };
         validation::validate_activation_tensor(&activation)?;
         Ok(activation)
@@ -925,6 +942,8 @@ mod tests {
             payload: Vec::new(),
             crc32: 0,
             compression: "none".into(),
+            rewind_to: 0,
+            every_row: false,
         })
         .unwrap_err();
 
@@ -943,6 +962,8 @@ mod tests {
             payload: vec![0; validation::MAX_ACTIVATION_PAYLOAD_BYTES + 1],
             crc32: 0,
             compression: "none".into(),
+            rewind_to: 0,
+            every_row: false,
         })
         .unwrap_err();
 

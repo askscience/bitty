@@ -325,6 +325,8 @@ Supported user-facing flags include:
 - `--seed`
 - `--top-k`
 - `--top-p`
+- `--think`
+- `--draft N` / `--no-draft` (a small model on the leader guesses N tokens for each pass of the ring, see `engine/README.md`)
 - `--system`
 - `--template`
 - `--data-dir`

@@ -49,10 +49,14 @@ pub struct StageOptions {
     /// Keeps the output layer on the GPU even when no block of the range is there. It is one
     /// large matrix, about a tenth of the work of a token, and needs little video memory.
     pub gpu_output: bool,
+    /// Tokens of its last request a stage can take back: the longest guess of a draft model
+    /// that can be checked in one pass. Costs memory (about 25 MB each for Qwen3.5-35B).
+    pub rollback: u32,
 }
 
 impl StageOptions {
-    /// Defaults overridden by `BITTY_STAGE_THREADS` and `BITTY_GPU_LAYERS`.
+    /// Defaults overridden by `BITTY_STAGE_THREADS`, `BITTY_GPU_LAYERS`, `BITTY_GPU_OUTPUT`
+    /// and `BITTY_STAGE_ROLLBACK`.
     pub fn from_env() -> Self {
         let read = |name: &str| {
             std::env::var(name)
@@ -68,6 +72,9 @@ impl StageOptions {
         }
         if let Some(gpu_output) = read("BITTY_GPU_OUTPUT") {
             options.gpu_output = gpu_output > 0;
+        }
+        if let Some(rollback) = read("BITTY_STAGE_ROLLBACK") {
+            options.rollback = rollback;
         }
         options
     }
@@ -98,9 +105,13 @@ impl Default for StageOptions {
             sessions: 4,
             gpu_layers: 0,
             gpu_output: false,
+            rollback: DEFAULT_ROLLBACK,
         }
     }
 }
+
+/// Tokens a stage can take back unless `BITTY_STAGE_ROLLBACK` says otherwise.
+pub const DEFAULT_ROLLBACK: u32 = 4;
 
 struct Session {
     id: u64,
@@ -293,6 +304,7 @@ impl StageExecutor {
             context: self.options.context,
             sessions: self.options.sessions,
             top_logits: crate::sampling::top_logits_limit() as u32,
+            rollback: self.options.rollback,
         })
         .map_err(|err| ExecutorError::Failed(err.to_string()))?;
         engine.process = Some(process);
@@ -409,6 +421,20 @@ impl LayerExecutor for StageExecutor {
                 );
             }
             let (session_id, position) = match engine.sessions.get(&activation.request_id) {
+                // a guess that was wrong is taken back: the engine goes back by itself when
+                // a request starts before the end of the session
+                Some(session)
+                    if activation.rewind_to != 0
+                        && activation.rewind_to <= session.next_position =>
+                {
+                    (session.id, activation.rewind_to)
+                }
+                Some(session) if activation.rewind_to != 0 => {
+                    return Err(ExecutorError::Failed(format!(
+                        "request {} is at position {} and was asked to go back to {}",
+                        activation.request_id, session.next_position, activation.rewind_to
+                    )))
+                }
                 Some(session) => (session.id, session.next_position),
                 None => {
                     return Err(ExecutorError::Failed(format!(
@@ -417,6 +443,7 @@ impl LayerExecutor for StageExecutor {
                     )))
                 }
             };
+            let every_row = activation.every_row;
 
             let process = engine.process.as_mut().expect("process started");
             let result = if first {
@@ -425,9 +452,15 @@ impl LayerExecutor for StageExecutor {
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
                     .collect();
-                process.decode_tokens(session_id, position, &ids)
+                process.decode_tokens(session_id, position, &ids, every_row)
             } else {
-                process.decode_hidden(session_id, position, tokens as u32, &activation.payload)
+                process.decode_hidden(
+                    session_id,
+                    position,
+                    tokens as u32,
+                    &activation.payload,
+                    every_row,
+                )
             };
             let output = match engine.settle(result) {
                 Ok(output) => output,
@@ -438,7 +471,7 @@ impl LayerExecutor for StageExecutor {
                 }
             };
             if let Some(session) = engine.sessions.get_mut(&activation.request_id) {
-                session.next_position += tokens as u32;
+                session.next_position = position + tokens as u32;
             }
 
             let (values, shape) = match output {
@@ -453,17 +486,35 @@ impl LayerExecutor for StageExecutor {
                         pairs,
                     ));
                 }
+                StageOutput::TopLogitRows(rows) => {
+                    return Ok(ActivationTensor::new(
+                        activation.request_id,
+                        activation.token_position,
+                        range.start_layer,
+                        range.end_layer_exclusive,
+                        vec![tokens as u32],
+                        ActivationDType::TopLogitRows,
+                        rows,
+                    ));
+                }
                 StageOutput::Hidden(values) => (values, vec![tokens as u32, hidden_size as u32]),
+                StageOutput::Logits(_) if every_row => {
+                    return Err(ExecutorError::Failed(
+                        "the logits of every token need a limit on them (BITTY_TOP_LOGITS is 0)"
+                            .into(),
+                    ))
+                }
                 StageOutput::Logits(values) => {
                     let width = values.len() as u32;
                     (values, vec![width])
                 }
             };
+            let (rewind_to, every_row) = (activation.rewind_to, activation.every_row);
             let mut payload = Vec::with_capacity(values.len() * 4);
             for value in &values {
                 payload.extend_from_slice(&value.to_le_bytes());
             }
-            Ok(ActivationTensor::new(
+            let mut output = ActivationTensor::new(
                 activation.request_id,
                 activation.token_position,
                 range.start_layer,
@@ -471,7 +522,11 @@ impl LayerExecutor for StageExecutor {
                 shape,
                 ActivationDType::F32,
                 payload,
-            ))
+            );
+            // the stages that follow must go back and answer in the same way
+            output.rewind_to = rewind_to;
+            output.every_row = every_row;
+            Ok(output)
         })
         .await
     }

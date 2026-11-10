@@ -135,6 +135,46 @@ built before this option has to be rebuilt. `BITTY_TOP_LOGITS` changes the
 number; 0 sends everything. Sampling gives the same text as long as the number
 is not below `--top-k`.
 
+## A draft model on the leader
+
+A small model with the same vocabulary can guess the next tokens, and the ring
+checks several of them in one pass. The coordinator sends the last certain token
+followed by the guesses; the final stage answers with the logits of every one of
+them (`KIND_TOP_ROWS`), and the coordinator samples row by row. A guess is kept
+while it is the token the model itself chooses. At the first other one the rest
+is dropped: the next pass carries `rewind_to`, and every stage takes the wrong
+tokens out of its memory before it decodes. One pass gives between 1 and N + 1
+tokens.
+
+The stages can only take back tokens of their last decode call, and not its
+first one. `bitty-stage --rollback N` keeps a copy of the recurrent state for
+each of the last N tokens (4 by default, `BITTY_STAGE_ROLLBACK`); on the 35B
+model that is about 25 MB of memory per kept token and node. A request for
+more guesses than the workers can take back is cut down to that number.
+
+The draft model runs whole on the leader, as one more `bitty-stage` process.
+For a model of the registry the file named by `draft_url` is downloaded next
+to the model the first time the leader starts; `BITTY_DRAFT_MODEL` names
+another file, or `off`. `BITTY_DRAFT_THREADS` and `BITTY_DRAFT_GPU_LAYERS`
+set its threads and GPU layers.
+
+It is off unless asked for: `bitty generate --draft 4` or `bitty run MODEL
+--draft 4` for one request, `BITTY_DRAFT_TOKENS=4` on the leader for all.
+`--no-draft` turns it off for one request. Every worker must run a build
+that knows it, otherwise the request fails with a message that says so.
+
+Whether it is faster depends on the ring. A pass with five tokens costs each
+stage more than a pass with one, and the draft model costs its own time, so on
+one machine it is slower. It pays when most of the time of a pass is spent on
+the network. `BITTY_TIMING=1` on the leader prints passes, guesses kept and
+milliseconds per token for each request, with and without it.
+
+The text is not always the one of a request without a draft. Decoding several
+tokens in one call gives logits that differ by up to 0.3 from decoding them one
+by one, and where two tokens are that close the choice can fall on the other.
+`engine/spec_check.py` checks that every token chosen this way is within 0.5 of
+the best one when the model reads the same text token by token.
+
 Engines are started with `GOMP_SPINCOUNT=1000` unless that variable or
 `OMP_WAIT_POLICY` is already set: idle threads spin briefly and then sleep.
 The libgomp default spins long enough to take the cores from the other stages

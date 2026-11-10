@@ -206,6 +206,20 @@ pub fn decode_top_logits(payload: &[u8]) -> Option<Vec<(u32, f32)>> {
     )
 }
 
+/// Rows of [`decode_top_logits`], one for each token of a request: every row is a
+/// little-endian u32 count followed by that many pairs.
+pub fn decode_top_logit_rows(payload: &[u8]) -> Option<Vec<Vec<(u32, f32)>>> {
+    let mut rows = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let count = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let end = count.checked_mul(8)?.checked_add(4)?;
+        rows.push(decode_top_logits(rest.get(4..end)?)?);
+        rest = &rest[end..];
+    }
+    Some(rows)
+}
+
 /// ln(sum(exp(x - max))) for a stable log-probability of the best logit.
 fn log_sum_exp(logits: impl Iterator<Item = f32>, max: f32) -> f32 {
     logits.map(|logit| (logit - max).exp()).sum::<f32>().ln()

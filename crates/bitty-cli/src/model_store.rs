@@ -18,6 +18,9 @@ pub struct ModelSpec {
     pub num_predict: u32,
     pub num_ctx: u32,
     pub path: Option<PathBuf>,
+    /// A small model with the same vocabulary: on the leader it guesses the next tokens.
+    pub draft_filename: String,
+    pub draft_url: String,
 }
 
 impl ModelSpec {
@@ -330,6 +333,62 @@ pub fn has_stage_source(settings: &BittySettings, model: &str) -> bool {
     stage_spec(settings, model).is_ok_and(|(spec, _)| !spec.url.is_empty())
 }
 
+/// The draft model of a model: where its file is kept and where it comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftFile {
+    pub path: PathBuf,
+    pub url: String,
+}
+
+impl DraftFile {
+    /// Downloads the file. A download that was cut goes on from where it stopped.
+    pub fn fetch(&self) -> Result<(), String> {
+        if self.url.is_empty() {
+            return Err(format!("{} is not there", self.path.display()));
+        }
+        ensure_parent(&self.path).map_err(|err| err.to_string())?;
+        let mut part = self.path.clone().into_os_string();
+        part.push(".part");
+        let status = std::process::Command::new("curl")
+            .args(["-L", "--fail", "--silent", "--show-error", "--retry", "5"])
+            .args(["-C", "-", "-o"])
+            .arg(&part)
+            .arg(&self.url)
+            .status()
+            .map_err(|err| format!("curl: {err}"))?;
+        if !status.success() {
+            return Err(format!("download failed: {}", self.url));
+        }
+        std::fs::rename(&part, &self.path).map_err(|err| err.to_string())
+    }
+}
+
+/// The draft model the leader of `model` uses, if there is one: the file named by
+/// `BITTY_DRAFT_MODEL`, otherwise the one of the registry, kept next to the model.
+/// `BITTY_DRAFT_MODEL=off` gives none.
+pub fn draft_model(settings: &BittySettings, model: &str) -> Option<DraftFile> {
+    if let Some(path) = std::env::var_os("BITTY_DRAFT_MODEL").filter(|path| !path.is_empty()) {
+        return (path != "off").then(|| DraftFile {
+            path: PathBuf::from(path),
+            url: String::new(),
+        });
+    }
+    let (spec, is_url) = stage_spec(settings, model).ok()?;
+    if is_url {
+        return None;
+    }
+    // a model installed by an older build has a manifest without the draft
+    let spec = if spec.draft_filename.is_empty() {
+        find_registry_model(&spec.name).filter(|known| !known.draft_filename.is_empty())?
+    } else {
+        spec
+    };
+    Some(DraftFile {
+        path: spec.model_dir(settings).join(&spec.draft_filename),
+        url: spec.draft_url,
+    })
+}
+
 pub fn whole_model_path(settings: &BittySettings, model: &str) -> Option<PathBuf> {
     let direct = Path::new(model);
     if direct.is_file() {
@@ -424,6 +483,8 @@ fn set_spec_value(spec: &mut ModelSpec, key: &str, value: &str) {
         "num_predict" => spec.num_predict = value.parse().unwrap_or(128),
         "num_ctx" => spec.num_ctx = value.parse().unwrap_or(2048),
         "path" => spec.path = Some(PathBuf::from(unquote(value))),
+        "draft_filename" => spec.draft_filename = value.into(),
+        "draft_url" => spec.draft_url = value.into(),
         _ => {}
     }
 }

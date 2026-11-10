@@ -1,3 +1,4 @@
+pub mod draft;
 pub mod executor;
 pub mod lifecycle;
 pub mod sampling;
@@ -6,6 +7,7 @@ pub mod stage_process;
 pub mod text;
 pub mod tiny_lm;
 
+pub use draft::DraftModel;
 pub use executor::{
     DraftExecutor, ExecutorError, FakeLayerExecutor, LayerExecutor, LowBitReferenceExecutor,
     StubLayerExecutor,

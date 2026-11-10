@@ -17,10 +17,14 @@ const OP_TOKEN_TEXT: u32 = 5;
 const OP_TOKENIZE: u32 = 6;
 const OP_CHAT_PROMPT: u32 = 7;
 const OP_EOG_TOKENS: u32 = 8;
+const OP_MARK: u32 = 9;
+/// Added to a decode op: the final stage answers for every token of the request.
+const OP_FLAG_ROWS: u32 = 0x100;
 
 const KIND_HIDDEN: u32 = 1;
 const KIND_LOGITS: u32 = 2;
 const KIND_TOP_LOGITS: u32 = 5;
+const KIND_TOP_ROWS: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum StageProcessError {
@@ -74,6 +78,9 @@ pub struct StageProcessConfig {
     pub sessions: u32,
     /// How many logits the final stage answers with, best first; 0 asks for the whole vocabulary.
     pub top_logits: u32,
+    /// How many tokens of its last request a session can take back. Each one costs a copy of
+    /// the recurrent state of every session.
+    pub rollback: u32,
 }
 
 /// Output of one decode call.
@@ -87,6 +94,9 @@ pub enum StageOutput {
     /// [`crate::sampling::encode_top_logits`]; the final stage returns them when it was started
     /// with a limit.
     TopLogits(Vec<u8>),
+    /// The best logits of every token of the request, asked for with `every_row`: for each
+    /// token a little-endian u32 count and that many pairs in the form of `TopLogits`.
+    TopLogitRows(Vec<u8>),
 }
 
 /// One running `bitty-stage` child. Calls block; the process dies with this value.
@@ -124,6 +134,9 @@ impl StageProcess {
             command
                 .arg("--top-logits")
                 .arg(config.top_logits.to_string());
+        }
+        if config.rollback > 0 {
+            command.arg("--rollback").arg(config.rollback.to_string());
         }
         Self::start(command, &config.engine)
     }
@@ -204,19 +217,22 @@ impl StageProcess {
     }
 
     /// Runs token ids through the first stage. `position` is where they sit in the session;
-    /// 0 opens a new session.
+    /// 0 opens a new session, and a position before the end of the session takes it back
+    /// there first (see `rollback` and [`StageProcess::mark`]). With `every_row` the final
+    /// stage answers for every token.
     pub fn decode_tokens(
         &mut self,
         session: u64,
         position: u32,
         tokens: &[u32],
+        every_row: bool,
     ) -> Result<StageOutput, StageProcessError> {
         let payload: Vec<u8> = tokens
             .iter()
             .flat_map(|token| token.to_le_bytes())
             .collect();
         self.decode(
-            OP_DECODE_TOKENS,
+            OP_DECODE_TOKENS | if every_row { OP_FLAG_ROWS } else { 0 },
             session,
             position,
             tokens.len() as u32,
@@ -231,8 +247,16 @@ impl StageProcess {
         position: u32,
         tokens: u32,
         hidden: &[u8],
+        every_row: bool,
     ) -> Result<StageOutput, StageProcessError> {
-        self.decode(OP_DECODE_HIDDEN, session, position, tokens, hidden)
+        let op = OP_DECODE_HIDDEN | if every_row { OP_FLAG_ROWS } else { 0 };
+        self.decode(op, session, position, tokens, hidden)
+    }
+
+    /// Keeps a copy of the session state at its present position. A later decode may start
+    /// from that position again, however many tokens were run in between.
+    pub fn mark(&mut self, session: u64) -> Result<(), StageProcessError> {
+        self.call(OP_MARK, session, 0, 0, &[]).map(|_| ())
     }
 
     fn decode(
@@ -243,7 +267,14 @@ impl StageProcess {
         tokens: u32,
         payload: &[u8],
     ) -> Result<StageOutput, StageProcessError> {
-        let (kind, _, bytes) = self.call(op, session, position, tokens, payload)?;
+        let (kind, rows, bytes) = self.call(op, session, position, tokens, payload)?;
+        if kind == KIND_TOP_ROWS {
+            return if rows == tokens && crate::sampling::decode_top_logit_rows(&bytes).is_some() {
+                Ok(StageOutput::TopLogitRows(bytes))
+            } else {
+                Err(StageProcessError::BadReply)
+            };
+        }
         if kind == KIND_TOP_LOGITS {
             return if bytes.len() % 8 == 0 {
                 Ok(StageOutput::TopLogits(bytes))

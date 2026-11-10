@@ -173,6 +173,9 @@ struct GenerateOptions {
     raw: bool,
     /// Let the model reason before it answers.
     thinking: bool,
+    /// Tokens the draft model guesses for one pass: 0 for the leader's default, negative
+    /// for none.
+    draft_tokens: i32,
     /// Token of the cluster, for a scheduler reached over plain TCP.
     cluster_token: Option<String>,
 }
@@ -203,6 +206,7 @@ struct RunConfig {
     data_dir: Option<String>,
     auto_pull: bool,
     local: bool,
+    options: GenerateOptions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +464,17 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         let mut coordinator = NetworkCoordinator::new(leader_layers(&model_file, config.layers))
             .with_model_path(&model_file)
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
+        // The small model that guesses tokens for the ring. It is used from the moment the
+        // file is whole on disk; until then requests go without it.
+        if let Some(draft) = model_store::draft_model(&node_settings, &config.model) {
+            coordinator = coordinator.with_draft_model(&draft.path);
+            if !draft.path.is_file() {
+                tokio::task::spawn_blocking(move || match draft.fetch() {
+                    Ok(()) => println!("bitty node: draft model ready: {}", draft.path.display()),
+                    Err(err) => eprintln!("bitty node: the draft model was not fetched: {err}"),
+                });
+            }
+        }
         if let Some(iroh_node) = &iroh_node {
             coordinator =
                 coordinator.with_iroh_endpoint(iroh_node.endpoint.clone(), cluster_token.clone());
@@ -560,7 +575,7 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
                     prompt: line.into(),
                     max_tokens: config.max_tokens,
                     temperature: config.temperature.clone(),
-                    options: GenerateOptions::default(),
+                    options: config.options.clone(),
                     data_dir: config.data_dir.clone(),
                 })
                 .await?;
@@ -572,7 +587,7 @@ async fn run_model(config: RunConfig) -> Result<(), Box<dyn std::error::Error>> 
             prompt,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
-            options: GenerateOptions::default(),
+            options: config.options,
             data_dir: config.data_dir,
         })
         .await;
@@ -1491,6 +1506,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                     seed: config.options.seed,
                     raw: config.options.raw,
                     thinking: config.options.thinking,
+                    draft_tokens: config.options.draft_tokens,
                 },
             )
             .await?;
@@ -1517,6 +1533,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                 seed: config.options.seed,
                 raw: config.options.raw,
                 thinking: config.options.thinking,
+                draft_tokens: config.options.draft_tokens,
             },
             config.options.cluster_token.as_deref().unwrap_or_default(),
         ))
@@ -1543,6 +1560,7 @@ async fn run_chat(config: ChatConfig) -> Result<(), Box<dyn std::error::Error>> 
             data_dir: config.data_dir,
             auto_pull: true,
             local: false,
+            options: GenerateOptions::default(),
         })
         .await;
     }
@@ -1780,6 +1798,12 @@ fn parse_node(args: &mut impl Iterator<Item = String>) -> Result<NodeConfig, Str
     Ok(config)
 }
 
+/// `--draft N`: how many tokens the draft model guesses for one pass, 0 for none.
+fn parse_draft(args: &mut impl Iterator<Item = String>) -> Result<i32, String> {
+    let tokens: u16 = parse_next(args, "--draft")?;
+    Ok(if tokens == 0 { -1 } else { i32::from(tokens) })
+}
+
 fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateConfig, String> {
     let mut config = GenerateConfig {
         node: String::new(),
@@ -1800,6 +1824,8 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
             "--seed" => config.options.seed = parse_next(args, "--seed")?,
             "--raw" => config.options.raw = true,
             "--think" => config.options.thinking = true,
+            "--draft" => config.options.draft_tokens = parse_draft(args)?,
+            "--no-draft" => config.options.draft_tokens = -1,
             "--cluster-token" => {
                 config.options.cluster_token = Some(required_next(args, "--cluster-token")?)
             }
@@ -1861,6 +1887,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
         data_dir: None,
         auto_pull: true,
         local: false,
+        options: GenerateOptions::default(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1875,7 +1902,13 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--local" => config.local = true,
             "--no-daemon" => {}
             "--join" => config.node = Some(required_next(args, "--join")?),
-            "--num-ctx" | "--seed" | "--top-k" | "--top-p" | "--system" | "--template" => {
+            "--top-k" => config.options.top_k = parse_next(args, "--top-k")?,
+            "--top-p" => config.options.top_p = required_next(args, "--top-p")?,
+            "--seed" => config.options.seed = parse_next(args, "--seed")?,
+            "--think" => config.options.thinking = true,
+            "--draft" => config.options.draft_tokens = parse_draft(args)?,
+            "--no-draft" => config.options.draft_tokens = -1,
+            "--num-ctx" | "--system" | "--template" => {
                 let _ = required_next(args, arg.as_str()).ok();
             }
             value if config.model.is_empty() => config.model = value.into(),
@@ -3292,7 +3325,7 @@ fn print_help() {
     println!("  bitty node --join 'iroh://INVITE' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
     println!("  bitty generate --prompt TEXT [--node TARGET] [--max-tokens N] [--temperature T]");
-    println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--cluster-token TOKEN]");
+    println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--draft N] [--cluster-token TOKEN]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
     println!(

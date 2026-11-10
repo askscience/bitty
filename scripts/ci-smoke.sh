@@ -15,6 +15,7 @@ BITTY="$1"
 MODEL="$(native "$3")"
 BITTY_STAGE_BIN="$(native "$2")"
 export BITTY_STAGE_BIN BITTY_STAGE_THREADS=2
+export BITTY_DRAFT_MODEL="$MODEL" BITTY_DRAFT_THREADS=2 BITTY_TIMING=1
 WORK="$(mktemp -d)"
 DATA="$(native "$WORK")"
 PIDS=()
@@ -62,6 +63,18 @@ leader
 PIDS+=("$!")
 first="$(generate_when_ready)" || die "no text from two nodes"
 echo "$first"
+
+echo "== draft model"
+# the model is its own draft here: nearly every guess is right, so a pass yields several tokens
+drafted="$("$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+    --prompt "Name three colours." --seed 7 --max-tokens 24 --draft 4 2>> "$WORK/client.log")" \
+    || die "no text with the draft model"
+echo "$drafted"
+[ -n "$drafted" ] || die "empty text with the draft model"
+grep -q "draft model loaded" "$WORK/n0.log" || die "the leader did not load the draft model"
+kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)"
+echo "$kept"
+[ "${kept%% *}" -ge 8 ] || die "the workers kept too few draft tokens: $kept"
 
 echo "== leader restart"
 kill "$LEADER"

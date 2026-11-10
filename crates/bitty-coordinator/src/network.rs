@@ -1,11 +1,12 @@
 use crate::security::{request_rate_limiter, AuthMode, SharedRateLimiter};
 use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
+use bitty_inference::{
+    DraftModel, Sampler, SamplingOptions, StageOptions, TextCodec, TextStream, DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+};
 #[cfg(test)]
 use bitty_inference::{LayerExecutor, LowBitReferenceExecutor};
-use bitty_inference::{
-    Sampler, SamplingOptions, TextCodec, TextStream, DEFAULT_TOP_K, DEFAULT_TOP_P,
-};
 use bitty_observability::record_halda_run;
 use bitty_protocol::endpoint::validate_worker_endpoint_for_dial;
 use bitty_protocol::pb::coordinator_service_server::{
@@ -56,6 +57,30 @@ pub struct NetworkCoordinator {
     /// The topology in which the workers could not pass a token to each other. While it
     /// lasts, every worker answers the coordinator instead.
     chain_broken: Arc<Mutex<Option<String>>>,
+    /// The small model that guesses tokens for the workers to check, opened on first use.
+    draft_path: Option<PathBuf>,
+    draft: Arc<Mutex<DraftSlot>>,
+}
+
+type SharedDraft = Arc<std::sync::Mutex<DraftModel>>;
+
+#[derive(Debug, Default)]
+enum DraftSlot {
+    #[default]
+    NotOpened,
+    Open(SharedDraft),
+    /// It could not be opened or does not fit the model; not tried again.
+    Unusable,
+}
+
+/// How many tokens the draft model guesses for one pass when the request does not say:
+/// `BITTY_DRAFT_TOKENS`. None by default: whether a draft makes a ring faster depends on
+/// how long a pass waits on the network, so it is asked for with the request.
+fn default_draft_tokens() -> usize {
+    std::env::var("BITTY_DRAFT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// `BITTY_CHAIN=0` makes every worker answer the coordinator, as it was before the workers
@@ -142,7 +167,16 @@ impl NetworkCoordinator {
             text_codec: Arc::new(Mutex::new(None)),
             prepare_lock: Arc::new(Mutex::new(())),
             chain_broken: Arc::new(Mutex::new(None)),
+            draft_path: None,
+            draft: Arc::default(),
         }
+    }
+
+    /// A small model with the vocabulary of the served one. It guesses the next tokens and
+    /// the workers check several of them in one pass.
+    pub fn with_draft_model(mut self, draft_path: impl Into<PathBuf>) -> Self {
+        self.draft_path = Some(draft_path.into());
+        self
     }
 
     pub fn with_model_path(mut self, model_path: impl Into<PathBuf>) -> Self {
@@ -639,27 +673,74 @@ impl NetworkCoordinator {
         let mut hop_micros = vec![0u64; worker_clients.len()];
         let mut token_micros = 0u64;
         let generation_started = Instant::now();
-        let mut token_position = 0;
-        while token_position < max_new_tokens {
+        // Speculative decoding: a small model guesses the next tokens, the workers run the
+        // last certain token and the guesses in one pass and answer for each of them. The
+        // guesses are kept as long as the model chooses the same token; at the first other
+        // one the workers go back. The text is the one the model would have written alone.
+        let (mut draft, draft_tokens) = self
+            .draft_for(request.draft_tokens, codec.vocab_size())
+            .await;
+        // the whole text: the prompt and every token chosen so far
+        let mut text_tokens = std::mem::take(&mut current_input);
+        // how many of them the workers hold
+        let mut fed = 0usize;
+        // the workers hold guesses after `fed` that were wrong
+        let mut rewind = false;
+        let (mut guessed, mut kept) = (0usize, 0usize);
+        let mut first_pass_tokens = 0usize;
+        let mut step = 0u32;
+        let mut produced = 0u32;
+        'passes: while produced < max_new_tokens {
             let started = Instant::now();
-            let payload = current_input
+            let pending = text_tokens[fed..].to_vec();
+            let mut guesses = Vec::new();
+            // The workers can only take back tokens of their last pass, and not its first
+            // one: a guess goes with one certain token, not with the prompt.
+            if let (Some(model), 1) = (&draft, pending.len()) {
+                let count =
+                    draft_tokens.min((max_new_tokens - produced).saturating_sub(1) as usize);
+                let (model, codec) = (model.clone(), codec.clone());
+                let (request, text) = (request_id.clone(), text_tokens.clone());
+                let proposed = tokio::task::spawn_blocking(move || {
+                    let mut model = model.lock().unwrap_or_else(|poison| poison.into_inner());
+                    model.propose(&request, &text, count, |token| codec.is_end(token))
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|result| result.map_err(|err| err.to_string()));
+                match proposed {
+                    Ok(tokens) => guesses = tokens,
+                    Err(err) => {
+                        eprintln!(
+                            "bitty-coordinator: the draft model failed ({err}); the request goes on without it"
+                        );
+                        draft = None;
+                    }
+                }
+            }
+            let payload = pending
                 .iter()
+                .chain(&guesses)
                 .flat_map(|token| token.to_le_bytes())
                 .collect::<Vec<_>>();
             let mut activation = ActivationTensor::new(
                 run_id.clone(),
-                token_position,
+                step,
                 0,
                 0,
-                vec![current_input.len() as u32],
+                vec![(pending.len() + guesses.len()) as u32],
                 ActivationDType::Tokens,
                 payload,
             );
+            activation.every_row = !guesses.is_empty();
+            if rewind {
+                activation.rewind_to = fed as u32;
+            }
 
             if let Some(endpoints) = &route {
                 match Self::chain_token(&mut worker_clients, endpoints, &activation).await {
                     Ok((output, micros)) => {
-                        if token_position > 0 {
+                        if step > 0 {
                             for (total, micros) in hop_micros.iter_mut().zip(micros) {
                                 *total += micros;
                             }
@@ -670,9 +751,7 @@ impl NetworkCoordinator {
                     // request can start again the old way. After a timeout a worker may
                     // still be busy, and later in the text the workers hold a state
                     // that cannot be replayed.
-                    Err(err)
-                        if token_position == 0 && err.code() != tonic::Code::DeadlineExceeded =>
-                    {
+                    Err(err) if step == 0 && err.code() != tonic::Code::DeadlineExceeded => {
                         eprintln!(
                             "bitty-coordinator: the workers could not pass the token to each other ({}); every worker answers the coordinator until the cluster changes",
                             bitty_protocol::worker_client::status_text(&err)
@@ -701,7 +780,7 @@ impl NetworkCoordinator {
                     let hop_started = Instant::now();
                     match client.forward_activation(&activation).await {
                         Ok(output) => {
-                            if token_position > 0 {
+                            if step > 0 {
                                 hop_micros[index] += hop_started.elapsed().as_micros() as u64;
                             }
                             activation = output
@@ -717,84 +796,132 @@ impl NetworkCoordinator {
                 }
             }
 
-            // the final stage answers with the logits of the last token: the best ones, or
-            // the whole vocabulary from a worker that was told not to cut them
-            let candidates = match activation.dtype {
+            // The final stage answers with the logits of the last token: the best ones, or
+            // the whole vocabulary from a worker that was told not to cut them. With guesses
+            // in the pass it answers for every token from the last certain one on.
+            let rows = match activation.dtype {
+                ActivationDType::TopLogitRows => {
+                    bitty_inference::sampling::decode_top_logit_rows(&activation.payload)
+                }
                 ActivationDType::TopLogits => {
                     bitty_inference::sampling::decode_top_logits(&activation.payload)
+                        .map(|row| vec![row])
                 }
                 ActivationDType::F32
                     if activation.payload.len() == codec.vocab_size() as usize * 4 =>
                 {
-                    Some(
-                        activation
-                            .payload
-                            .chunks_exact(4)
-                            .enumerate()
-                            .map(|(token, chunk)| {
-                                let logit =
-                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                                (token as u32, logit)
-                            })
-                            .collect(),
-                    )
+                    Some(vec![activation
+                        .payload
+                        .chunks_exact(4)
+                        .enumerate()
+                        .map(|(token, chunk)| {
+                            let logit =
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            (token as u32, logit)
+                        })
+                        .collect()])
                 }
                 _ => None,
             };
-            let Some(candidates) = candidates else {
+            let Some(rows) = rows else {
                 failure = Some(Status::internal(
                     "the last worker did not return the logits of the model",
                 ));
                 break;
             };
-            let Some(sampled) = sampler.sample_candidates(candidates) else {
-                failure = Some(Status::internal("the model returned no usable logits"));
+            if rows.len() != guesses.len() + 1 {
+                failure = Some(Status::internal(if guesses.is_empty() {
+                    "the last worker returned the logits of the wrong number of tokens"
+                } else {
+                    "the workers did not check the tokens of the draft model; a worker may run an older build of bitty"
+                }));
                 break;
-            };
-            let ended = codec.is_end(sampled.token);
-            let finished = ended || token_position + 1 == max_new_tokens;
-            let mut piece = if ended {
-                String::new()
-            } else {
-                match codec.piece(sampled.token) {
-                    Ok(bytes) => text.push(&bytes),
-                    Err(err) => {
-                        failure = Some(text_error(err));
-                        break;
+            }
+
+            let mut accepted = 0usize;
+            let mut done = false;
+            for (index, candidates) in rows.into_iter().enumerate() {
+                let Some(sampled) = sampler.sample_candidates(candidates) else {
+                    failure = Some(Status::internal("the model returned no usable logits"));
+                    break 'passes;
+                };
+                let ended = codec.is_end(sampled.token);
+                let finished = ended || produced + 1 == max_new_tokens;
+                let mut piece = if ended {
+                    String::new()
+                } else {
+                    match codec.piece(sampled.token) {
+                        Ok(bytes) => text.push(&bytes),
+                        Err(err) => {
+                            failure = Some(text_error(err));
+                            break 'passes;
+                        }
+                    }
+                };
+                if finished {
+                    piece.push_str(&text.finish());
+                }
+                let token = ProtoTokenOutput {
+                    request_id: request_id.clone(),
+                    token_position: produced,
+                    token_id: sampled.token,
+                    text: piece,
+                    finished,
+                    log_prob: sampled.log_prob,
+                    gen_latency_us: started.elapsed().as_micros() as u64,
+                };
+                produced += 1;
+                text_tokens.push(sampled.token);
+                if let Some(sender) = &sender {
+                    if sender.send(Ok(token.clone())).await.is_err() {
+                        break 'passes;
                     }
                 }
-            };
-            if finished {
-                piece.push_str(&text.finish());
-            }
-            let token = ProtoTokenOutput {
-                request_id: request_id.clone(),
-                token_position,
-                token_id: sampled.token,
-                text: piece,
-                finished,
-                log_prob: sampled.log_prob,
-                gen_latency_us: started.elapsed().as_micros() as u64,
-            };
-            if token_position > 0 {
-                token_micros += started.elapsed().as_micros() as u64;
-            }
-            token_position += 1;
-            current_input.clear();
-            current_input.push(sampled.token);
-            if let Some(sender) = &sender {
-                if sender.send(Ok(token.clone())).await.is_err() {
+                outputs.push(token);
+                if finished {
+                    done = true;
+                    break;
+                }
+                // the guess was the model's own choice: the next row holds what follows it
+                if guesses.get(index) == Some(&sampled.token) {
+                    accepted += 1;
+                } else {
                     break;
                 }
             }
-            outputs.push(token);
-            if finished {
+            if step > 0 {
+                token_micros += started.elapsed().as_micros() as u64;
+            } else {
+                first_pass_tokens = outputs.len();
+            }
+            fed += pending.len() + accepted;
+            rewind = accepted < guesses.len();
+            guessed += guesses.len();
+            kept += accepted;
+            if let (Some(model), false) = (&draft, guesses.is_empty()) {
+                model
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .settle(&request_id, accepted);
+            }
+            step += 1;
+            if done {
                 break;
             }
         }
+        if let Some(model) = &draft {
+            let (model, request) = (model.clone(), request_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                model
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .end(&request)
+            })
+            .await;
+        }
 
-        if std::env::var_os("BITTY_TIMING").is_some() && outputs.len() > 1 {
-            let steps = (outputs.len() - 1) as f64;
+        if std::env::var_os("BITTY_TIMING").is_some() && outputs.len() > first_pass_tokens {
+            let steps = (outputs.len() - first_pass_tokens) as f64;
             let hops: Vec<String> = assignments
                 .iter()
                 .zip(&hop_micros)
@@ -810,7 +937,7 @@ impl NetworkCoordinator {
                 .collect();
             let in_hops = hop_micros.iter().sum::<u64>() as f64 / steps / 1000.0;
             println!(
-                "timing ({}): {} tokens in {:.1}s; ms per token after the first: {:.1}, of which workers {:.1} [{}]",
+                "timing ({}): {} tokens in {:.1}s, {} passes, {} of {} draft tokens kept; ms per token after the first pass: {:.1}, of which workers {:.1} [{}]",
                 if route.is_some() {
                     "worker to worker"
                 } else {
@@ -818,6 +945,9 @@ impl NetworkCoordinator {
                 },
                 outputs.len(),
                 generation_started.elapsed().as_secs_f64(),
+                step,
+                kept,
+                guessed,
                 token_micros as f64 / steps / 1000.0,
                 in_hops,
                 hops.join(", ")
@@ -842,6 +972,70 @@ impl NetworkCoordinator {
         match failure {
             Some(status) => Err(status),
             None => Ok(outputs),
+        }
+    }
+
+    /// The draft model and how many tokens it guesses for one pass, or `None` when the
+    /// request goes without. `wanted` comes with the request: negative for no draft, 0 for the
+    /// default. The workers cannot take back more tokens than their engines keep copies for.
+    async fn draft_for(&self, wanted: i32, vocab_size: u32) -> (Option<SharedDraft>, usize) {
+        let tokens = match wanted {
+            wanted if wanted < 0 => 0,
+            0 => default_draft_tokens(),
+            wanted => wanted as usize,
+        }
+        .min(StageOptions::from_env().rollback as usize);
+        let Some(path) = self.draft_path.clone() else {
+            return (None, 0);
+        };
+        // the file may still be on its way
+        if tokens == 0 || !path.is_file() {
+            return (None, 0);
+        }
+        let mut slot = self.draft.lock().await;
+        if let DraftSlot::NotOpened = *slot {
+            let opened = tokio::task::spawn_blocking(move || {
+                let engine = bitty_inference::find_stage_engine()
+                    .ok_or_else(|| "bitty-stage was not found".to_string())?;
+                let read = |name: &str| {
+                    std::env::var(name)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        .unwrap_or(0)
+                };
+                let model = DraftModel::open(
+                    &engine,
+                    &path,
+                    read("BITTY_DRAFT_THREADS"),
+                    read("BITTY_DRAFT_GPU_LAYERS"),
+                )
+                .map_err(|err| format!("{}: {err}", path.display()))?;
+                if model.vocab_size() != vocab_size {
+                    return Err(format!(
+                        "{} has {} tokens in its vocabulary, the model has {vocab_size}",
+                        path.display(),
+                        model.vocab_size()
+                    ));
+                }
+                Ok(model)
+            })
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|result| result);
+            *slot = match opened {
+                Ok(model) => {
+                    println!("bitty-coordinator: draft model loaded, {tokens} tokens for one pass");
+                    DraftSlot::Open(Arc::new(std::sync::Mutex::new(model)))
+                }
+                Err(err) => {
+                    eprintln!("bitty-coordinator: no draft model: {err}");
+                    DraftSlot::Unusable
+                }
+            };
+        }
+        match &*slot {
+            DraftSlot::Open(model) => (Some(model.clone()), tokens),
+            _ => (None, 0),
         }
     }
 

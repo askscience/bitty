@@ -347,14 +347,14 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..d6c6313
+index 0000000..bffc2b5
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,609 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
-+//               [--top-logits N]
++//               [--top-logits N] [--rollback N]
 +//   bitty-stage -m model.gguf --vocab-only
 +//
 +// With --vocab-only no weights are loaded: the process only serves the text ops (5 to 8) and
@@ -377,6 +377,12 @@ index 0000000..d6c6313
 +//        f32; the final stage answers kind LOGITS with the n_vocab f32 logits of the last token,
 +//        or with --top-logits N kind TOP_LOGITS: the N best as pairs of u32 token id and f32
 +//        logit, best first (equal logits by token id), rows = number of pairs.
++//        With the flag 0x100 in `op` the final stage answers for every token of the request and
++//        not only for the last: kind LOGITS with rows = n_tokens, or with --top-logits kind
++//        TOP_ROWS, where each row is a u32 count followed by that many pairs.
++//        A `pos` before the end of the session takes the session back to `pos` first. This
++//        works for the tokens of the last request but its first one, up to --rollback N of
++//        them, or to the position of the last MARK.
 +//   3 END            drops the session state
 +//   4 PING           answers kind NONE
 +//   5 TOKEN_TEXT     payload = token ids, answers kind BYTES with their UTF-8 text
@@ -386,6 +392,8 @@ index 0000000..d6c6313
 +//                    (n_tokens != 0 opens the assistant turn at the end; pos != 0 lets a
 +//                    reasoning model think before it answers)
 +//   8 EOG_TOKENS     answers kind TOKENS with every token id that ends generation
++//   9 MARK           keeps a copy of the session state at its present position, in place of
++//                    the copy made before; a later decode may start again from there
 +
 +#include "llama.h"
 +
@@ -424,8 +432,9 @@ index 0000000..d6c6313
 +static void fd_binary(int) {}
 +#endif
 +
-+enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8 };
-+enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4, KIND_TOP_LOGITS = 5 };
++enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8, OP_MARK = 9 };
++enum : uint32_t { OP_MASK = 0xff, OP_FLAG_ROWS = 0x100 };
++enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4, KIND_TOP_LOGITS = 5, KIND_TOP_ROWS = 6 };
 +
 +static const uint32_t PROTOCOL_VERSION = 1;
 +static const uint32_t MAX_PAYLOAD      = 1u << 30;
@@ -473,6 +482,10 @@ index 0000000..d6c6313
 +    llama_seq_id seq      = 0;
 +    uint32_t     next_pos = 0;
 +    uint64_t     last_use = 0;
++    // state kept by MARK: what a model cannot rebuild from its cache (the recurrent layers)
++    bool                 marked   = false;
++    uint32_t             mark_pos = 0;
++    std::vector<uint8_t> mark;
 +};
 +
 +struct server {
@@ -484,6 +497,7 @@ index 0000000..d6c6313
 +    int  begin = 0, end = 0;
 +    int  n_batch = 512, n_ctx_seq = 4096, n_sessions = 4;
 +    int  top_logits = 0; // 0 answers with the whole vocabulary
++    int  rollback   = 0; // tokens of the last request a session can take back
 +    bool first = false, last = false;
 +
 +    std::map<uint64_t, session> sessions;
@@ -494,6 +508,32 @@ index 0000000..d6c6313
 +        if (it == sessions.end()) return;
 +        llama_memory_seq_rm(llama_get_memory(ctx), it->second.seq, -1, -1);
 +        sessions.erase(it);
++    }
++
++    bool mark(session & s) {
++        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
++        const size_t size = llama_state_seq_get_size_ext(ctx, s.seq, flags);
++        s.mark.resize(size);
++        s.marked   = size == 0 || llama_state_seq_get_data_ext(ctx, s.mark.data(), size, s.seq, flags) == size;
++        s.mark_pos = s.next_pos;
++        return s.marked;
++    }
++
++    // takes the session back to `pos`: the memory's own snapshots of the last request first,
++    // then the state kept by MARK
++    bool rewind(session & s, uint32_t pos) {
++        llama_memory_t mem = llama_get_memory(ctx);
++        if (!llama_memory_seq_rm(mem, s.seq, (llama_pos) pos, -1)) {
++            if (!s.marked || s.mark_pos != pos) return false;
++            if (!s.mark.empty() &&
++                llama_state_seq_set_data_ext(ctx, s.mark.data(), s.mark.size(), s.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++                return false;
++            }
++            if (!llama_memory_seq_rm(mem, s.seq, (llama_pos) pos, -1)) return false;
++        }
++        if (s.marked && s.mark_pos > pos) s.marked = false;
++        s.next_pos = pos;
++        return true;
 +    }
 +
 +    // returns the session that continues at `pos`, opening it when pos is 0
@@ -521,16 +561,20 @@ index 0000000..d6c6313
 +        } else if (it == sessions.end()) {
 +            err = "session state is not on this stage (never opened, ended or evicted)";
 +            return nullptr;
-+        } else if (it->second.next_pos != pos) {
++        } else if (it->second.next_pos < pos) {
 +            err = "session is at position " + std::to_string(it->second.next_pos) + ", request starts at " + std::to_string(pos);
++            return nullptr;
++        } else if (it->second.next_pos > pos && !rewind(it->second, pos)) {
++            err = "session is at position " + std::to_string(it->second.next_pos) + " and cannot go back to " + std::to_string(pos);
 +            return nullptr;
 +        }
 +        it->second.last_use = ++clock;
 +        return &it->second;
 +    }
 +
-+    // runs n tokens of one session; out receives the hidden states or the last token's logits
-+    bool decode(session & s, const llama_token * tokens, const float * hidden, int n, std::vector<float> & out, std::string & err) {
++    // runs n tokens of one session; out receives the hidden states, or the logits of the last
++    // token, or with `rows` those of every token
++    bool decode(session & s, const llama_token * tokens, const float * hidden, int n, bool rows, std::vector<float> & out, std::string & err) {
 +        if ((int64_t) s.next_pos + n > n_ctx_seq) {
 +            err = "session would exceed the stage context of " + std::to_string(n_ctx_seq) + " tokens";
 +            return false;
@@ -556,7 +600,7 @@ index 0000000..d6c6313
 +            std::vector<llama_seq_id>   seq0(1, s.seq);
 +            std::vector<llama_seq_id *> seq(m, seq0.data());
 +            // a non-final stage outputs every token; the final stage only the last one
-+            std::vector<int8_t> outputs(m, last ? 0 : 1);
++            std::vector<int8_t> outputs(m, last && !rows ? 0 : 1);
 +            if (last && last_chunk) outputs[m - 1] = 1;
 +
 +            llama_batch batch = {};
@@ -584,6 +628,15 @@ index 0000000..d6c6313
 +                    return false;
 +                }
 +                out.insert(out.end(), h, h + (size_t) m * n_embd);
++            } else if (rows) {
++                for (int i = 0; i < m; ++i) {
++                    const float * l = llama_get_logits_ith(ctx, i);
++                    if (!l) {
++                        err = "the stage returned no logits";
++                        return false;
++                    }
++                    out.insert(out.end(), l, l + n_vocab);
++                }
 +            } else if (last_chunk) {
 +                const float * l = llama_get_logits_ith(ctx, -1);
 +                if (!l) {
@@ -624,6 +677,7 @@ index 0000000..d6c6313
 +        else if (a == "--sessions") srv.n_sessions = atoi(argv[++i]);
 +        else if (a == "--batch")    srv.n_batch    = atoi(argv[++i]);
 +        else if (a == "--top-logits") srv.top_logits = atoi(argv[++i]);
++        else if (a == "--rollback") srv.rollback   = atoi(argv[++i]);
 +        else {
 +            fprintf(stderr, "unknown argument %s\n", a.c_str());
 +            return 2;
@@ -632,8 +686,8 @@ index 0000000..d6c6313
 +    if (vocab_only) {
 +        srv.begin = srv.end = 0;
 +    }
-+    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1) {
-+        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N]\n"
++    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1 || srv.rollback < 0) {
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N] [--rollback N]\n"
 +                        "       %s -m model.gguf --vocab-only\n", argv[0], argv[0]);
 +        return 2;
 +    }
@@ -667,6 +721,7 @@ index 0000000..d6c6313
 +    llama_context_params cparams = llama_context_default_params();
 +    cparams.n_ctx        = (uint32_t) srv.n_ctx_seq * srv.n_sessions;
 +    cparams.n_seq_max    = srv.n_sessions;
++    cparams.n_rs_seq     = (uint32_t) srv.rollback;
 +    cparams.n_batch      = srv.n_batch;
 +    cparams.n_ubatch     = srv.n_batch;
 +    cparams.no_perf      = true;
@@ -699,6 +754,8 @@ index 0000000..d6c6313
 +        uint32_t op, pos, n_tokens, len;
 +        uint64_t sid;
 +        memcpy(&op, head, 4);
++        const bool rows = (op & OP_FLAG_ROWS) != 0;
++        op &= ~(uint32_t) OP_FLAG_ROWS;
 +        memcpy(&sid, head + 4, 8);
 +        memcpy(&pos, head + 12, 4);
 +        memcpy(&n_tokens, head + 16, 4);
@@ -746,35 +803,51 @@ index 0000000..d6c6313
 +                const bool done = srv.decode(*s,
 +                        is_tokens ? (const llama_token *) payload.data() : nullptr,
 +                        is_tokens ? nullptr : (const float *) payload.data(),
-+                        (int) n_tokens, result, err);
++                        (int) n_tokens, rows && srv.last, result, err);
 +                if (!done) {
 +                    // the state may hold part of the request: the session cannot continue
 +                    srv.drop(sid);
 +                    ok = respond_error(out_fd, err);
 +                    break;
 +                }
-+                if (srv.last && srv.top_logits > 0 && (size_t) srv.top_logits < result.size()) {
++                const uint32_t n_rows = rows && srv.last ? n_tokens : 1;
++                if (srv.last && srv.top_logits > 0 && (rows || srv.top_logits < srv.n_vocab)) {
 +                    // choosing here keeps a megabyte of logits per token out of the pipe and
 +                    // out of the caller, whose thread has been asleep during the decode
-+                    order.resize(result.size());
-+                    std::iota(order.begin(), order.end(), 0u);
-+                    order.erase(std::remove_if(order.begin(), order.end(),
-+                            [&](uint32_t t) { return std::isnan(result[t]); }), order.end());
-+                    const size_t keep = std::min((size_t) srv.top_logits, order.size());
-+                    std::partial_sort(order.begin(), order.begin() + keep, order.end(),
-+                            [&](uint32_t a, uint32_t b) {
-+                                return result[a] != result[b] ? result[a] > result[b] : a < b;
-+                            });
-+                    best.resize(keep * 8);
-+                    for (size_t i = 0; i < keep; ++i) {
-+                        memcpy(best.data() + i * 8, &order[i], 4);
-+                        memcpy(best.data() + i * 8 + 4, &result[order[i]], 4);
++                    best.clear();
++                    uint32_t pairs = 0;
++                    for (uint32_t row = 0; row < n_rows; ++row) {
++                        const float * logits = result.data() + (size_t) row * srv.n_vocab;
++                        order.resize(srv.n_vocab);
++                        std::iota(order.begin(), order.end(), 0u);
++                        order.erase(std::remove_if(order.begin(), order.end(),
++                                [&](uint32_t t) { return std::isnan(logits[t]); }), order.end());
++                        const size_t keep = std::min((size_t) srv.top_logits, order.size());
++                        std::partial_sort(order.begin(), order.begin() + keep, order.end(),
++                                [&](uint32_t a, uint32_t b) {
++                                    return logits[a] != logits[b] ? logits[a] > logits[b] : a < b;
++                                });
++                        size_t at = best.size();
++                        if (rows) {
++                            const uint32_t count = (uint32_t) keep;
++                            best.resize(at + 4);
++                            memcpy(best.data() + at, &count, 4);
++                            at += 4;
++                        }
++                        best.resize(at + keep * 8);
++                        for (size_t i = 0; i < keep; ++i) {
++                            memcpy(best.data() + at + i * 8, &order[i], 4);
++                            memcpy(best.data() + at + i * 8 + 4, &logits[order[i]], 4);
++                        }
++                        pairs = (uint32_t) keep;
 +                    }
-+                    ok = respond(out_fd, 0, KIND_TOP_LOGITS, (uint32_t) keep, best.data(), best.size());
++                    ok = rows
++                        ? respond(out_fd, 0, KIND_TOP_ROWS, n_rows, best.data(), best.size())
++                        : respond(out_fd, 0, KIND_TOP_LOGITS, pairs, best.data(), best.size());
 +                    break;
 +                }
 +                ok = srv.last
-+                    ? respond(out_fd, 0, KIND_LOGITS, 1, result.data(), result.size() * sizeof(float))
++                    ? respond(out_fd, 0, KIND_LOGITS, n_rows, result.data(), result.size() * sizeof(float))
 +                    : respond(out_fd, 0, KIND_HIDDEN, n_tokens, result.data(), result.size() * sizeof(float));
 +                break;
 +            }
@@ -782,6 +855,17 @@ index 0000000..d6c6313
 +                if (srv.ctx) srv.drop(sid);
 +                ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
 +                break;
++            case OP_MARK: {
++                auto it = srv.sessions.find(sid);
++                if (!srv.ctx || it == srv.sessions.end()) {
++                    ok = respond_error(out_fd, "no such session to mark");
++                } else if (!srv.mark(it->second)) {
++                    ok = respond_error(out_fd, "the state of the session could not be copied");
++                } else {
++                    ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
++                }
++                break;
++            }
 +            case OP_PING:
 +                ok = respond(out_fd, 0, KIND_NONE, 0, nullptr, 0);
 +                break;

@@ -325,6 +325,23 @@ one) the gain is larger. The weak point is the draft itself: the 0.8B model
 needs 62 ms per token on CPU and 39 on this GPU, a large share of it in the
 output layer over 248320 tokens.
 
+### Built (2026-11-10)
+
+It is in bitty now, off by default (`--draft N`, see `engine/README.md`). Two
+nodes on this machine, Qwen3.5-0.8B cut 12/12, the same file as draft (so
+nearly every guess is right), 80 tokens, CPU:
+
+| | Passes | Guesses kept | ms per token | of which workers |
+|---|---|---|---|---|
+| no draft | 80 | | 104 | 97 |
+| draft of 4 | 18 | 62 of 65 | 153 | 69 |
+
+The workers need less time per token (69 against 97 ms) and the draft model
+adds 83: slower on one machine, as estimated. With temperature 0.7 only 51 of
+107 guesses were kept, because the draft always proposes its best token while
+the model samples. Not measured yet: the real ring, where a pass waits on the
+network.
+
 ## From worker to worker (2026-11-10)
 
 Until now every worker answered the coordinator, which then called the next

@@ -71,6 +71,12 @@ message ActivationTensor {
   bytes payload = 7;
   uint32 crc32 = 8;
   string compression = 9;
+  // Not zero: the request goes back to this position before the payload is run. The tokens
+  // from there on were a guess that turned out wrong.
+  uint32 rewind_to = 10;
+  // The final stage answers with the best logits of every token of the payload, not only of
+  // the last one.
+  bool every_row = 11;
 }
 
 message TokenOutput {
@@ -110,6 +116,9 @@ message GenerateRequest {
   bool raw = 9;
   // Let the model reason before it answers; the reasoning is part of the output.
   bool thinking = 10;
+  // Tokens the draft model of the coordinator guesses for one pass of the workers. 0 takes
+  // the coordinator's default, a negative number asks for no draft.
+  sint32 draft_tokens = 11;
 }
 
 message GenerateResponse {
