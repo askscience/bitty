@@ -12,9 +12,9 @@ use bitty_protocol::pb::coordinator_service_server::{
     CoordinatorService, CoordinatorServiceServer,
 };
 use bitty_protocol::pb::{
-    ActivationTensor as ProtoActivationTensor, ChainStep, ClusterStatusRequest, ClusterStatusResponse,
-    GenerateRequest as ProtoGenerateRequest, HeartbeatRequest, HeartbeatResponse, LoadShardRequest,
-    RegisterWorkerRequest, RegisterWorkerResponse,
+    ActivationTensor as ProtoActivationTensor, ChainStep, ClusterStatusRequest,
+    ClusterStatusResponse, GenerateRequest as ProtoGenerateRequest, HeartbeatRequest,
+    HeartbeatResponse, LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse,
     ShardManifest as ProtoShardManifest, TokenOutput as ProtoTokenOutput,
 };
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
@@ -85,7 +85,9 @@ fn is_loopback_endpoint(endpoint: &str) -> bool {
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = match authority.strip_prefix('[') {
         Some(inner) => inner.split(']').next().unwrap_or(inner),
-        None => authority.rsplit_once(':').map_or(authority, |(host, _)| host),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
     };
     host == "localhost"
         || host
@@ -473,10 +475,12 @@ impl NetworkCoordinator {
             // the worker beside an iroh coordinator is reached on the loopback address,
             // which is another machine for everybody else: they get the iroh address
             let endpoint = match &self.iroh_endpoint {
-                Some(iroh) if is_loopback_endpoint(&endpoint) => bitty_protocol::iroh_transport::iroh_uri(
-                    iroh.id(),
-                    self.cluster_token.as_deref().unwrap_or_default(),
-                ),
+                Some(iroh) if is_loopback_endpoint(&endpoint) => {
+                    bitty_protocol::iroh_transport::iroh_uri(
+                        iroh.id(),
+                        self.cluster_token.as_deref().unwrap_or_default(),
+                    )
+                }
                 _ => endpoint,
             };
             route.push(endpoint);
@@ -626,8 +630,7 @@ impl NetworkCoordinator {
                     // still be busy, and later in the text the workers hold a state
                     // that cannot be replayed.
                     Err(err)
-                        if token_position == 0
-                            && err.code() != tonic::Code::DeadlineExceeded =>
+                        if token_position == 0 && err.code() != tonic::Code::DeadlineExceeded =>
                     {
                         eprintln!(
                             "bitty-coordinator: the workers could not pass the token to each other ({}); every worker answers the coordinator until the cluster changes",

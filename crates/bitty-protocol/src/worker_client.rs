@@ -137,10 +137,7 @@ impl WorkerRpcClient {
         }
     }
 
-    pub async fn cleanup(
-        &mut self,
-        request: crate::pb::CleanupRequest,
-    ) -> Result<(), Status> {
+    pub async fn cleanup(&mut self, request: crate::pb::CleanupRequest) -> Result<(), Status> {
         match self {
             Self::Tcp { client, token } => {
                 let _ = client

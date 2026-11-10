@@ -23,7 +23,10 @@ fn token_activation(request: &str, step: u32, tokens: &[u32]) -> ActivationTenso
         0,
         vec![tokens.len() as u32],
         ActivationDType::Tokens,
-        tokens.iter().flat_map(|token| token.to_le_bytes()).collect(),
+        tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect(),
     )
 }
 
@@ -40,7 +43,10 @@ async fn generate(
     for step in 0..steps {
         let mut activation = token_activation(request, step, &input);
         for (executor, range) in chain {
-            activation = executor.execute_range(range, activation).await.expect("stage runs");
+            activation = executor
+                .execute_range(range, activation)
+                .await
+                .expect("stage runs");
         }
         let (last, _) = chain.last().unwrap();
         let logits = last.final_logits(activation).await.expect("final logits");
@@ -77,7 +83,10 @@ async fn chained_stages_match_the_whole_model() {
         ..StageOptions::default()
     };
     let load = || async {
-        let executor = StageExecutor::load(&model).await.expect("model header").with_options(options);
+        let executor = StageExecutor::load(&model)
+            .await
+            .expect("model header")
+            .with_options(options);
         assert!(executor.engine_available());
         executor
     };
@@ -94,7 +103,10 @@ async fn chained_stages_match_the_whole_model() {
         .expect("whole model runs");
     whole.end_request("warmup").await;
     let prompt = whole
-        .tokenize("The capital of Italy is Rome. The capital of France is", true)
+        .tokenize(
+            "The capital of Italy is Rome. The capital of France is",
+            true,
+        )
         .await
         .expect("tokenize");
     assert!(prompt.len() > 4);
@@ -146,7 +158,8 @@ fn vocabulary_process_handles_text_without_weights() {
         eprintln!("skipped: set BITTY_STAGE_BIN and BITTY_TEST_MODEL");
         return;
     };
-    let codec = bitty_inference::TextCodec::open_with_engine(engine.as_ref(), model.as_ref()).unwrap();
+    let codec =
+        bitty_inference::TextCodec::open_with_engine(engine.as_ref(), model.as_ref()).unwrap();
     assert!(codec.vocab_size() > 1000);
 
     let text = |tokens: &[u32]| {
@@ -162,9 +175,15 @@ fn vocabulary_process_handles_text_without_weights() {
 
     let quiet = text(&codec.chat_tokens(&[("user", "Hi")], false).unwrap());
     assert!(quiet.contains("<|im_start|>user\nHi<|im_end|>"), "{quiet}");
-    assert!(quiet.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{quiet}");
+    assert!(
+        quiet.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        "{quiet}"
+    );
     let thinking = text(&codec.chat_tokens(&[("user", "Hi")], true).unwrap());
-    assert!(thinking.ends_with("<|im_start|>assistant\n<think>\n"), "{thinking}");
+    assert!(
+        thinking.ends_with("<|im_start|>assistant\n<think>\n"),
+        "{thinking}"
+    );
 
     // the end of a turn stops generation, ordinary text does not
     let end = codec.tokenize("<|im_end|>").unwrap();

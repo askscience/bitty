@@ -199,6 +199,9 @@ pub struct HardwareProfile {
     pub os: String,
     pub tier: NodeTier,
     pub ram_mb: u64,
+    /// Memory free when the node started, in MB. Zero: the node did not say.
+    #[serde(default)]
+    pub available_ram_mb: u64,
     pub vram_mb: u64,
     pub architecture: String,
     pub gpus: Vec<GpuInfo>,
@@ -462,6 +465,7 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             os: profile.os.clone(),
             tier: profile.tier.as_str().into(),
             ram_mb: profile.ram_mb,
+            available_ram_mb: profile.available_ram_mb,
             vram_mb: profile.vram_mb,
             architecture: profile.architecture.clone(),
             gpus: profile.gpus.iter().map(Into::into).collect(),
@@ -516,6 +520,7 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             os: profile.os,
             tier: NodeTier::try_from(profile.tier.as_str())?,
             ram_mb,
+            available_ram_mb: profile.available_ram_mb.min(ram_mb),
             vram_mb: profile.vram_mb,
             architecture: if profile.architecture.is_empty() {
                 "unknown".into()

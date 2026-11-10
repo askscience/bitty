@@ -4,8 +4,8 @@ use bitty_protocol::pb::worker_service_server::{WorkerService, WorkerServiceServ
 use bitty_protocol::pb::{
     ActivationTensor as ProtoActivationTensor, ChainAck, ChainResult, ChainResultRequest,
     ChainStep, CleanupRequest, CleanupResponse, HeartbeatResponse, LoadShardRequest,
-    LoadShardResponse, Logits as ProtoLogits, SampleTokenRequest,
-    TokenOutput as ProtoTokenOutput, TopologyUpdate,
+    LoadShardResponse, Logits as ProtoLogits, SampleTokenRequest, TokenOutput as ProtoTokenOutput,
+    TopologyUpdate,
 };
 use bitty_protocol::security::{AuthMode, BITTY_TOKEN_HEADER};
 use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
@@ -80,7 +80,10 @@ impl ChainMailbox {
         }
     }
 
-    fn take_or_wait(&self, key: (String, u32)) -> Result<ChainResult, oneshot::Receiver<ChainResult>> {
+    fn take_or_wait(
+        &self,
+        key: (String, u32),
+    ) -> Result<ChainResult, oneshot::Receiver<ChainResult>> {
         let mut slots = self.slots.lock().expect("chain mailbox");
         if let Some(ChainSlot::Ready(result)) = slots.remove(&key) {
             return Ok(result);
@@ -269,7 +272,9 @@ where
             Ok(output) => output,
             Err(status) => {
                 let error = format!("worker {}: {}", self.node_id.0, status_text(&status));
-                return self.report_chain_failure(key, route.last(), error, hop_micros).await;
+                return self
+                    .report_chain_failure(key, route.last(), error, hop_micros)
+                    .await;
             }
         };
         let Some((next, rest)) = route.split_first() else {
@@ -298,7 +303,8 @@ where
             );
             // the last worker is the only one the coordinator listens to; when it is the
             // one that cannot be reached, the coordinator finds out by its own timeout
-            self.report_chain_failure(key, rest.last(), error, hop_micros).await;
+            self.report_chain_failure(key, rest.last(), error, hop_micros)
+                .await;
         }
     }
 
@@ -765,7 +771,10 @@ mod tests {
         mailbox.deliver(("old".into(), 0), chain_result("stale"));
         mailbox.forget("old");
 
-        assert_eq!(mailbox.take_or_wait(("req".into(), 0)).unwrap().error, "kept");
+        assert_eq!(
+            mailbox.take_or_wait(("req".into(), 0)).unwrap().error,
+            "kept"
+        );
         assert!(mailbox.take_or_wait(("old".into(), 0)).is_err());
     }
 

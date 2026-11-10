@@ -54,7 +54,11 @@ pub struct StageOptions {
 impl StageOptions {
     /// Defaults overridden by `BITTY_STAGE_THREADS` and `BITTY_GPU_LAYERS`.
     pub fn from_env() -> Self {
-        let read = |name: &str| std::env::var(name).ok().and_then(|value| value.trim().parse::<u32>().ok());
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        };
         let mut options = Self::default();
         if let Some(threads) = read("BITTY_STAGE_THREADS") {
             options.threads = threads;
@@ -240,10 +244,15 @@ impl StageExecutor {
     }
 
     /// Starts the engine for `range`, replacing a process that serves another range.
-    fn ensure_process(&self, engine: &mut Engine, range: &AssignedLayerRange) -> Result<(), ExecutorError> {
+    fn ensure_process(
+        &self,
+        engine: &mut Engine,
+        range: &AssignedLayerRange,
+    ) -> Result<(), ExecutorError> {
         let matches = engine.process.as_ref().is_some_and(|process| {
             let info = process.info();
-            info.start_layer == range.start_layer && info.end_layer_exclusive == range.end_layer_exclusive
+            info.start_layer == range.start_layer
+                && info.end_layer_exclusive == range.end_layer_exclusive
         });
         if matches {
             return Ok(());
@@ -258,11 +267,12 @@ impl StageExecutor {
             Some(source) => {
                 let wanted = self.wanted.clone();
                 let mine = pack_range(range);
-                let stale: CancelCheck = Arc::new(move || {
-                    wanted.load(std::sync::atomic::Ordering::Relaxed) != mine
-                });
-                fetched = source(range.start_layer, range.end_layer_exclusive, stale)
-                    .map_err(|err| ExecutorError::Failed(format!("stage file is not available: {err}")))?;
+                let stale: CancelCheck =
+                    Arc::new(move || wanted.load(std::sync::atomic::Ordering::Relaxed) != mine);
+                fetched =
+                    source(range.start_layer, range.end_layer_exclusive, stale).map_err(|err| {
+                        ExecutorError::Failed(format!("stage file is not available: {err}"))
+                    })?;
                 &fetched
             }
             None => model,
@@ -309,7 +319,8 @@ impl LayerExecutor for StageExecutor {
         let range = range.clone();
         self.wanted
             .store(pack_range(&range), std::sync::atomic::Ordering::Relaxed);
-        self.blocking(move |this, engine| this.ensure_process(engine, &range)).await
+        self.blocking(move |this, engine| this.ensure_process(engine, &range))
+            .await
     }
 
     /// Token ids go into a range that starts at layer 0, hidden states into any other range.
@@ -325,7 +336,8 @@ impl LayerExecutor for StageExecutor {
             return Err(ExecutorError::ChecksumFailed);
         }
         let layer_count = self.metadata.layer_count;
-        if range.end_layer_exclusive > layer_count || range.start_layer >= range.end_layer_exclusive {
+        if range.end_layer_exclusive > layer_count || range.start_layer >= range.end_layer_exclusive
+        {
             return Err(ExecutorError::Failed(format!(
                 "layer range {}..{} is outside the model's {} blocks",
                 range.start_layer, range.end_layer_exclusive, layer_count
@@ -350,7 +362,9 @@ impl LayerExecutor for StageExecutor {
             let first = range.start_layer == 0;
             let tokens = if first {
                 if activation.payload.is_empty() || activation.payload.len() % 4 != 0 {
-                    return Err(ExecutorError::Failed("the first stage expects u32 token ids".into()));
+                    return Err(ExecutorError::Failed(
+                        "the first stage expects u32 token ids".into(),
+                    ));
                 }
                 activation.payload.len() / 4
             } else {
@@ -377,14 +391,22 @@ impl LayerExecutor for StageExecutor {
 
             if activation.token_position == 0 {
                 if let Some(old) = engine.sessions.remove(&activation.request_id) {
-                    let result = engine.process.as_mut().expect("process started").end_session(old.id);
+                    let result = engine
+                        .process
+                        .as_mut()
+                        .expect("process started")
+                        .end_session(old.id);
                     engine.settle(result)?;
                 }
                 engine.next_session_id += 1;
                 let id = engine.next_session_id;
-                engine
-                    .sessions
-                    .insert(activation.request_id.clone(), Session { id, next_position: 0 });
+                engine.sessions.insert(
+                    activation.request_id.clone(),
+                    Session {
+                        id,
+                        next_position: 0,
+                    },
+                );
             }
             let (session_id, position) = match engine.sessions.get(&activation.request_id) {
                 Some(session) => (session.id, session.next_position),
@@ -455,7 +477,10 @@ impl LayerExecutor for StageExecutor {
     }
 
     async fn decode_token_text(&self, token_id: u32) -> String {
-        match self.with_running(move |process| process.token_text(&[token_id])).await {
+        match self
+            .with_running(move |process| process.token_text(&[token_id]))
+            .await
+        {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => format!("<token:{token_id}>"),
         }
@@ -481,7 +506,9 @@ impl LayerExecutor for StageExecutor {
         if !activation.verify_checksum() {
             return Err(ExecutorError::ChecksumFailed);
         }
-        if activation.dtype == ActivationDType::TopLogits && activation.target_layer == self.metadata.layer_count {
+        if activation.dtype == ActivationDType::TopLogits
+            && activation.target_layer == self.metadata.layer_count
+        {
             // the logits the stage left out can never be sampled: they stand as minus infinity
             let vocabulary = self
                 .blocking(|_, engine| {
@@ -493,12 +520,18 @@ impl LayerExecutor for StageExecutor {
                 })
                 .await?;
             let mut logits = vec![f32::NEG_INFINITY; vocabulary];
-            for (token, logit) in crate::sampling::decode_top_logits(&activation.payload).unwrap_or_default() {
+            for (token, logit) in
+                crate::sampling::decode_top_logits(&activation.payload).unwrap_or_default()
+            {
                 if let Some(slot) = logits.get_mut(token as usize) {
                     *slot = logit;
                 }
             }
-            return Ok(Logits::new(activation.request_id, activation.token_position, logits));
+            return Ok(Logits::new(
+                activation.request_id,
+                activation.token_position,
+                logits,
+            ));
         }
         if activation.dtype != ActivationDType::F32
             || activation.target_layer != self.metadata.layer_count
@@ -514,7 +547,11 @@ impl LayerExecutor for StageExecutor {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        Ok(Logits::new(activation.request_id, activation.token_position, logits))
+        Ok(Logits::new(
+            activation.request_id,
+            activation.token_position,
+            logits,
+        ))
     }
 }
 

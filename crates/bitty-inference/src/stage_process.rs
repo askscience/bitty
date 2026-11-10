@@ -113,13 +113,17 @@ impl StageProcess {
             .arg("--sessions")
             .arg(config.sessions.to_string());
         if config.gpu_layers > 0 {
-            command.arg("--gpu-layers").arg(config.gpu_layers.to_string());
+            command
+                .arg("--gpu-layers")
+                .arg(config.gpu_layers.to_string());
         }
         if config.threads > 0 {
             command.arg("-t").arg(config.threads.to_string());
         }
         if config.top_logits > 0 {
-            command.arg("--top-logits").arg(config.top_logits.to_string());
+            command
+                .arg("--top-logits")
+                .arg(config.top_logits.to_string());
         }
         Self::start(command, &config.engine)
     }
@@ -167,7 +171,9 @@ impl StageProcess {
             let _ = child.wait();
             return Err(StageProcessError::Io(err));
         }
-        let word = |index: usize| u32::from_le_bytes(hello[4 + index * 4..8 + index * 4].try_into().unwrap());
+        let word = |index: usize| {
+            u32::from_le_bytes(hello[4 + index * 4..8 + index * 4].try_into().unwrap())
+        };
         if &hello[..4] != b"BSTG" {
             let _ = child.kill();
             let _ = child.wait();
@@ -205,8 +211,17 @@ impl StageProcess {
         position: u32,
         tokens: &[u32],
     ) -> Result<StageOutput, StageProcessError> {
-        let payload: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
-        self.decode(OP_DECODE_TOKENS, session, position, tokens.len() as u32, &payload)
+        let payload: Vec<u8> = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        self.decode(
+            OP_DECODE_TOKENS,
+            session,
+            position,
+            tokens.len() as u32,
+            &payload,
+        )
     }
 
     /// Runs hidden states (`tokens * hidden_size` values) through a later stage.
@@ -257,11 +272,19 @@ impl StageProcess {
     }
 
     pub fn token_text(&mut self, tokens: &[u32]) -> Result<Vec<u8>, StageProcessError> {
-        let payload: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
-        self.call(OP_TOKEN_TEXT, 0, 0, 0, &payload).map(|reply| reply.2)
+        let payload: Vec<u8> = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        self.call(OP_TOKEN_TEXT, 0, 0, 0, &payload)
+            .map(|reply| reply.2)
     }
 
-    pub fn tokenize(&mut self, text: &str, add_special: bool) -> Result<Vec<u32>, StageProcessError> {
+    pub fn tokenize(
+        &mut self,
+        text: &str,
+        add_special: bool,
+    ) -> Result<Vec<u32>, StageProcessError> {
         let (_, _, bytes) = self.call(OP_TOKENIZE, 0, 0, add_special as u32, text.as_bytes())?;
         Ok(bytes
             .chunks_exact(4)
@@ -316,7 +339,8 @@ impl StageProcess {
 
         let mut reply = [0u8; 16];
         self.stdout.read_exact(&mut reply)?;
-        let word = |index: usize| u32::from_le_bytes(reply[index * 4..index * 4 + 4].try_into().unwrap());
+        let word =
+            |index: usize| u32::from_le_bytes(reply[index * 4..index * 4 + 4].try_into().unwrap());
         let (status, kind, rows, len) = (word(0), word(1), word(2), word(3));
         if len > MAX_PAYLOAD {
             return Err(StageProcessError::BadReply);
@@ -324,7 +348,9 @@ impl StageProcess {
         let mut bytes = vec![0u8; len as usize];
         self.stdout.read_exact(&mut bytes)?;
         if status != 0 {
-            return Err(StageProcessError::Engine(String::from_utf8_lossy(&bytes).into_owned()));
+            return Err(StageProcessError::Engine(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
         }
         Ok((kind, rows, bytes))
     }

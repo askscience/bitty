@@ -11,9 +11,9 @@ pub use gguf::{
     GgufFileMetadata, GgufLayout, GgufMetadataValue, GgufTensorInfo,
 };
 pub use metadata::{MetadataError, ModelMetadata, ShardPlan, TensorMetadata};
-pub use stage_file::{
-    stage_holds_tensor, write_stage_file, ByteSource, CancelCheck, FileSource, HttpSource, StageFileError,
-    StageFileReport, STAGE_END_KEY, STAGE_START_KEY,
-};
 pub use shard::{MappedWeightShard, ShardError, WeightShard, WeightShardManifest};
+pub use stage_file::{
+    stage_holds_tensor, write_stage_file, ByteSource, CancelCheck, FileSource, HttpSource,
+    StageFileError, StageFileReport, STAGE_END_KEY, STAGE_START_KEY,
+};
 pub use tensor::{LowBitTensor, TensorShape};

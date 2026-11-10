@@ -188,6 +188,7 @@ pub fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
             os: "linux".into(),
             tier: if index == 0 { NodeTier::S } else { NodeTier::D },
             ram_mb: 4096,
+            available_ram_mb: 0,
             vram_mb: if index == 0 { 8192 } else { 0 },
             architecture: "x86_64".into(),
             gpus: Vec::new(),

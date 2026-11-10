@@ -99,7 +99,10 @@ pub struct HttpSource {
 
 impl HttpSource {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), cancel: None }
+        Self {
+            url: url.into(),
+            cancel: None,
+        }
     }
 
     /// Stops a running download as soon as `cancel` answers `true`.
@@ -112,7 +115,14 @@ impl HttpSource {
         let mut command = Command::new("curl");
         command
             .args(["--location", "--fail", "--silent", "--show-error"])
-            .args(["--retry", "5", "--retry-delay", "2", "--proto", "=https,http"])
+            .args([
+                "--retry",
+                "5",
+                "--retry-delay",
+                "2",
+                "--proto",
+                "=https,http",
+            ])
             // a connection that stalls is ended, so the transfer can go on from where it was
             .args(["--speed-limit", "1024", "--speed-time", "60"]);
         command
@@ -131,18 +141,24 @@ impl ByteSource for HttpSource {
             .stderr(Stdio::piped())
             .output()?;
         if !output.status.success() {
-            return Err(StageFileError::Fetch(String::from_utf8_lossy(&output.stderr).trim().into()));
+            return Err(StageFileError::Fetch(
+                String::from_utf8_lossy(&output.stderr).trim().into(),
+            ));
         }
         let headers = String::from_utf8_lossy(&output.stdout);
         headers
             .lines()
             .filter_map(|line| {
                 let (name, value) = line.split_once(':')?;
-                name.trim().eq_ignore_ascii_case("content-range").then_some(value)
+                name.trim()
+                    .eq_ignore_ascii_case("content-range")
+                    .then_some(value)
             })
             .last()
             .and_then(|value| value.rsplit('/').next()?.trim().parse().ok())
-            .ok_or_else(|| StageFileError::Fetch("the server does not support range requests".into()))
+            .ok_or_else(|| {
+                StageFileError::Fetch("the server does not support range requests".into())
+            })
     }
 
     fn copy_range(&self, offset: u64, len: u64, out: &mut dyn Write) -> Result<(), StageFileError> {
@@ -252,7 +268,13 @@ pub struct StageFileReport {
 }
 
 /// Whether a tensor belongs to the stage `[start, end)` of a model with `layers` blocks.
-pub fn stage_holds_tensor(name: &str, start: u32, end: u32, layers: u32, has_output_weight: bool) -> bool {
+pub fn stage_holds_tensor(
+    name: &str,
+    start: u32,
+    end: u32,
+    layers: u32,
+    has_output_weight: bool,
+) -> bool {
     if start >= end {
         return false;
     }
@@ -260,7 +282,11 @@ pub fn stage_holds_tensor(name: &str, start: u32, end: u32, layers: u32, has_out
     let last = end == layers;
     if let Some(block) = block_of(name) {
         // blocks past the layer count belong to heads that go with the output
-        return if block < layers { (start..end).contains(&block) } else { last };
+        return if block < layers {
+            (start..end).contains(&block)
+        } else {
+            last
+        };
     }
     if name == "token_embd.weight" {
         return first || (last && !has_output_weight);
@@ -277,7 +303,10 @@ fn block_of(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn read_layout(source: &dyn ByteSource, source_len: u64) -> Result<(GgufLayout, Vec<u8>), StageFileError> {
+fn read_layout(
+    source: &dyn ByteSource,
+    source_len: u64,
+) -> Result<(GgufLayout, Vec<u8>), StageFileError> {
     let mut want = FIRST_HEADER_READ;
     loop {
         let len = want.min(source_len);
@@ -337,7 +366,10 @@ pub fn write_stage_file(
     if let (Some(GgufMetadataValue::U64(from)), Some(GgufMetadataValue::U64(to))) =
         (metadata.get(STAGE_START_KEY), metadata.get(STAGE_END_KEY))
     {
-        return Err(StageFileError::SourceIsStage { start: *from, end: *to });
+        return Err(StageFileError::SourceIsStage {
+            start: *from,
+            end: *to,
+        });
     }
     let layers = block_count(&layout).ok_or(StageFileError::NoBlockCount)?;
     // 0..0 is the vocabulary file: every metadata value and no tensor
@@ -347,7 +379,11 @@ pub fn write_stage_file(
     }
 
     let alignment = layout.header.alignment.max(1);
-    let has_output_weight = layout.header.tensors.iter().any(|tensor| tensor.name == "output.weight");
+    let has_output_weight = layout
+        .header
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "output.weight");
     let mut kept: Vec<&GgufTensorInfo> = layout
         .header
         .tensors
@@ -427,7 +463,9 @@ pub fn write_stage_file(
             written += padding + run.len;
             fetched += run.len;
         }
-        out.into_inner().map_err(|err| err.into_error())?.sync_all()?;
+        out.into_inner()
+            .map_err(|err| err.into_error())?
+            .sync_all()?;
         Ok(fetched)
     })();
     let fetched = match result {
@@ -499,7 +537,11 @@ mod tests {
         (bytes, names)
     }
 
-    fn build(with_output_weight: bool, start: u32, end: u32) -> (Vec<String>, Vec<u8>, StageFileReport, Vec<String>) {
+    fn build(
+        with_output_weight: bool,
+        start: u32,
+        end: u32,
+    ) -> (Vec<String>, Vec<u8>, StageFileReport, Vec<String>) {
         let dir = std::env::temp_dir().join(format!(
             "bitty-stage-file-{}-{with_output_weight}-{start}-{end}",
             std::process::id()
@@ -513,8 +555,14 @@ mod tests {
         let parsed = parse_gguf_file(&dest).unwrap();
         let bytes = std::fs::read(&dest).unwrap();
         let layout = parse_gguf_prefix(&bytes, bytes.len() as u64).unwrap();
-        assert_eq!(parsed.metadata.get(STAGE_START_KEY), Some(&GgufMetadataValue::U64(start as u64)));
-        assert_eq!(parsed.metadata.get(STAGE_END_KEY), Some(&GgufMetadataValue::U64(end as u64)));
+        assert_eq!(
+            parsed.metadata.get(STAGE_START_KEY),
+            Some(&GgufMetadataValue::U64(start as u64))
+        );
+        assert_eq!(
+            parsed.metadata.get(STAGE_END_KEY),
+            Some(&GgufMetadataValue::U64(end as u64))
+        );
         // every kept tensor still holds its own marker bytes at an aligned offset
         for tensor in &parsed.tensors {
             let marker = names.iter().position(|name| name == &tensor.name).unwrap() as u8 + 1;
@@ -523,7 +571,11 @@ mod tests {
             assert_eq!(&bytes[at..at + 40], &[marker; 40][..], "{}", tensor.name);
         }
         assert!(!dest.with_extension("gguf.partial").exists());
-        let kept = parsed.tensors.iter().map(|tensor| tensor.name.clone()).collect();
+        let kept = parsed
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect();
         std::fs::remove_dir_all(&dir).unwrap();
         (kept, bytes, report, names)
     }
@@ -549,11 +601,23 @@ mod tests {
     #[test]
     fn first_stage_holds_the_embeddings_and_last_the_head() {
         let (first, ..) = build(true, 0, 1);
-        assert_eq!(first, ["token_embd.weight", "blk.0.attn_q.weight", "blk.0.ffn_up.weight"]);
+        assert_eq!(
+            first,
+            [
+                "token_embd.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.ffn_up.weight"
+            ]
+        );
         let (last, ..) = build(true, 2, 3);
         assert_eq!(
             last,
-            ["blk.2.attn_q.weight", "blk.2.ffn_up.weight", "output_norm.weight", "output.weight"]
+            [
+                "blk.2.attn_q.weight",
+                "blk.2.ffn_up.weight",
+                "output_norm.weight",
+                "output.weight"
+            ]
         );
     }
 
@@ -562,13 +626,19 @@ mod tests {
         let (last, ..) = build(false, 2, 3);
         assert_eq!(
             last,
-            ["token_embd.weight", "blk.2.attn_q.weight", "blk.2.ffn_up.weight", "output_norm.weight"]
+            [
+                "token_embd.weight",
+                "blk.2.attn_q.weight",
+                "blk.2.ffn_up.weight",
+                "output_norm.weight"
+            ]
         );
     }
 
     #[test]
     fn rejects_bad_ranges_and_stage_sources() {
-        let dir = std::env::temp_dir().join(format!("bitty-stage-file-{}-reject", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bitty-stage-file-{}-reject", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (model, _) = sample_model(true);
         let source_path = dir.join("model.gguf");
@@ -614,7 +684,10 @@ mod resume_tests {
                     }
                     if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
                         let (start, end) = value.trim().split_once('-').unwrap();
-                        range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                        range = Some((
+                            start.parse::<usize>().unwrap(),
+                            end.parse::<usize>().unwrap(),
+                        ));
                     }
                 }
                 let Some((start, end)) = range else { continue };

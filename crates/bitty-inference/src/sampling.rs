@@ -81,7 +81,10 @@ impl Sampler {
             (self.options.top_k as usize).min(candidates.len())
         };
         let log_sum = greedy.then(|| {
-            let best = candidates.iter().map(|(_, logit)| *logit).fold(f32::MIN, f32::max);
+            let best = candidates
+                .iter()
+                .map(|(_, logit)| *logit)
+                .fold(f32::MIN, f32::max);
             log_sum_exp(candidates.iter().map(|(_, logit)| *logit), best)
         });
         if keep < candidates.len() {
@@ -153,7 +156,11 @@ pub fn top_logits(logits: &[f32], limit: usize) -> Vec<(u32, f32)> {
     // million tokens, building and ordering a pair for every token costs milliseconds per token.
     let mut threshold = f32::NEG_INFINITY;
     if limit > 0 && limit < logits.len() {
-        let mut values: Vec<f32> = logits.iter().copied().filter(|logit| !logit.is_nan()).collect();
+        let mut values: Vec<f32> = logits
+            .iter()
+            .copied()
+            .filter(|logit| !logit.is_nan())
+            .collect();
         if limit < values.len() {
             let (_, nth, _) = values.select_nth_unstable_by(limit - 1, |a, b| b.total_cmp(a));
             threshold = *nth;
@@ -244,12 +251,16 @@ mod tests {
     fn sampling_follows_the_distribution_and_the_seed() {
         let logits = [1.0, 1.0, -20.0];
         let mut sampler = Sampler::new(options(1.0, 0, 1.0));
-        let draws: Vec<u32> = (0..400).map(|_| sampler.sample(&logits).unwrap().token).collect();
+        let draws: Vec<u32> = (0..400)
+            .map(|_| sampler.sample(&logits).unwrap().token)
+            .collect();
         let zeros = draws.iter().filter(|token| **token == 0).count();
         assert!((120..280).contains(&zeros), "{zeros}");
         assert!(draws.iter().all(|token| *token < 2));
         let mut again = Sampler::new(options(1.0, 0, 1.0));
-        let repeat: Vec<u32> = (0..400).map(|_| again.sample(&logits).unwrap().token).collect();
+        let repeat: Vec<u32> = (0..400)
+            .map(|_| again.sample(&logits).unwrap().token)
+            .collect();
         assert_eq!(draws, repeat);
     }
 

@@ -95,6 +95,24 @@ bitty run qwen3.5-35b-a3b "hello"
 No machine needs the whole 22 GB model. A node downloads the vocabulary and
 then only the layers it is given.
 
+### How many layers a machine gets
+
+The layers are shared in proportion to speed, inside what the memory of each
+machine can hold. A layer of the 35B model is about 0.5 GB, and a node needs
+about 1.5 GB more for the engine and its context. The first limit is 90% of
+the memory that was free when the node started, so a machine that also runs a
+desktop and a browser keeps working. Only when the layers do not fit anywhere
+inside that limit does the planner go up to 85% of the whole memory of a
+machine. A machine with no room for one layer is left out of the ring.
+
+To give a machine less than it would get, put one of these in its `env` file
+and restart the node:
+
+```
+BITTY_AVAILABLE_RAM_MB=6000
+BITTY_MAX_LAYERS=6
+```
+
 ## Options
 
 | Linux | Windows | |

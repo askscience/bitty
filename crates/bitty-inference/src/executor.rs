@@ -31,10 +31,7 @@ pub trait LayerExecutor: Send + Sync {
     /// Drops any per-request state (KV cache, recurrent state) held for `request_id`.
     async fn end_request(&self, _request_id: &str) {}
 
-    async fn final_logits(
-        &self,
-        activation: ActivationTensor,
-    ) -> Result<Logits, ExecutorError> {
+    async fn final_logits(&self, activation: ActivationTensor) -> Result<Logits, ExecutorError> {
         if !activation.verify_checksum() {
             return Err(ExecutorError::ChecksumFailed);
         }
@@ -206,7 +203,8 @@ mod tests {
             end_layer_exclusive: 1,
             quantization: Quantization::Q4,
         };
-        let activation = ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
+        let activation =
+            ActivationTensor::new("r", 0, 0, 1, vec![1], ActivationDType::Fp16, vec![0u8]);
         let err = StubLayerExecutor
             .execute_range(&range, activation)
             .await

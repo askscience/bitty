@@ -34,6 +34,11 @@ impl HardwareProfiler {
             .and_then(|value| value.parse().ok())
             .or_else(|| total_ram_mb(&system))
             .unwrap_or(4096);
+        let available_ram_mb = std::env::var("BITTY_AVAILABLE_RAM_MB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| system.available_memory() / 1024 / 1024)
+            .min(ram_mb);
         let gpu_probe = configured_gpu_probe();
         let gpus = gpu_probe.gpus;
         let vram_mb = std::env::var("BITTY_VRAM_MB")
@@ -80,6 +85,7 @@ impl HardwareProfiler {
             os: std::env::consts::OS.into(),
             tier,
             ram_mb,
+            available_ram_mb,
             vram_mb,
             architecture: architecture(&system),
             gpus,
@@ -203,10 +209,7 @@ fn detect_system_gpus() -> Option<GpuProbe> {
             backend_type: Some("metal:apple".into()),
         })
     }
-    #[cfg(not(any(
-        target_os = "linux",
-        all(target_os = "macos", target_arch = "aarch64")
-    )))]
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
     {
         None
     }
@@ -220,8 +223,9 @@ fn detect_drm_gpus(drm_root: &std::path::Path) -> Option<GpuProbe> {
         .filter(|entry| {
             // `card0`, not connectors such as `card0-eDP-1`.
             entry.file_name().to_str().is_some_and(|name| {
-                name.strip_prefix("card")
-                    .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                name.strip_prefix("card").is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                })
             })
         })
         .map(|entry| entry.path())

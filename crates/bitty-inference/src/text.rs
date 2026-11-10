@@ -16,7 +16,9 @@ pub struct TextCodec {
 
 impl std::fmt::Debug for TextCodec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TextCodec").field("vocab_size", &self.vocab_size).finish()
+        f.debug_struct("TextCodec")
+            .field("vocab_size", &self.vocab_size)
+            .finish()
     }
 }
 
@@ -46,7 +48,9 @@ impl TextCodec {
     }
 
     fn process(&self) -> std::sync::MutexGuard<'_, StageProcess> {
-        self.process.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Tokens of a raw prompt, with the prefix the model expects.
@@ -97,7 +101,9 @@ impl TextStream {
                 }
                 Err(err) => {
                     let valid = err.valid_up_to();
-                    text.push_str(std::str::from_utf8(&self.pending[..valid]).expect("checked prefix"));
+                    text.push_str(
+                        std::str::from_utf8(&self.pending[..valid]).expect("checked prefix"),
+                    );
                     match err.error_len() {
                         // bytes that can never be valid: replace them and go on
                         Some(bad) => {

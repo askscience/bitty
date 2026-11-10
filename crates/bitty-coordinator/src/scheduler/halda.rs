@@ -9,6 +9,11 @@ use thiserror::Error;
 pub struct SchedulerConfig {
     pub memory_reserve_fraction: f64,
     pub critical_quantization: Quantization,
+    /// Memory a stage engine needs on top of its layers: the embeddings or the output head, the
+    /// context of every session, the engine itself.
+    pub stage_overhead_bytes: u64,
+    /// The share of the memory that is free when a node starts that the planner may fill.
+    pub free_memory_fraction: f64,
 }
 
 impl Default for SchedulerConfig {
@@ -16,6 +21,8 @@ impl Default for SchedulerConfig {
         Self {
             memory_reserve_fraction: 0.15,
             critical_quantization: Quantization::Fp16,
+            stage_overhead_bytes: stage_overhead_bytes(),
+            free_memory_fraction: 0.9,
         }
     }
 }
@@ -66,6 +73,27 @@ impl Halda {
             ranked = nodes.to_vec();
         }
 
+        // A node that cannot hold even one layer in the memory it has free would start to swap
+        // and stall the whole ring: it stays out while other nodes can do the work.
+        if ranked.len() > 1 {
+            let largest = layers
+                .iter()
+                .map(|layer| layer.weight_bytes)
+                .max()
+                .unwrap_or(0);
+            let roomy = ranked
+                .iter()
+                .filter(|node| {
+                    largest + self.config.stage_overhead_bytes
+                        <= free_memory_bytes(node, &self.config)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !roomy.is_empty() {
+                ranked = roomy;
+            }
+        }
+
         let total_score = ranked
             .iter()
             .map(HardwareProfile::effective_compute_score)
@@ -73,10 +101,17 @@ impl Halda {
             .max(f64::MIN_POSITIVE);
 
         let total_layers = layers.len() as u32;
+        // Two limits. The free limit is what the node had free when it started: inside it the
+        // node keeps working as it did before. The hard limit is its whole memory less a
+        // reserve: past it the node swaps. Layers go inside the free limit first.
+        let needed = |start: u32, len: u32| {
+            assignment_weight_bytes(start, start + len, layers) + self.config.stage_overhead_bytes
+        };
         let fits = |node: &HardwareProfile, start: u32, len: u32| {
-            let quantization = quantization_for(node, start, start + len, layers, &self.config);
-            assigned_weight_bytes_for_len(start, len, layers, quantization)
-                <= available_memory_bytes(node, self.config.memory_reserve_fraction)
+            needed(start, len) <= free_memory_bytes(node, &self.config)
+        };
+        let fits_hard = |node: &HardwareProfile, start: u32, len: u32| {
+            needed(start, len) <= available_memory_bytes(node, self.config.memory_reserve_fraction)
         };
 
         // First pass: a share of the layers in proportion to each node's speed.
@@ -108,18 +143,24 @@ impl Halda {
         // engine, so it can hold only one range: the layers left over make the existing ranges
         // longer, fastest node first, and are never handed out as a second range.
         let mut left_over = total_layers - cursor;
-        for index in 0..lens.len() {
-            if left_over == 0 {
-                break;
-            }
-            let node = &ranked[index];
-            let start: u32 = lens[..index].iter().sum();
-            while left_over > 0
-                && lens[index] < node.max_layers.max(1)
-                && fits(node, start, lens[index] + 1)
-            {
-                lens[index] += 1;
-                left_over -= 1;
+        for hard in [false, true] {
+            for index in 0..lens.len() {
+                if left_over == 0 {
+                    break;
+                }
+                let node = &ranked[index];
+                let start: u32 = lens[..index].iter().sum();
+                while left_over > 0
+                    && lens[index] < node.max_layers.max(1)
+                    && if hard {
+                        fits_hard(node, start, lens[index] + 1)
+                    } else {
+                        fits(node, start, lens[index] + 1)
+                    }
+                {
+                    lens[index] += 1;
+                    left_over -= 1;
+                }
             }
         }
         if left_over > 0 {
@@ -135,7 +176,7 @@ impl Halda {
         for (node, len) in ranked.iter().zip(lens) {
             let end = cursor + len;
             let quantization = quantization_for(node, cursor, end, layers, &self.config);
-            let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers, quantization);
+            let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers);
             assignments.push(LayerAssignment {
                 node_id: node.node_id.clone(),
                 range: AssignedLayerRange {
@@ -146,7 +187,10 @@ impl Halda {
                 assigned_weight_bytes,
                 expected_latency_ms: estimate_latency_ms(node, cursor, end, layers),
                 next_node_id: None,
-                disk_offload_fraction: disk_offload_fraction(node, assigned_weight_bytes),
+                disk_offload_fraction: disk_offload_fraction(
+                    node,
+                    assigned_weight_bytes + self.config.stage_overhead_bytes,
+                ),
                 model_stage: ModelStage::LayerRange,
             });
             cursor = end;
@@ -200,10 +244,11 @@ impl Halda {
                 .ok_or_else(|| HaldaError::InvalidAssignment("unknown node".into()))?;
 
             let memory_budget = available_memory_bytes(node, self.config.memory_reserve_fraction);
-            if assignment.assigned_weight_bytes > memory_budget {
+            let required = assignment.assigned_weight_bytes + self.config.stage_overhead_bytes;
+            if required > memory_budget {
                 return Err(HaldaError::InsufficientMemory {
                     node_id: node.node_id.clone(),
-                    required: assignment.assigned_weight_bytes,
+                    required,
                     available: memory_budget,
                 });
             }
@@ -271,25 +316,34 @@ fn quantization_for(
     }
 }
 
-fn assignment_weight_bytes(
-    start: u32,
-    end: u32,
-    layers: &[LayerMetadata],
-    quantization: Quantization,
-) -> u64 {
+/// The bytes of the layers as they are in the model file: a stage file holds these very bytes,
+/// whatever the tier of the node that loads it.
+fn assignment_weight_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u64 {
     layers[start as usize..end as usize]
         .iter()
-        .map(|layer| (layer.weight_bytes as f64 * quantization.bytes_per_weight()).ceil() as u64)
+        .map(|layer| layer.weight_bytes)
         .sum()
 }
 
-fn assigned_weight_bytes_for_len(
-    start: u32,
-    len: u32,
-    layers: &[LayerMetadata],
-    quantization: Quantization,
-) -> u64 {
-    assignment_weight_bytes(start, start + len, layers, quantization)
+fn stage_overhead_bytes() -> u64 {
+    std::env::var("BITTY_STAGE_OVERHEAD_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1536)
+        .saturating_mul(1024 * 1024)
+}
+
+/// What the planner may fill without pushing the node into swap: a share of the memory that was
+/// free when the node started, and never more than the hard limit. A node with a graphics card
+/// loads into its card, and an older node does not say how much it has free: both get the hard
+/// limit.
+fn free_memory_bytes(node: &HardwareProfile, config: &SchedulerConfig) -> u64 {
+    let hard = available_memory_bytes(node, config.memory_reserve_fraction);
+    if (node.gpu_tflops > 0.0 && node.vram_mb > 0) || node.available_ram_mb == 0 {
+        return hard;
+    }
+    let free = node.available_ram_mb.saturating_mul(1024 * 1024) as f64;
+    hard.min((free * config.free_memory_fraction).max(0.0) as u64)
 }
 
 fn available_memory_bytes(node: &HardwareProfile, reserve_fraction: f64) -> u64 {
@@ -348,6 +402,7 @@ mod tests {
             os: "linux".into(),
             tier,
             ram_mb: (memory_gb * 1024.0) as u64,
+            available_ram_mb: 0,
             vram_mb: 0,
             architecture: "x86_64".into(),
             gpus: Vec::new(),
@@ -374,6 +429,86 @@ mod tests {
                 precision_critical: layer_id == 0 || layer_id + 1 == count,
             })
             .collect()
+    }
+
+    /// Forty layers of the size they have in the 35B model file.
+    fn big_layers() -> Vec<LayerMetadata> {
+        layers(40)
+            .into_iter()
+            .map(|mut layer| {
+                layer.weight_bytes = 527 * 1024 * 1024;
+                layer
+            })
+            .collect()
+    }
+
+    fn cpu_node(index: usize, ram_gb: u64, free_gb: u64) -> HardwareProfile {
+        let mut profile = node(index, NodeTier::D, ram_gb as f64);
+        profile.available_ram_mb = free_gb * 1024;
+        profile
+    }
+
+    fn len_of(assignments: &[LayerAssignment], index: usize) -> u32 {
+        assignments
+            .iter()
+            .find(|assignment| assignment.node_id.0 == format!("node-{index}"))
+            .map(|assignment| assignment.range.end_layer_exclusive - assignment.range.start_layer)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_small_machine_gets_only_what_its_free_memory_holds() {
+        // 8 GB with 4 GB free: 4 GB * 0.9 less the overhead leaves room for 4 layers.
+        let nodes = vec![cpu_node(0, 8, 4), cpu_node(1, 32, 24)];
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert!(len_of(&assignments, 0) <= 4, "{assignments:?}");
+        assert_eq!(len_of(&assignments, 0) + len_of(&assignments, 1), 40);
+    }
+
+    #[test]
+    fn the_size_of_a_range_is_the_size_in_the_file_for_every_tier() {
+        let nodes = vec![cpu_node(0, 16, 12), cpu_node(1, 32, 24)];
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        for assignment in &assignments {
+            let len = assignment.range.end_layer_exclusive - assignment.range.start_layer;
+            assert_eq!(
+                assignment.assigned_weight_bytes,
+                len as u64 * 527 * 1024 * 1024
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_room_for_one_layer_stays_out() {
+        let nodes = vec![cpu_node(0, 8, 1), cpu_node(1, 32, 28)];
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(len_of(&assignments, 1), 40);
+    }
+
+    #[test]
+    fn a_lone_machine_goes_past_its_free_memory_up_to_the_hard_limit() {
+        // 16 GB free is not enough for 40 layers, 85% of 32 GB is.
+        let assignments = Halda::new(SchedulerConfig::default())
+            .assign(&[cpu_node(0, 32, 16)], &big_layers())
+            .unwrap();
+        assert_eq!(len_of(&assignments, 0), 40);
+    }
+
+    #[test]
+    fn machines_too_small_together_are_an_error() {
+        let nodes = vec![cpu_node(0, 8, 6), cpu_node(1, 8, 6)];
+        let result = Halda::new(SchedulerConfig::default()).assign(&nodes, &big_layers());
+        assert!(
+            matches!(result, Err(HaldaError::NotEnoughCapacity { .. })),
+            "{result:?}"
+        );
     }
 
     proptest! {

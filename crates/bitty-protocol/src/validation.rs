@@ -1,4 +1,4 @@
-use crate::{ActivationTensor, Logits, GenerateRequest, ProtocolConversionError};
+use crate::{ActivationTensor, GenerateRequest, Logits, ProtocolConversionError};
 
 pub const MAX_ACTIVATION_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ACTIVATION_RANK: usize = 8;

@@ -13,17 +13,16 @@ use bitty_protocol::iroh_transport::{
     self, IrohFrame, BITTY_SCHEDULER_ALPN, BITTY_WORKER_ALPN, DEFAULT_FRAME_LIMIT,
     SCHEDULER_CLUSTER_STATUS, SCHEDULER_GENERATE, SCHEDULER_HEARTBEAT, SCHEDULER_REGISTER_WORKER,
     WORKER_APPLY_TOPOLOGY, WORKER_AWAIT_CHAIN_RESULT, WORKER_CLEANUP, WORKER_FINAL_LOGITS,
-    WORKER_FORWARD_ACTIVATION, WORKER_FORWARD_CHAIN,
-    WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
+    WORKER_FORWARD_ACTIVATION, WORKER_FORWARD_CHAIN, WORKER_LOAD_SHARD, WORKER_SAMPLE_TOKEN,
 };
 use bitty_protocol::pb::coordinator_service_client::CoordinatorServiceClient;
 use bitty_protocol::pb::coordinator_service_server::CoordinatorService;
 use bitty_protocol::pb::worker_service_server::WorkerService;
 use bitty_protocol::pb::{
-    ActivationTensor as ProtoActivationTensor, CleanupRequest, ClusterStatusRequest,
-    ClusterStatusResponse, GenerateRequest, GenerateResponse, HeartbeatRequest, HeartbeatResponse,
-    ChainResultRequest, ChainStep, LoadShardRequest, RegisterWorkerRequest, RegisterWorkerResponse, SampleTokenRequest,
-    TopologyUpdate,
+    ActivationTensor as ProtoActivationTensor, ChainResultRequest, ChainStep, CleanupRequest,
+    ClusterStatusRequest, ClusterStatusResponse, GenerateRequest, GenerateResponse,
+    HeartbeatRequest, HeartbeatResponse, LoadShardRequest, RegisterWorkerRequest,
+    RegisterWorkerResponse, SampleTokenRequest, TopologyUpdate,
 };
 use bitty_protocol::security::{
     constant_time_eq, validate_cluster_token, AuthMode, BITTY_TOKEN_HEADER,
@@ -388,23 +387,24 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     // A node that holds the whole model opens it directly. Any other node keeps only the
     // vocabulary file now and fetches the stage file of its layers once they are assigned.
     let node_settings = BittySettings::load(data_dir.clone());
-    let (model_file, stage_source) = match model_store::whole_model_path(&node_settings, &config.model) {
-        Some(path) => (path, None),
-        None => {
-            let settings = node_settings.clone();
-            let model = config.model.clone();
-            let vocabulary = tokio::task::spawn_blocking(move || {
-                model_store::ensure_stage(&settings, &model, 0, 0, None)
-            })
-            .await??;
-            let settings = node_settings.clone();
-            let model = config.model.clone();
-            let source: bitty_inference::StageSource = Arc::new(move |start, end, stale| {
-                model_store::ensure_stage(&settings, &model, start, end, Some(stale))
-            });
-            (vocabulary, Some(source))
-        }
-    };
+    let (model_file, stage_source) =
+        match model_store::whole_model_path(&node_settings, &config.model) {
+            Some(path) => (path, None),
+            None => {
+                let settings = node_settings.clone();
+                let model = config.model.clone();
+                let vocabulary = tokio::task::spawn_blocking(move || {
+                    model_store::ensure_stage(&settings, &model, 0, 0, None)
+                })
+                .await??;
+                let settings = node_settings.clone();
+                let model = config.model.clone();
+                let source: bitty_inference::StageSource = Arc::new(move |start, end, stale| {
+                    model_store::ensure_stage(&settings, &model, start, end, Some(stale))
+                });
+                (vocabulary, Some(source))
+            }
+        };
     let mut executor = StageExecutor::load(&model_file).await?;
     if let Some(source) = stage_source {
         executor = executor.with_stage_source(source);
@@ -1483,17 +1483,17 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
     let mut stream = client
         .generate(request_with_token(
             GenerateRequest {
-            request_id: request_id(),
-            prompt_tokens: Vec::new(),
-            prompt: config.prompt,
-            max_new_tokens: config.max_tokens,
-            temperature: config.temperature.parse().unwrap_or(0.0),
-            top_k: config.options.top_k,
-            top_p: config.options.top_p.parse().unwrap_or(0.0),
-            seed: config.options.seed,
-            raw: config.options.raw,
-            thinking: config.options.thinking,
-        },
+                request_id: request_id(),
+                prompt_tokens: Vec::new(),
+                prompt: config.prompt,
+                max_new_tokens: config.max_tokens,
+                temperature: config.temperature.parse().unwrap_or(0.0),
+                top_k: config.options.top_k,
+                top_p: config.options.top_p.parse().unwrap_or(0.0),
+                seed: config.options.seed,
+                raw: config.options.raw,
+                thinking: config.options.thinking,
+            },
             config.options.cluster_token.as_deref().unwrap_or_default(),
         ))
         .await?
@@ -2244,7 +2244,9 @@ async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::er
 /// A client that only dials out. `wait_until_online` holds it until its own relay connection is
 /// up, which takes a few seconds: only needed when the target comes without any address and has
 /// to be looked up.
-async fn start_iroh_client(wait_until_online: bool) -> Result<Endpoint, Box<dyn std::error::Error>> {
+async fn start_iroh_client(
+    wait_until_online: bool,
+) -> Result<Endpoint, Box<dyn std::error::Error>> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![
@@ -2895,12 +2897,12 @@ fn assert_destructive_data_dir(path: &Path) -> Result<(), Box<dyn std::error::Er
     if path == Path::new("/") {
         return Err("refusing destructive operation on filesystem root".into());
     }
-    let allowed = std::env::var("BITTY_ALLOW_ANY_DATA_DIR_RESET").map_or(false, |v| {
-        matches!(v.as_str(), "1" | "true" | "yes")
-    }) || path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == ".bitty");
+    let allowed = std::env::var("BITTY_ALLOW_ANY_DATA_DIR_RESET")
+        .map_or(false, |v| matches!(v.as_str(), "1" | "true" | "yes"))
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == ".bitty");
     if !allowed {
         return Err(format!(
             "refusing to modify `{}`: directory name must be `.bitty`, or set BITTY_ALLOW_ANY_DATA_DIR_RESET=1",
@@ -3168,7 +3170,9 @@ fn print_help() {
     println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--cluster-token TOKEN]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
-    println!("  bitty clean [--data-dir DIR]   # models + cluster state + secrets; keeps config.toml");
+    println!(
+        "  bitty clean [--data-dir DIR]   # models + cluster state + secrets; keeps config.toml"
+    );
     println!("  bitty reset [--data-dir DIR]   # delete entire data dir; fresh default config");
     println!("  bitty version");
     println!();
@@ -3184,7 +3188,12 @@ mod tests {
 
     #[test]
     fn parses_clean_and_reset() {
-        let clean = Cli::parse(vec!["clean".into(), "--data-dir".into(), "/tmp/.bitty".into()]).unwrap();
+        let clean = Cli::parse(vec![
+            "clean".into(),
+            "--data-dir".into(),
+            "/tmp/.bitty".into(),
+        ])
+        .unwrap();
         match clean {
             CliCommand::Clean(cfg) => assert_eq!(cfg.data_dir.as_deref(), Some("/tmp/.bitty")),
             other => panic!("unexpected: {other:?}"),
@@ -3325,7 +3334,12 @@ mod tests {
             CliCommand::Run(RunConfig { max_tokens: 4, .. })
         ));
         assert!(matches!(
-            Cli::parse(vec!["run".into(), "qwen3.5-35b-a3b".into(), "--local".into()]).unwrap(),
+            Cli::parse(vec![
+                "run".into(),
+                "qwen3.5-35b-a3b".into(),
+                "--local".into()
+            ])
+            .unwrap(),
             CliCommand::Run(RunConfig { local: true, .. })
         ));
         assert!(matches!(
@@ -3420,7 +3434,9 @@ mod tests {
             })
         ));
         assert_eq!(
-            parse_env_file("# threads\nBITTY_STAGE_THREADS=8\nexport BITTY_GPU_LAYERS = \"12\"\n\nbroken\n"),
+            parse_env_file(
+                "# threads\nBITTY_STAGE_THREADS=8\nexport BITTY_GPU_LAYERS = \"12\"\n\nbroken\n"
+            ),
             vec![
                 ("BITTY_STAGE_THREADS".to_string(), "8".to_string()),
                 ("BITTY_GPU_LAYERS".to_string(), "12".to_string()),
@@ -3559,6 +3575,12 @@ mod tests {
             assert!(parse_layer_range(bad).is_err(), "{bad}");
         }
         // only pull takes a range
-        assert!(Cli::parse(vec!["show".into(), "m".into(), "--layers".into(), "0..1".into()]).is_err());
+        assert!(Cli::parse(vec![
+            "show".into(),
+            "m".into(),
+            "--layers".into(),
+            "0..1".into()
+        ])
+        .is_err());
     }
 }
