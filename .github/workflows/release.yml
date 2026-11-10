@@ -1,0 +1,210 @@
+# Builds bitty and the stage engine for Linux and Windows on every push to the
+# qwen-llama-cpp branch, checks them end to end, and publishes them as the rolling
+# `nightly` release. scripts/install.sh and scripts/install.ps1 install from that
+# release, and the updater they set up follows it.
+name: Release
+
+on:
+  push:
+    branches: [qwen-llama-cpp]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # keep in step with engine/README.md
+  LLAMA_COMMIT: 45c8ea837489be1304500dd1d298f2a671c985d4
+  TEST_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the oldest runner, so that the binaries start on older distributions too
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            exe: ""
+          - os: windows-latest
+            name: windows-x86_64
+            exe: ".exe"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Version
+        run: echo "BITTY_GIT_SHA=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Build bitty
+        env:
+          # no Visual C++ runtime to install on the machines that run it
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p bitty-cli
+
+      - name: Stage engine cache
+        id: engine
+        uses: actions/cache@v4
+        with:
+          path: engine-bin
+          key: engine-${{ matrix.name }}-${{ env.LLAMA_COMMIT }}-${{ hashFiles('engine/llama-cpp-stage.patch', '.github/workflows/release.yml') }}
+
+      - name: Build the stage engine
+        if: steps.engine.outputs.cache-hit != 'true'
+        run: |
+          git init -q llama.cpp
+          cd llama.cpp
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_COMMIT"
+          git checkout -q FETCH_HEAD
+          git apply ../engine/llama-cpp-stage.patch
+          # a build that runs on any x86-64 machine with AVX2, and needs no extra libraries
+          flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=OFF
+                 -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
+                 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -B build -A x64 "${flags[@]}" -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          else
+            cmake -B build "${flags[@]}" -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          fi
+          cmake --build build --config Release --target bitty-stage --parallel 4
+          mkdir -p ../engine-bin
+          cp "$(find build/bin -name 'bitty-stage${{ matrix.exe }}' | head -n 1)" ../engine-bin/
+
+      - name: Test model cache
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: test-model
+          key: test-model-qwen3.5-0.8b-q4_k_m
+          enableCrossOsArchive: true
+
+      - name: Download the test model
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p test-model
+          curl --fail --location --silent --show-error --retry 3 "$TEST_MODEL_URL" --output test-model/model.gguf
+
+      - name: Stage engine test
+        run: |
+          native() { if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
+          BITTY_STAGE_BIN="$(native "$PWD/engine-bin/bitty-stage${{ matrix.exe }}")" \
+          BITTY_TEST_MODEL="$(native "$PWD/test-model/model.gguf")" \
+            cargo test --release --locked -p bitty-inference --test stage_engine -- --nocapture
+
+      - name: End-to-end check
+        run: scripts/ci-smoke.sh "$PWD/target/release/bitty${{ matrix.exe }}" "$PWD/engine-bin/bitty-stage${{ matrix.exe }}" "$PWD/test-model/model.gguf"
+
+      - name: Package
+        run: |
+          name="bitty-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          cp "target/release/bitty${{ matrix.exe }}" "engine-bin/bitty-stage${{ matrix.exe }}" "dist/$name/"
+          echo "$BITTY_GIT_SHA" > "dist/$name/VERSION"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp ../scripts/install.ps1 "$name/"
+            7z a -tzip -bso0 "$name.zip" "$name"
+          else
+            cp ../scripts/install.sh "$name/"
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          ls -l
+
+      - name: Installer check (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          export BITTY_HOME="$RUNNER_TEMP/bitty" BITTY_BIN_DIR="$RUNNER_TEMP/bin" BITTY_DATA_DIR="$RUNNER_TEMP/data"
+          BITTY_ARCHIVE="$PWD/dist/bitty-linux-x86_64.tar.gz" bash scripts/install.sh --no-auto-update
+          "$BITTY_BIN_DIR/bitty" version
+          test -x "$BITTY_HOME/bin/bitty-stage" -a -x "$BITTY_HOME/bin/bitty-update"
+          test "$(cat "$BITTY_HOME/VERSION")" = "$BITTY_GIT_SHA"
+          bash scripts/install.sh --uninstall
+          test ! -e "$BITTY_HOME"
+
+      - name: Installer check (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:BITTY_HOME = Join-Path $env:RUNNER_TEMP 'bitty'
+          $env:BITTY_DATA_DIR = Join-Path $env:RUNNER_TEMP 'data'
+          $env:BITTY_ARCHIVE = Join-Path $PWD 'dist\bitty-windows-x86_64.zip'
+          # the one-line form: the script text through Invoke-Expression
+          Get-Content scripts\install.ps1 -Raw | Invoke-Expression
+          & "$env:BITTY_HOME\bin\bitty.exe" version
+          if ($LASTEXITCODE -ne 0) { throw 'the installed bitty does not run' }
+          foreach ($file in 'bin\bitty-stage.exe', 'bin\bitty-update.ps1', 'VERSION') {
+            if (-not (Test-Path (Join-Path $env:BITTY_HOME $file))) { throw "missing $file" }
+          }
+          if ((Get-Content "$env:BITTY_HOME\VERSION" -Raw).Trim() -ne $env:BITTY_GIT_SHA) { throw 'wrong VERSION' }
+          $task = Get-ScheduledTask -TaskName 'bitty-update'
+          $task.Actions | Format-List Execute, Arguments
+          # reinstall over a bitty.exe that is in use, the way an update meets a running node
+          $busy = Start-Process -FilePath "$env:BITTY_HOME\bin\bitty.exe" -ArgumentList 'serve', '--host', '127.0.0.1:50999' -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          Remove-Item "$env:BITTY_HOME\VERSION"
+          & scripts\install.ps1
+          Stop-Process -Id $busy.Id -Force
+          # the updater as the task runs it
+          & "$env:BITTY_HOME\bin\bitty-update.ps1" -Update
+          if (Test-Path "$env:BITTY_HOME\update.log") { Get-Content "$env:BITTY_HOME\update.log" }
+          if (Get-ChildItem "$env:BITTY_HOME\bin" -Filter '*.old-*') { throw 'old files were left behind' }
+          & scripts\install.ps1 -Uninstall
+          if (Test-Path $env:BITTY_HOME) { throw 'uninstall left files behind' }
+          if (Get-ScheduledTask -TaskName 'bitty-update' -ErrorAction SilentlyContinue) { throw 'uninstall left the task behind' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bitty-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: github.ref == 'refs/heads/qwen-llama-cpp'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the rolling release
+        working-directory: dist
+        run: |
+          version="${GITHUB_SHA::12}"
+          sha256sum bitty-linux-x86_64.tar.gz bitty-windows-x86_64.zip > SHA256SUMS
+          echo "$version" > VERSION
+          notes="Rolling build of the qwen-llama-cpp branch, commit $GITHUB_SHA. Installed and kept up to date by scripts/install.sh (Linux) and scripts/install.ps1 (Windows). CPU build for x86-64 with AVX2."
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release edit nightly --notes "$notes" --prerelease
+          else
+            gh release create nightly --title "Rolling build" --notes "$notes" --prerelease --latest=false --target "$GITHUB_SHA"
+          fi
+          # VERSION goes last: the updaters read it first and only then fetch the rest
+          gh release upload nightly bitty-linux-x86_64.tar.gz bitty-windows-x86_64.zip SHA256SUMS --clobber
+          gh release upload nightly VERSION --clobber
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true > /dev/null

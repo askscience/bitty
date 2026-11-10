@@ -7,11 +7,18 @@ This project is **in development**. It is useful for testing, research, and
 iterating on distributed BitNet runtime ideas. It is not yet a polished
 production inference server, and APIs or commands may still change.
 
-Install from GitHub:
+Install the prebuilt binaries (Linux, then Windows PowerShell):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/askscience/bitty/main/scripts/install_bitty.sh | bash
+curl -fsSL https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scripts/install.sh | bash
 ```
+
+```powershell
+irm https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scripts/install.ps1 | iex
+```
+
+Both also set up an updater that follows new builds by itself. See
+[docs/install.md](docs/install.md).
 
 The normal user experience is intentionally similar to Ollama:
 
@@ -63,52 +70,8 @@ Important limitations:
 
 ## Install
 
-Bitty has one installer:
-
-```bash
-scripts/install_bitty.sh
-```
-
-The installer can:
-
-- Install Rust with `rustup` if needed.
-- Install native build dependencies on common Linux distributions and macOS.
-- Build the `bitty` binary.
-- Link `bitty` into `~/.local/bin` by default.
-- Optionally run tests after building.
-
-If `~/.local/bin` is not in your shell path, add it:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-You can put that line in your shell profile, for example `~/.zshrc` or
-`~/.bashrc`.
-
-Install and run tests:
-
-```bash
-scripts/install_bitty.sh --run-tests
-```
-
-Build a debug binary instead of release:
-
-```bash
-scripts/install_bitty.sh --debug
-```
-
-Skip automatic system dependency installation:
-
-```bash
-scripts/install_bitty.sh --no-system-deps
-```
-
-Override install paths:
-
-```bash
-scripts/install_bitty.sh --install-dir "$HOME/src/bitty" --bin-dir "$HOME/.local/bin"
-```
+See [docs/install.md](docs/install.md): one script for Linux, one for Windows,
+automatic updates, and how to build from source instead.
 
 ## Quick Start
 

@@ -73,6 +73,7 @@ fn default_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .map(|home| PathBuf::from(home).join(".bitty"))
         })

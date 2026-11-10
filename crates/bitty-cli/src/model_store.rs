@@ -247,6 +247,11 @@ pub fn ensure_stage(settings: &BittySettings, model: &str, start: u32, end: u32)
 }
 
 /// The whole model on disk, if this machine has it.
+/// Whether a node can fetch stage files of this model: it is in the registry or it is a URL.
+pub fn has_stage_source(settings: &BittySettings, model: &str) -> bool {
+    stage_spec(settings, model).is_ok_and(|(spec, _)| !spec.url.is_empty())
+}
+
 pub fn whole_model_path(settings: &BittySettings, model: &str) -> Option<PathBuf> {
     let direct = Path::new(model);
     if direct.is_file() {

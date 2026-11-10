@@ -1,0 +1,139 @@
+# Install and automatic updates
+
+Bitty is two programs: `bitty` (network and orchestration, Rust) and
+`bitty-stage` (the patched llama.cpp that computes a range of layers). The
+installers put both on a machine and keep them current.
+
+## Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scripts/install.sh | bash
+```
+
+- Binaries: `~/.local/share/bitty/bin` (`bitty`, `bitty-stage`, `bitty-update`).
+- Command: `~/.local/bin/bitty` is a link to the first one.
+- Updater: a systemd user timer, `bitty-update.timer`. Where there is no systemd
+  user session it is a cron job.
+- Needs `curl`, `tar` and `sha256sum`. No root.
+
+## Windows
+
+In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scripts/install.ps1 | iex
+```
+
+- Binaries: `%LOCALAPPDATA%\bitty\bin` (`bitty.exe`, `bitty-stage.exe`,
+  `bitty-update.ps1`). The folder is added to the user `PATH`: open a new
+  terminal after installing.
+- Updater: a scheduled task named `bitty-update`.
+- Windows 10 or later, 64-bit Intel or AMD. No administrator rights.
+
+The first time a node starts, Windows Firewall may ask whether `bitty.exe` may
+accept connections. Nodes that reach each other through iroh work without it,
+because every connection is opened from the inside.
+
+## What the updater does
+
+Every 10 minutes, and when the machine starts (Linux) or the user logs in
+(Windows):
+
+1. It reads `VERSION` from the `nightly` release. The same as the installed
+   one: nothing else is downloaded.
+2. A new one: it downloads the archive, checks it against `SHA256SUMS`, checks
+   that the new `bitty` runs, and swaps the files. A failed download or a wrong
+   checksum changes nothing.
+3. If a node was running it is restarted with `bitty restart --if-started`. It
+   comes back in the same role: a worker joins the same cluster again, a leader
+   keeps the same invite.
+4. `bitty start --if-started` brings the node back if it is not running, which
+   is what happens after a reboot or a crash.
+
+Steps 3 and 4 do nothing on a machine where no node was started, or where it
+was stopped with `bitty stop`: stopping by hand is remembered.
+
+A new build is published by the `Release` workflow on every push to the
+`qwen-llama-cpp` branch, after it has built both programs for Linux and
+Windows and run two nodes end to end on each. So a push reaches every machine
+within about 10 minutes of the workflow ending, with no command to give.
+
+What happened is in `update.log`, next to the `bin` folder.
+
+The machines of a cluster do not update at the same moment. That is fine:
+workers register again by themselves when the leader comes back, and a worker
+that is restarting is seen as gone and then as new. A request that is being
+answered while a node restarts fails and has to be asked again.
+
+## Settings of one machine
+
+`bitty` reads `NAME=value` lines from the file `env` in its data directory
+(`~/.bitty/env`, on Windows `%USERPROFILE%\.bitty\env`). Put the variables
+there, not in the shell: a node restarted by the updater does not get the
+variables of the terminal that started it the first time.
+
+```
+BITTY_STAGE_THREADS=8
+BITTY_GPU_LAYERS=12
+```
+
+A variable set in the environment wins over the file.
+
+## A network of machines
+
+```bash
+# first machine
+bitty share home                      # starts the node, prints the invite
+
+# every other machine
+bitty connect 'iroh://...' --name home
+
+# anywhere
+bitty run qwen3.5-35b-a3b "hello"
+```
+
+No machine needs the whole 22 GB model. A node downloads the vocabulary and
+then only the layers it is given.
+
+## Options
+
+| Linux | Windows | |
+| --- | --- | --- |
+| `install.sh --no-auto-update` | `install.ps1 -NoAutoUpdate`, or `$env:BITTY_NO_AUTO_UPDATE=1` before the one-line form | install without the updater |
+| `bitty-update --update` | `bitty-update.ps1 -Update` | check now |
+| `install.sh --uninstall` | `install.ps1 -Uninstall` | remove binaries and updater; models and settings stay |
+
+Environment: `BITTY_HOME` (where the binaries go), `BITTY_BIN_DIR` (Linux,
+where the `bitty` link goes), `BITTY_CHANNEL` (release tag to follow, default
+`nightly`).
+
+To pass an option to the one-line form on Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scripts/install.sh | bash -s -- --no-auto-update
+```
+
+## What the prebuilt binaries are
+
+- x86-64 only, and the processor needs AVX2 (Intel from 2013, AMD from 2015).
+- CPU only. For a GPU build the engine yourself with Vulkan as described in
+  [engine/README.md](../engine/README.md) and point `BITTY_STAGE_BIN` at it in
+  the `env` file. The updater keeps updating `bitty` and leaves your engine
+  alone.
+- The Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or later.
+
+Other platforms build from source: `cargo build --release -p bitty-cli`, and
+the engine as in [engine/README.md](../engine/README.md).
+
+## Checked and not checked
+
+Checked on Linux, on a real machine: install, update, restart of a running
+node on update, restart after the node was killed, nothing started after
+`bitty stop`, a refused archive with a wrong checksum, uninstall.
+
+Checked on Windows only on the GitHub runner, never on a real desktop: the
+build, two nodes generating through each other, the leader restart, start,
+restart and stop of the background node, install over a `bitty.exe` that is
+in use, registering and removing the scheduled task. Not checked there: the
+task actually firing in a logged-in session, and whether a node started by
+the task survives the end of the task.

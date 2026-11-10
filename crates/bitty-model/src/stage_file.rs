@@ -111,7 +111,8 @@ impl ByteSource for HttpSource {
         // server honours ranges at all
         let output = self
             .curl()
-            .args(["--range", "0-0", "--output", "/dev/null", "--dump-header", "-"])
+            .args(["--range", "0-0", "--dump-header", "-"])
+            .args(["--output", if cfg!(windows) { "NUL" } else { "/dev/null" }])
             .arg(&self.url)
             .stderr(Stdio::piped())
             .output()?;

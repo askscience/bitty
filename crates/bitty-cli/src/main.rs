@@ -51,6 +51,7 @@ const DEFAULT_TCP_CLUSTER: &str = "127.0.0.1:50051";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    load_env_file(&bitty_data_dir(None).join("env"));
     logger::log_default(format!(
         "bitty command: {}",
         secrets::redact_secret_args(&raw_args).join(" ")
@@ -230,6 +231,8 @@ struct StartConfig {
     model: Option<String>,
     join: Option<String>,
     data_dir: Option<String>,
+    /// Do nothing unless a node was started before and never stopped by hand.
+    if_started: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -745,6 +748,9 @@ async fn run_stop(config: StopConfig) -> Result<(), Box<dyn std::error::Error>> 
 
 async fn run_start(config: StartConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    if config.if_started && read_runtime_state(&settings.data_dir).is_none() {
+        return Ok(());
+    }
     ensure_background_runtime(&settings, config.model, config.join).await?;
     print_runtime_summary(&settings);
     Ok(())
@@ -752,8 +758,25 @@ async fn run_start(config: StartConfig) -> Result<(), Box<dyn std::error::Error>
 
 async fn run_restart(config: StartConfig) -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_settings(config.data_dir.as_deref());
+    // stopping forgets the saved state, so keep what the node was doing: without this a worker
+    // would come back as the leader of a cluster of its own
+    let saved = read_runtime_state(&settings.data_dir);
+    if config.if_started && saved.is_none() {
+        return Ok(());
+    }
     let _ = stop_background_runtime(&settings);
-    ensure_background_runtime(&settings, config.model, config.join).await?;
+    let join = config.join.or_else(|| {
+        saved
+            .as_ref()
+            .filter(|state| state.mode == "worker" && !state.target.is_empty())
+            .map(|state| state.target.clone())
+    });
+    let model = config.model.or_else(|| {
+        saved
+            .map(|state| state.model)
+            .filter(|model| !model.is_empty())
+    });
+    ensure_background_runtime(&settings, model, join).await?;
     print_runtime_summary(&settings);
     Ok(())
 }
@@ -1144,109 +1167,190 @@ async fn register_and_heartbeat(
             }
         }
         SchedulerTarget::Tcp(leader) => {
-            let endpoint = normalize_endpoint(leader);
-            let mut client = CoordinatorServiceClient::connect(endpoint.clone()).await?;
-            let registration = client
-                .register_worker(request_with_token(
-                    RegisterWorkerRequest {
-                        profile: Some((&profile).into()),
-                        protocol_version: BITTY_PROTOCOL_VERSION,
-                        inference_backend_id: STAGE_BACKEND_ID.into(),
-                    },
-                    cluster_token,
-                ))
-                .await?
-                .into_inner();
-            println!(
-                "bitty node joined scheduler at {endpoint}; topology_epoch={} assignments={}",
-                registration.topology_epoch,
-                registration.assignments.len()
-            );
-            loop {
-                sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
-                let snapshot = worker_stats.snapshot().await;
-                let response = client
-                    .heartbeat(request_with_token(
-                        HeartbeatRequest {
-                            node_id: profile.node_id.0.clone(),
-                            observed_tokens_per_second: observed_tokens_per_second(
-                                &profile,
-                                snapshot.observed_tokens_per_second,
-                            ),
-                            avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
-                            activation_bytes_per_second: snapshot.activation_bytes_per_second,
-                            backend_type: profile.backend_type.clone(),
-                        },
-                        cluster_token,
-                    ))
-                    .await;
-                match response {
-                    Ok(response) => {
-                        if !response.into_inner().accepted {
-                            eprintln!(
-                                "scheduler rejected heartbeat for node {}",
-                                profile.node_id.0
-                            );
-                        }
-                    }
-                    Err(err) => eprintln!("heartbeat failed: {err}"),
-                }
-            }
+            let scheduler = RemoteScheduler::Tcp {
+                endpoint: normalize_endpoint(leader),
+                client: None,
+                token: cluster_token.to_string(),
+            };
+            stay_registered(scheduler, config, &profile, worker_stats).await
         }
         SchedulerTarget::Iroh {
             endpoint,
             remote,
             token,
         } => {
-            let client = IrohSchedulerClient {
+            let scheduler = RemoteScheduler::Iroh(IrohSchedulerClient {
                 endpoint: endpoint.clone(),
                 remote: remote.clone(),
                 token: token.clone(),
-            };
-            let registration: RegisterWorkerResponse = client
-                .request(
-                    SCHEDULER_REGISTER_WORKER,
-                    &RegisterWorkerRequest {
-                        profile: Some((&profile).into()),
-                        protocol_version: BITTY_PROTOCOL_VERSION,
-                        inference_backend_id: STAGE_BACKEND_ID.into(),
-                    },
-                )
-                .await?;
-            println!(
-                "bitty node joined iroh scheduler {}; topology_epoch={} assignments={}",
-                remote.id,
-                registration.topology_epoch,
-                registration.assignments.len()
-            );
-            loop {
-                sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
-                let snapshot = worker_stats.snapshot().await;
-                let response = client
-                    .request::<_, HeartbeatResponse>(
-                        SCHEDULER_HEARTBEAT,
-                        &HeartbeatRequest {
-                            node_id: profile.node_id.0.clone(),
-                            observed_tokens_per_second: observed_tokens_per_second(
-                                &profile,
-                                snapshot.observed_tokens_per_second,
-                            ),
-                            avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
-                            activation_bytes_per_second: snapshot.activation_bytes_per_second,
-                            backend_type: profile.backend_type.clone(),
-                        },
-                    )
+            });
+            stay_registered(scheduler, config, &profile, worker_stats).await
+        }
+    }
+}
+
+/// A scheduler on another machine, over gRPC or over iroh.
+enum RemoteScheduler {
+    Tcp {
+        endpoint: String,
+        client: Option<CoordinatorServiceClient<tonic::transport::Channel>>,
+        token: String,
+    },
+    Iroh(IrohSchedulerClient),
+}
+
+impl RemoteScheduler {
+    fn label(&self) -> String {
+        match self {
+            Self::Tcp { endpoint, .. } => endpoint.clone(),
+            Self::Iroh(client) => format!("iroh {}", client.remote.id),
+        }
+    }
+
+    /// The gRPC channel is opened on first use and dropped after an error, so the next call
+    /// connects again: that is what brings a worker back once the leader has restarted.
+    async fn tcp_client<'a>(
+        endpoint: &str,
+        client: &'a mut Option<CoordinatorServiceClient<tonic::transport::Channel>>,
+    ) -> Result<&'a mut CoordinatorServiceClient<tonic::transport::Channel>, String> {
+        if client.is_none() {
+            let connected = CoordinatorServiceClient::connect(endpoint.to_string())
+                .await
+                .map_err(|err| err.to_string())?;
+            *client = Some(connected);
+        }
+        Ok(client.as_mut().expect("just connected"))
+    }
+
+    async fn register(
+        &mut self,
+        request: RegisterWorkerRequest,
+    ) -> Result<RegisterWorkerResponse, String> {
+        match self {
+            Self::Tcp {
+                endpoint,
+                client,
+                token,
+            } => {
+                let result = Self::tcp_client(endpoint, client)
+                    .await?
+                    .register_worker(request_with_token(request, token))
                     .await;
-                match response {
-                    Ok(response) => {
-                        if !response.accepted {
-                            eprintln!(
-                                "scheduler rejected heartbeat for node {}",
-                                profile.node_id.0
-                            );
-                        }
+                if result.is_err() {
+                    *client = None;
+                }
+                result
+                    .map(tonic::Response::into_inner)
+                    .map_err(|status| bitty_protocol::worker_client::status_text(&status))
+            }
+            Self::Iroh(client) => client
+                .request(SCHEDULER_REGISTER_WORKER, &request)
+                .await
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    async fn heartbeat(&mut self, request: HeartbeatRequest) -> Result<HeartbeatResponse, String> {
+        match self {
+            Self::Tcp {
+                endpoint,
+                client,
+                token,
+            } => {
+                let result = Self::tcp_client(endpoint, client)
+                    .await?
+                    .heartbeat(request_with_token(request, token))
+                    .await;
+                if result.is_err() {
+                    *client = None;
+                }
+                result
+                    .map(tonic::Response::into_inner)
+                    .map_err(|status| bitty_protocol::worker_client::status_text(&status))
+            }
+            Self::Iroh(client) => client
+                .request(SCHEDULER_HEARTBEAT, &request)
+                .await
+                .map_err(|err| err.to_string()),
+        }
+    }
+}
+
+/// Heartbeats that may fail in a row before the worker registers again.
+const HEARTBEAT_FAILURES_BEFORE_REJOIN: u32 = 5;
+
+/// Registers with a remote scheduler and keeps the registration alive for as long as the node
+/// runs. A scheduler that restarts (an update, a reboot) has forgotten its workers: it answers
+/// the next heartbeat with "not accepted", or does not answer at all for a while. In both cases
+/// the worker registers again by itself, so nobody has to restart the nodes by hand.
+async fn stay_registered(
+    mut scheduler: RemoteScheduler,
+    config: &NodeConfig,
+    profile: &HardwareProfile,
+    worker_stats: RuntimeStats,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let label = scheduler.label();
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let registration = scheduler
+            .register(RegisterWorkerRequest {
+                profile: Some(profile.into()),
+                protocol_version: BITTY_PROTOCOL_VERSION,
+                inference_backend_id: STAGE_BACKEND_ID.into(),
+            })
+            .await;
+        match registration {
+            Ok(registration) => {
+                println!(
+                    "bitty node joined scheduler {label}; topology_epoch={} assignments={}",
+                    registration.topology_epoch,
+                    registration.assignments.len()
+                );
+                retry = Duration::from_secs(1);
+            }
+            Err(err) => {
+                eprintln!(
+                    "cannot register with scheduler {label}: {err}; trying again in {}s",
+                    retry.as_secs()
+                );
+                sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        }
+
+        let mut failures = 0;
+        loop {
+            sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
+            let snapshot = worker_stats.snapshot().await;
+            let response = scheduler
+                .heartbeat(HeartbeatRequest {
+                    node_id: profile.node_id.0.clone(),
+                    observed_tokens_per_second: observed_tokens_per_second(
+                        profile,
+                        snapshot.observed_tokens_per_second,
+                    ),
+                    avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
+                    activation_bytes_per_second: snapshot.activation_bytes_per_second,
+                    backend_type: profile.backend_type.clone(),
+                })
+                .await;
+            match response {
+                Ok(response) if response.accepted => failures = 0,
+                Ok(_) => {
+                    eprintln!(
+                        "scheduler {label} no longer knows node {}; registering again",
+                        profile.node_id.0
+                    );
+                    break;
+                }
+                Err(err) => {
+                    failures += 1;
+                    eprintln!("heartbeat failed: {err}");
+                    if failures >= HEARTBEAT_FAILURES_BEFORE_REJOIN {
+                        eprintln!("scheduler {label} does not answer; registering again");
+                        break;
                     }
-                    Err(err) => eprintln!("heartbeat failed: {err}"),
                 }
             }
         }
@@ -1784,9 +1888,11 @@ fn parse_start(args: &mut impl Iterator<Item = String>) -> Result<StartConfig, S
         model: None,
         join: None,
         data_dir: None,
+        if_started: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--if-started" => config.if_started = true,
             "--model" => config.model = Some(required_next(args, "--model")?),
             "--join" => config.join = Some(required_next(args, "--join")?),
             "--data-dir" => config.data_dir = Some(required_next(args, "--data-dir")?),
@@ -2441,7 +2547,12 @@ async fn ensure_background_runtime(
                 .filter(|model| !model.is_empty())
         })
         .unwrap_or_else(|| settings.default_model.clone());
-    let model_path = model_path_for_runtime(settings, &model)?;
+    let model_path = match model_store::whole_model_path(settings, &model) {
+        Some(path) => path.display().to_string(),
+        // without the whole file the node fetches the vocabulary and the stage of its own layers
+        None if model_store::has_stage_source(settings, &model) => model,
+        None => model_path_for_runtime(settings, &model)?,
+    };
     spawn_background_node(settings, &model_path, join).await
 }
 
@@ -2470,7 +2581,29 @@ async fn spawn_background_node(
     if let Some(join) = &join {
         command.arg("--join").arg(join);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: the node outlives the terminal that
+        // started it, and neither it nor its stage engines open a console window
+        command.creation_flags(0x0800_0000 | 0x0000_0200);
+    }
     let mode = if join.is_some() { "worker" } else { "leader" };
+    #[cfg(windows)]
+    let child = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_BREAKAWAY_FROM_JOB: a node started by the scheduled updater must not die with
+        // the task that started it. A job that forbids leaving refuses the flag, so try without.
+        command.creation_flags(0x0800_0000 | 0x0000_0200 | 0x0100_0000);
+        match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                command.creation_flags(0x0800_0000 | 0x0000_0200);
+                command.spawn()?
+            }
+        }
+    };
+    #[cfg(not(windows))]
     let child = command.spawn()?;
     let state = RuntimeState {
         pid: child.id(),
@@ -2497,9 +2630,13 @@ fn stop_background_runtime(settings: &BittySettings) -> Result<(), Box<dyn std::
         return Ok(());
     };
     if is_pid_running(state.pid) {
-        let status = Command::new("kill").arg(state.pid.to_string()).status()?;
-        if !status.success() {
+        if !kill_pid(state.pid) {
             return Err(format!("failed to stop Bitty runtime pid {}", state.pid).into());
+        }
+        // a node started right after this one needs the same ports
+        let asked = std::time::Instant::now();
+        while is_pid_running(state.pid) && asked.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
         }
         println!("stopped Bitty runtime pid {}", state.pid);
     } else {
@@ -2604,9 +2741,55 @@ fn runtime_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime").join("runtime.toml")
 }
 
+/// Whether the saved pid is still a bitty process. The number alone is not enough: after a
+/// reboot another program may have it.
+#[cfg(target_os = "linux")]
+fn is_pid_running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim().starts_with("bitty"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_pid_running(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_lowercase()
+                .contains("\"bitty")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn is_pid_running(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: u32) -> bool {
+    // /T takes the stage engines down with the node
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) -> bool {
+    Command::new("kill")
         .arg(pid.to_string())
         .status()
         .map(|status| status.success())
@@ -2719,12 +2902,46 @@ fn clean_local_state(settings: &BittySettings) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reads `NAME=value` lines from `<data dir>/env` into the environment. This is where the
+/// settings of a machine live (threads, GPU layers, ...): a node restarted by the updater or
+/// after a reboot does not get the variables of the shell that started it the first time.
+/// A variable that is already set wins over the file.
+fn load_env_file(path: &Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for (name, value) in parse_env_file(&contents) {
+        if std::env::var_os(&name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+fn parse_env_file(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix("export ").unwrap_or(line).split_once('='))
+        .map(|(name, value)| {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(value);
+            (name.trim().to_string(), value.to_string())
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
 fn bitty_data_dir(configured: Option<&str>) -> PathBuf {
     configured
         .map(PathBuf::from)
         .or_else(|| std::env::var("BITTY_DATA_DIR").ok().map(PathBuf::from))
         .or_else(|| {
             std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .map(|home| PathBuf::from(home).join(".bitty"))
         })
@@ -2887,9 +3104,9 @@ fn print_help() {
     println!("  bitty setup");
     println!("  bitty share NAME");
     println!("  bitty connect INVITE_OR_NAME [--name NAME]");
-    println!("  bitty start [--model MODEL_OR_PATH]");
+    println!("  bitty start [--model MODEL_OR_PATH] [--if-started]");
     println!("  bitty stop [MODEL]");
-    println!("  bitty restart");
+    println!("  bitty restart [--if-started]");
     println!("  bitty run MODEL [PROMPT] [--local|--node TARGET]");
     println!("  bitty pull MODEL");
     println!("  bitty pull MODEL --layers START..END [--output FILE]");
@@ -3158,6 +3375,20 @@ mod tests {
             .unwrap(),
             CliCommand::Start(StartConfig { model: Some(_), .. })
         ));
+        assert!(matches!(
+            Cli::parse(vec!["restart".into(), "--if-started".into()]).unwrap(),
+            CliCommand::Restart(StartConfig {
+                if_started: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_env_file("# threads\nBITTY_STAGE_THREADS=8\nexport BITTY_GPU_LAYERS = \"12\"\n\nbroken\n"),
+            vec![
+                ("BITTY_STAGE_THREADS".to_string(), "8".to_string()),
+                ("BITTY_GPU_LAYERS".to_string(), "12".to_string()),
+            ]
+        );
         assert!(matches!(
             Cli::parse(vec!["stop".into()]).unwrap(),
             CliCommand::Stop(StopConfig { model: None, .. })

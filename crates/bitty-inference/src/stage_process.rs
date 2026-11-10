@@ -340,13 +340,14 @@ impl Drop for StageProcess {
 
 /// Finds the `bitty-stage` binary: `BITTY_STAGE_BIN`, then next to this executable, then `PATH`.
 pub fn find_stage_engine() -> Option<PathBuf> {
-    const NAME: &str = "bitty-stage";
+    // "bitty-stage.exe" on Windows
+    let name = format!("bitty-stage{}", std::env::consts::EXE_SUFFIX);
     if let Some(path) = std::env::var_os("BITTY_STAGE_BIN") {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(candidate) = exe.parent().map(|dir| dir.join(NAME)) {
+        if let Some(candidate) = exe.parent().map(|dir| dir.join(&name)) {
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -354,6 +355,6 @@ pub fn find_stage_engine() -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| Path::new(&dir).join(NAME))
+        .map(|dir| Path::new(&dir).join(&name))
         .find(|candidate| candidate.is_file())
 }

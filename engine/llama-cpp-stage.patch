@@ -347,10 +347,10 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..8e3afc7
+index 0000000..d6c6313
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,525 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
@@ -401,7 +401,28 @@ index 0000000..8e3afc7
 +#include <string>
 +#include <vector>
 +
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#define STDIN_FILENO  0
++#define STDOUT_FILENO 1
++#define STDERR_FILENO 2
++typedef int io_count;
++static io_count fd_read(int fd, void * buf, size_t len) { return _read(fd, buf, (unsigned int) (len < (1u << 30) ? len : (1u << 30))); }
++static io_count fd_write(int fd, const void * buf, size_t len) { return _write(fd, buf, (unsigned int) (len < (1u << 30) ? len : (1u << 30))); }
++static int fd_dup(int fd) { return _dup(fd); }
++static int fd_dup2(int from, int to) { return _dup2(from, to); }
++// frames are binary: without this Windows would translate line endings and stop at Ctrl-Z
++static void fd_binary(int fd) { _setmode(fd, _O_BINARY); }
++#else
 +#include <unistd.h>
++typedef ssize_t io_count;
++static io_count fd_read(int fd, void * buf, size_t len) { return read(fd, buf, len); }
++static io_count fd_write(int fd, const void * buf, size_t len) { return write(fd, buf, len); }
++static int fd_dup(int fd) { return dup(fd); }
++static int fd_dup2(int from, int to) { return dup2(from, to); }
++static void fd_binary(int) {}
++#endif
 +
 +enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8 };
 +enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4, KIND_TOP_LOGITS = 5 };
@@ -412,7 +433,7 @@ index 0000000..8e3afc7
 +static bool read_all(int fd, void * buf, size_t len) {
 +    uint8_t * p = (uint8_t *) buf;
 +    while (len > 0) {
-+        const ssize_t n = read(fd, p, len);
++        const io_count n = fd_read(fd, p, len);
 +        if (n == 0) return false;
 +        if (n < 0) {
 +            if (errno == EINTR) continue;
@@ -427,7 +448,7 @@ index 0000000..8e3afc7
 +static bool write_all(int fd, const void * buf, size_t len) {
 +    const uint8_t * p = (const uint8_t *) buf;
 +    while (len > 0) {
-+        const ssize_t n = write(fd, p, len);
++        const io_count n = fd_write(fd, p, len);
 +        if (n < 0) {
 +            if (errno == EINTR) continue;
 +            return false;
@@ -618,8 +639,10 @@ index 0000000..8e3afc7
 +    }
 +
 +    // keep stdout for frames only: anything a library prints there would corrupt the stream
-+    const int out_fd = dup(STDOUT_FILENO);
-+    dup2(STDERR_FILENO, STDOUT_FILENO);
++    const int out_fd = fd_dup(STDOUT_FILENO);
++    fd_dup2(STDERR_FILENO, STDOUT_FILENO);
++    fd_binary(STDIN_FILENO);
++    fd_binary(out_fd);
 +
 +    llama_backend_init();
 +
