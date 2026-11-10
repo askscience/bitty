@@ -328,6 +328,57 @@ pub fn disk_for_stages_mb(settings: &BittySettings, model: &str) -> Option<u64> 
     Some((free + held) / (1024 * 1024))
 }
 
+/// What a node holds of a model and what it is still fetching, in words: the leader logs it,
+/// so the state of a far machine can be read without going there.
+pub fn holdings(settings: &BittySettings, model: &str) -> String {
+    if whole_model_path(settings, model).is_some() {
+        return "holds the whole model".into();
+    }
+    let Ok((spec, _)) = stage_spec(settings, model) else {
+        return String::new();
+    };
+    let Ok(entries) = std::fs::read_dir(spec.model_dir(settings).join("stages")) else {
+        return "holds no layers".into();
+    };
+    let mut parts = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (name, partial) = match name.strip_suffix(".partial") {
+            Some(name) => (name, true),
+            None => (name.as_str(), false),
+        };
+        let Some((start, end)) = name
+            .strip_suffix(".gguf")
+            .and_then(|name| name.rsplit_once(".layers-"))
+            .and_then(|(_, range)| range.split_once('-'))
+            .and_then(|(start, end)| Some((start.parse::<u32>().ok()?, end.parse::<u32>().ok()?)))
+        else {
+            continue;
+        };
+        // the stage with no layers holds the embeddings and the head only
+        if start == end {
+            continue;
+        }
+        let mb = entry.metadata().map(|meta| meta.len()).unwrap_or(0) / (1024 * 1024);
+        parts.push((start, partial, end, mb));
+    }
+    if parts.is_empty() {
+        return "holds no layers".into();
+    }
+    parts.sort();
+    parts
+        .iter()
+        .map(|(start, partial, end, mb)| {
+            if *partial {
+                format!("fetching {start}..{end}, {mb} MiB so far")
+            } else {
+                format!("holds {start}..{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Whether a node can fetch stage files of this model: it is in the registry or it is a URL.
 pub fn has_stage_source(settings: &BittySettings, model: &str) -> bool {
     stage_spec(settings, model).is_ok_and(|(spec, _)| !spec.url.is_empty())

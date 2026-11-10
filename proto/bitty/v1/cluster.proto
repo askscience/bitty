@@ -144,6 +144,9 @@ message HeartbeatRequest {
   double avg_forward_latency_ms = 3;
   uint64 activation_bytes_per_second = 4;
   string backend_type = 5;
+  // What the node holds of the model and what it is still fetching, in words for the log
+  // of the leader.
+  string holdings = 6;
 }
 
 message HeartbeatResponse {

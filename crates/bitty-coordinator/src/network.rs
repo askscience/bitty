@@ -62,6 +62,21 @@ pub struct NetworkCoordinator {
     draft: Arc<Mutex<DraftSlot>>,
     /// The plan in use. It is kept while it holds, also across a restart of the leader.
     plan: Arc<Mutex<KeptPlan>>,
+    /// What each node last said it holds, and when that was logged.
+    holdings: Arc<Mutex<HashMap<NodeId, (String, Instant)>>>,
+}
+
+/// How often the progress of a download on a node is logged.
+const HOLDINGS_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// What a node holds without the numbers that move: "fetching 10..34, 512 MiB so far" and
+/// "fetching 10..34, 600 MiB so far" are the same state.
+fn holdings_kind(holdings: &str) -> String {
+    holdings
+        .split("; ")
+        .map(|part| part.split(", ").next().unwrap_or(part))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The ranges of the last plan, and the file they are written to.
@@ -212,6 +227,7 @@ impl NetworkCoordinator {
                 file: None,
                 wait_until: Instant::now(),
             })),
+            holdings: Arc::default(),
         }
     }
 
@@ -556,6 +572,28 @@ impl NetworkCoordinator {
             + 1;
         *epoch = format!("network-epoch-{next}");
         epoch.clone()
+    }
+
+    /// Logs what a node holds when it changes, and the progress of a download now and then.
+    async fn note_holdings(&self, heartbeat: &Heartbeat) {
+        if heartbeat.holdings.is_empty() {
+            return;
+        }
+        let mut seen = self.holdings.lock().await;
+        let fresh = match seen.get(&heartbeat.node_id) {
+            Some((last, logged)) => {
+                holdings_kind(last) != holdings_kind(&heartbeat.holdings)
+                    || (*last != heartbeat.holdings && logged.elapsed() >= HOLDINGS_LOG_EVERY)
+            }
+            None => true,
+        };
+        if fresh {
+            println!("{}: {}", heartbeat.node_id.0, heartbeat.holdings);
+            seen.insert(
+                heartbeat.node_id.clone(),
+                (heartbeat.holdings.clone(), Instant::now()),
+            );
+        }
     }
 
     async fn epoch(&self) -> String {
@@ -1264,6 +1302,7 @@ impl CoordinatorService for NetworkCoordinator {
             return Err(status);
         }
         let heartbeat = Heartbeat::from(request.into_inner());
+        self.note_holdings(&heartbeat).await;
         let accepted = self.registry.lock().await.heartbeat(heartbeat);
 
         Ok(Response::new(HeartbeatResponse {
@@ -1355,6 +1394,15 @@ impl CoordinatorService for NetworkCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_progress_of_a_download_is_not_a_new_state() {
+        let early = "holds 0..4; fetching 4..10, 512 MiB so far";
+        let later = "holds 0..4; fetching 4..10, 900 MiB so far";
+        assert_eq!(holdings_kind(early), holdings_kind(later));
+        assert_eq!(holdings_kind(early), "holds 0..4; fetching 4..10");
+        assert_ne!(holdings_kind(later), holdings_kind("holds 0..4; holds 4..10"));
+    }
 
     #[test]
     fn a_refusal_carries_what_the_node_has_free() {

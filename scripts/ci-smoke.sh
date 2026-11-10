@@ -72,6 +72,7 @@ drafted="$("$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-d
 echo "$drafted"
 [ -n "$drafted" ] || die "empty text with the draft model"
 grep -q "draft model loaded" "$WORK/n0.log" || die "the leader did not load the draft model"
+grep -q "^n1: holds" "$WORK/n0.log" || die "the leader did not log what the worker holds"
 kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)"
 echo "$kept"
 [ "${kept%% *}" -ge 8 ] || die "the workers kept too few draft tokens: $kept"

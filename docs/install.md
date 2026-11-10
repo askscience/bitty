@@ -132,6 +132,13 @@ missing machines of the plan before it plans without them
 (`BITTY_PLAN_WAIT_SECS`); an update restarts a node in far less. Requests in
 that time are answered with what the leader is waiting for.
 
+Each node tells the leader, with every heartbeat, what it holds of the model and
+what it is still fetching. The leader writes it in its log when it changes, and
+the progress of a download every five minutes, for example
+`bitty-c5e9968c: fetching 10..34, 5120 MiB so far` and later
+`bitty-c5e9968c: holds 10..34`. So the state of a far machine can be read on the
+leader without going there. A node on an older build says nothing.
+
 To give a machine less than it would get, put one of these in its `env` file
 and restart the node:
 

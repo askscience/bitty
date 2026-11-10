@@ -1187,6 +1187,7 @@ async fn register_and_heartbeat(
                             avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
                             activation_bytes_per_second: snapshot.activation_bytes_per_second,
                             backend_type: profile.backend_type.clone(),
+                            holdings: node_holdings(config),
                         },
                         cluster_token,
                     ))
@@ -1228,6 +1229,12 @@ async fn register_and_heartbeat(
             stay_registered(scheduler, config, &profile, worker_stats).await
         }
     }
+}
+
+/// What this node holds of its model, for the log of the leader.
+fn node_holdings(config: &NodeConfig) -> String {
+    let settings = BittySettings::load(bitty_data_dir(config.data_dir.as_deref()));
+    model_store::holdings(&settings, &config.model)
 }
 
 /// A scheduler on another machine, over gRPC or over iroh.
@@ -1410,6 +1417,7 @@ async fn stay_registered(
                     avg_forward_latency_ms: snapshot.avg_forward_latency_ms,
                     activation_bytes_per_second: snapshot.activation_bytes_per_second,
                     backend_type: profile.backend_type.clone(),
+                    holdings: node_holdings(config),
                 })
                 .await;
             match response {

@@ -501,6 +501,9 @@ pub struct Heartbeat {
     pub avg_forward_latency_ms: f64,
     pub activation_bytes_per_second: u64,
     pub backend_type: String,
+    /// What the node holds of the model and what it is still fetching.
+    #[serde(default)]
+    pub holdings: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,6 +848,7 @@ impl From<&Heartbeat> for pb::HeartbeatRequest {
             avg_forward_latency_ms: heartbeat.avg_forward_latency_ms,
             activation_bytes_per_second: heartbeat.activation_bytes_per_second,
             backend_type: heartbeat.backend_type.clone(),
+            holdings: heartbeat.holdings.clone(),
         }
     }
 }
@@ -857,6 +861,7 @@ impl From<pb::HeartbeatRequest> for Heartbeat {
             avg_forward_latency_ms: heartbeat.avg_forward_latency_ms,
             activation_bytes_per_second: heartbeat.activation_bytes_per_second,
             backend_type: heartbeat.backend_type,
+            holdings: heartbeat.holdings,
         }
     }
 }
