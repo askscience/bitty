@@ -6,7 +6,7 @@
 # What it does:
 #   - downloads `bitty` and the stage engine `bitty-stage` into ~/.local/share/bitty/bin
 #   - links `bitty` into ~/.local/bin
-#   - sets up a timer that looks for a new build every 10 minutes, installs it, restarts the
+#   - sets up a timer that looks for a new build every minute, installs it, restarts the
 #     node if one was running, and starts the node again after a reboot
 #
 # Nothing here needs root. The same file is installed as `bitty-update`, which is what the
@@ -30,7 +30,7 @@ BASE_URL="${BITTY_BASE_URL:-https://github.com/$REPO/releases/download/$CHANNEL}
 PREFIX="${BITTY_HOME:-$HOME/.local/share/bitty}"
 BIN_DIR="${BITTY_BIN_DIR:-$HOME/.local/bin}"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-INTERVAL_MINUTES=10
+INTERVAL_MINUTES=1
 CRON_MARK="# bitty-update"
 
 quiet=0
@@ -135,18 +135,19 @@ KillMode=process
 EOF
         cat > "$UNIT_DIR/bitty-update.timer" << EOF
 [Unit]
-Description=Look for a new bitty build every $INTERVAL_MINUTES minutes
+Description=Look for a new bitty build every $INTERVAL_MINUTES min
 
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=${INTERVAL_MINUTES}min
-RandomizedDelaySec=1min
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
 EOF
         systemctl --user daemon-reload
-        if ! systemctl --user enable --now bitty-update.timer > /dev/null 2>&1; then
+        # restart, not only start: a timer that is already running keeps its old interval
+        if ! { systemctl --user enable bitty-update.timer && systemctl --user restart bitty-update.timer; } > /dev/null 2>&1; then
             say "auto update: the systemd timer could not be enabled"
             say "  run '$PREFIX/bin/bitty-update --update' whenever you want the current build"
             return 0
@@ -154,9 +155,9 @@ EOF
         remove_cron
         # without lingering the timer only runs while this user is logged in
         if loginctl enable-linger "$(id -un)" > /dev/null 2>&1; then
-            say "auto update: systemd timer every $INTERVAL_MINUTES minutes, also when nobody is logged in"
+            say "auto update: systemd timer every $INTERVAL_MINUTES min, also when nobody is logged in"
         else
-            say "auto update: systemd timer every $INTERVAL_MINUTES minutes while you are logged in"
+            say "auto update: systemd timer every $INTERVAL_MINUTES min while you are logged in"
             say "  to keep it running after logout: sudo loginctl enable-linger $(id -un)"
         fi
     elif command -v crontab > /dev/null 2>&1; then
@@ -166,11 +167,25 @@ EOF
             echo "*/$INTERVAL_MINUTES * * * * $PREFIX/bin/bitty-update --update $CRON_MARK"
             echo "@reboot $PREFIX/bin/bitty-update --update $CRON_MARK"
         ) | crontab -
-        say "auto update: cron job every $INTERVAL_MINUTES minutes"
+        say "auto update: cron job every $INTERVAL_MINUTES min"
     else
         say "auto update: not set up, this machine has neither a systemd user session nor cron"
         say "  run '$PREFIX/bin/bitty-update --update' whenever you want the current build"
     fi
+}
+
+# An installation made by an older build keeps that build's timer. The updater brings it to
+# the current interval; an installation without auto update is left alone.
+refresh_timer() {
+    if [ -f "$UNIT_DIR/bitty-update.timer" ]; then
+        grep -q "^OnUnitActiveSec=${INTERVAL_MINUTES}min\$" "$UNIT_DIR/bitty-update.timer" && return 0
+    elif command -v crontab > /dev/null 2>&1 && crontab -l 2> /dev/null | grep -q "$CRON_MARK"; then
+        crontab -l 2> /dev/null | grep -q "^\*/$INTERVAL_MINUTES .*$CRON_MARK" && return 0
+    else
+        return 0
+    fi
+    log "setting the update check to every $INTERVAL_MINUTES minute(s)"
+    install_timer || log "the timer could not be changed"
 }
 
 remove_timer() {
@@ -233,6 +248,7 @@ run_update() {
     # after a reboot or a crash: bring back the node that was running. Does nothing when
     # bitty was stopped with `bitty stop` or never started.
     "$PREFIX/bin/bitty" start --if-started > /dev/null 9>&- || log "start failed"
+    refresh_timer 9>&-
 }
 
 run_uninstall() {

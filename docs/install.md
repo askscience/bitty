@@ -36,7 +36,7 @@ because every connection is opened from the inside.
 
 ## What the updater does
 
-Every 10 minutes, and when the machine starts (Linux) or the user logs in
+Every minute, and when the machine starts (Linux) or the user logs in
 (Windows):
 
 1. It reads `VERSION` from the `nightly` release. The same as the installed
@@ -56,7 +56,7 @@ was stopped with `bitty stop`: stopping by hand is remembered.
 A new build is published by the `Release` workflow on every push to the
 `qwen-llama-cpp` branch, after it has built both programs for Linux and
 Windows and run two nodes end to end on each. So a push reaches every machine
-within about 10 minutes of the workflow ending, with no command to give.
+within about a minute of the workflow ending, with no command to give.
 
 What happened is in `update.log`, next to the `bin` folder.
 

@@ -5,7 +5,7 @@
 # What it does:
 #   - downloads bitty.exe and the stage engine bitty-stage.exe into %LOCALAPPDATA%\bitty\bin
 #   - adds that folder to your PATH
-#   - registers a scheduled task that looks for a new build every 10 minutes, installs it,
+#   - registers a scheduled task that looks for a new build every minute, installs it,
 #     restarts the node if one was running, and starts the node again after a reboot
 #
 # Nothing here needs administrator rights. The same file is installed as bitty-update.ps1,
@@ -41,7 +41,7 @@ $Updater = Join-Path $BinDir 'bitty-update.ps1'
 $VersionFile = Join-Path $Prefix 'VERSION'
 $LogFile = Join-Path $Prefix 'update.log'
 $TaskName = 'bitty-update'
-$IntervalMinutes = 10
+$IntervalMinutes = 1
 $Name = 'bitty-windows-x86_64'
 
 function Write-Log([string]$Message) {
@@ -174,6 +174,22 @@ function Register-UpdateTask {
         -Principal $principal -Description 'Updates bitty and keeps its node running' -Force | Out-Null
 }
 
+# An installation made by an older build keeps that build's task. The updater brings it to the
+# current interval; an installation without auto update has no task and is left alone.
+function Update-TaskInterval {
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $task) { return }
+        $wanted = [Xml.XmlConvert]::ToString((New-TimeSpan -Minutes $IntervalMinutes))
+        $current = $task.Triggers | ForEach-Object { $_.Repetition.Interval } | Where-Object { $_ }
+        if ($current -contains $wanted) { return }
+        Write-Log "setting the update check to every $IntervalMinutes minute(s)"
+        Register-UpdateTask
+    } catch {
+        Write-Log "the scheduled task could not be changed: $($_.Exception.Message)"
+    }
+}
+
 function Unregister-UpdateTask {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -198,7 +214,7 @@ function Invoke-Install {
     } else {
         try {
             Register-UpdateTask
-            Write-Host "auto update: scheduled task '$TaskName' every $IntervalMinutes minutes while you are logged in"
+            Write-Host "auto update: scheduled task '$TaskName' every $IntervalMinutes min while you are logged in"
         } catch {
             Write-Host "auto update: could not register the scheduled task ($($_.Exception.Message))"
             Write-Host "  run '$Updater -Update' whenever you want the current build"
@@ -236,6 +252,7 @@ function Invoke-Update {
         # after a reboot or a crash: bring back the node that was running. Does nothing when
         # bitty was stopped with `bitty stop` or never started.
         if (Test-Path $Bitty) { Invoke-Bitty @('start', '--if-started') | Out-Null }
+        Update-TaskInterval
     } finally {
         $mutex.ReleaseMutex()
     }
