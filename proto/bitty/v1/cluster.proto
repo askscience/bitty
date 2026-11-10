@@ -27,6 +27,8 @@ message HardwareProfile {
   uint64 available_ram_mb = 21;
   // Disk the node can use for layers. Zero: the node did not say, or it holds the whole model.
   uint64 free_disk_mb = 22;
+  // The build the node runs. Empty: an older node that did not say.
+  string build = 23;
 }
 
 message GpuInfo {

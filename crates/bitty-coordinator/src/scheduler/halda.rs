@@ -382,6 +382,7 @@ mod tests {
             ram_mb: (memory_gb * 1024.0) as u64,
             available_ram_mb: 0,
             free_disk_mb: 0,
+            build: String::new(),
             vram_mb: 0,
             architecture: "x86_64".into(),
             gpus: Vec::new(),

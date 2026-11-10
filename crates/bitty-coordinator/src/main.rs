@@ -132,6 +132,7 @@ fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
                 ram_mb: 4096,
                 available_ram_mb: 0,
                 free_disk_mb: 0,
+                build: String::new(),
                 vram_mb: 0,
                 architecture: std::env::consts::ARCH.into(),
                 gpus: Vec::new(),

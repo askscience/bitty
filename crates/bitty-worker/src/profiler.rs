@@ -87,6 +87,7 @@ impl HardwareProfiler {
             ram_mb,
             available_ram_mb,
             free_disk_mb: 0,
+            build: String::new(),
             vram_mb,
             architecture: architecture(&system),
             gpus,

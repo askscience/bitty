@@ -206,6 +206,9 @@ pub struct HardwareProfile {
     /// whole model.
     #[serde(default)]
     pub free_disk_mb: u64,
+    /// The build the node runs. Empty: an older node that did not say.
+    #[serde(default)]
+    pub build: String,
     pub vram_mb: u64,
     pub architecture: String,
     pub gpus: Vec<GpuInfo>,
@@ -526,6 +529,7 @@ impl From<&HardwareProfile> for pb::HardwareProfile {
             ram_mb: profile.ram_mb,
             available_ram_mb: profile.available_ram_mb,
             free_disk_mb: profile.free_disk_mb,
+            build: profile.build.clone(),
             vram_mb: profile.vram_mb,
             architecture: profile.architecture.clone(),
             gpus: profile.gpus.iter().map(Into::into).collect(),
@@ -582,6 +586,7 @@ impl TryFrom<pb::HardwareProfile> for HardwareProfile {
             ram_mb,
             available_ram_mb: profile.available_ram_mb.min(ram_mb),
             free_disk_mb: profile.free_disk_mb,
+            build: profile.build,
             vram_mb: profile.vram_mb,
             architecture: if profile.architecture.is_empty() {
                 "unknown".into()

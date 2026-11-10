@@ -904,6 +904,18 @@ impl CoordinatorService for NetworkCoordinator {
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
         }
         let node_id = profile.node_id.clone();
+        let about = format!(
+            "build={} os={} memory={} MB, free {} MB, disk for layers {} MB",
+            if profile.build.is_empty() {
+                "unknown"
+            } else {
+                profile.build.as_str()
+            },
+            profile.os,
+            profile.ram_mb,
+            profile.available_ram_mb,
+            profile.free_disk_mb
+        );
 
         // A node that registers again has restarted and holds no layers: it is told to load.
         let cached = format!("{}@", node_id.0);
@@ -918,7 +930,7 @@ impl CoordinatorService for NetworkCoordinator {
         let assignments = self.current_assignments().await.unwrap_or_default();
 
         println!(
-            "registered worker {node_id}; active_nodes={} assignments={}",
+            "registered worker {node_id} ({about}); active_nodes={} assignments={}",
             self.registry.lock().await.profiles().len(),
             assignments.len()
         );

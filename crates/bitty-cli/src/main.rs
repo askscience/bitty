@@ -1111,6 +1111,7 @@ async fn register_and_heartbeat(
     let mut profile = HardwareProfiler::new(config.node_id.clone()).profile();
     profile.network_rtt_ms = estimate_scheduler_rtt_ms(target).await;
     profile.model_path = config.model.clone();
+    profile.build = option_env!("BITTY_GIT_SHA").unwrap_or("local").to_string();
     let data_dir = bitty_data_dir(config.data_dir.as_deref());
     profile.free_disk_mb =
         model_store::disk_for_stages_mb(&BittySettings::load(data_dir), &config.model).unwrap_or(0);
@@ -2290,16 +2291,27 @@ async fn handle_iroh_request(
     worker: NetworkWorker<StageExecutor>,
     cluster_token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = incoming.accept()?.await?;
+    // the address goes into the error: a peer that keeps failing has to be told from the others
+    let from = incoming.remote_addr();
+    let connection = incoming
+        .accept()
+        .map_err(|err| format!("from {from:?}: {err}"))?
+        .await
+        .map_err(|err| format!("handshake from {from:?}: {err}"))?;
     let alpn = connection.alpn().to_vec();
+    let remote_id = connection.remote_id();
+    let peer = remote_id.fmt_short().to_string();
     if alpn == BITTY_WORKER_ALPN {
-        return handle_worker_connection(connection, worker, cluster_token).await;
+        return handle_worker_connection(connection, worker, cluster_token)
+            .await
+            .map_err(|err| format!("worker call from {peer}: {err}").into());
     }
     let Some(coordinator) = coordinator else {
         return Err("this node is not a scheduler leader".into());
     };
-    let remote_id = connection.remote_id();
-    handle_scheduler_connection(connection, remote_id, coordinator, cluster_token).await
+    handle_scheduler_connection(connection, remote_id, coordinator, cluster_token)
+        .await
+        .map_err(|err| format!("leader call from {peer}: {err}").into())
 }
 
 async fn handle_scheduler_connection(
