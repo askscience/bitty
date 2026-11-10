@@ -117,6 +117,9 @@ then plans again with the number the node gave. The same holds for the disk:
 a node first removes the layer files of an older plan, and when the new ones
 still do not fit it says how much room it has.
 
+A download of layers that is cut, by a restart, an update or a line that
+drops, goes on from where it was the next time.
+
 A node keeps its name in `node-id` inside its data directory, so after a
 restart or an update the leader sees the same machine and not a new one.
 

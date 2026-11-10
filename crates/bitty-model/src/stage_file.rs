@@ -13,7 +13,7 @@
 //! - any other tensor that is not tied to a block, which keeps unknown small tensors available.
 
 use crate::gguf::{parse_gguf_prefix, GgufError, GgufLayout, GgufMetadataValue, GgufTensorInfo};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -374,6 +374,19 @@ fn put_u32_entry(out: &mut Vec<u8>, key: &str, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// The end of a partial file is not trusted: a machine that lost power may have left it
+/// unwritten. This much is fetched again.
+const RESUME_ROLLBACK: u64 = if cfg!(test) { 8 } else { 1 << 20 };
+
+/// The length from which the partial file at `partial` can go on, when it starts with `header`.
+fn resumable_len(partial: &Path, header: &[u8]) -> Option<u64> {
+    let mut file = File::open(partial).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut start = vec![0u8; header.len()];
+    file.read_exact(&mut start).ok()?;
+    (start == header).then(|| len.saturating_sub(RESUME_ROLLBACK).max(header.len() as u64))
+}
+
 fn align_to(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
@@ -474,7 +487,13 @@ pub fn write_stage_file(
     }
     header.resize(align_to(header.len() as u64, alignment) as usize, 0);
 
-    let needed = header.len() as u64 + cursor + runs.len() as u64 * alignment;
+    let mut partial = dest.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    // what a cut download left behind is room already taken
+    let on_disk = std::fs::metadata(&partial).map_or(0, |partial| partial.len());
+    let needed =
+        (header.len() as u64 + cursor + runs.len() as u64 * alignment).saturating_sub(on_disk);
     if let Some(usable) = usable_disk_bytes(dest) {
         if needed > usable {
             return Err(StageFileError::NoSpace {
@@ -484,20 +503,44 @@ pub fn write_stage_file(
         }
     }
 
-    let mut partial = dest.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
+    // A download that was cut (a restart, an update, a line that dropped) goes on from what is
+    // already in the partial file. The file is the same byte for byte for the same model and
+    // the same layers, and its header says which those are.
+    let resume_at = resumable_len(&partial, &header);
     let result = (|| -> Result<u64, StageFileError> {
-        let mut out = BufWriter::with_capacity(1 << 20, File::create(&partial)?);
-        out.write_all(&header)?;
+        let file = match resume_at {
+            Some(len) => {
+                let mut file = OpenOptions::new().write(true).open(&partial)?;
+                file.set_len(len)?;
+                file.seek(SeekFrom::End(0))?;
+                file
+            }
+            None => File::create(&partial)?,
+        };
+        let mut out = BufWriter::with_capacity(1 << 20, file);
+        if resume_at.is_none() {
+            out.write_all(&header)?;
+        }
+        // where the file already ends, counted from the end of the header
+        let have = resume_at.map_or(0, |len| len - header.len() as u64);
         let mut written = 0u64;
         let mut fetched = prefix.len() as u64;
         for run in &runs {
             let padding = align_to(written, alignment) - written;
-            out.write_all(&vec![0u8; padding as usize])?;
-            source.copy_range(layout.data_start + run.source_offset, run.len, &mut out)?;
-            written += padding + run.len;
-            fetched += run.len;
+            let run_start = written + padding;
+            let run_end = run_start + run.len;
+            if have < run_end {
+                let missing_padding = run_start.saturating_sub(have.max(written));
+                out.write_all(&vec![0u8; missing_padding as usize])?;
+                let skip = have.saturating_sub(run_start);
+                source.copy_range(
+                    layout.data_start + run.source_offset + skip,
+                    run.len - skip,
+                    &mut out,
+                )?;
+                fetched += run.len - skip;
+            }
+            written = run_end;
         }
         out.into_inner()
             .map_err(|err| err.into_error())?
@@ -506,8 +549,11 @@ pub fn write_stage_file(
     })();
     let fetched = match result {
         Ok(fetched) => fetched,
+        // what arrived stays on disk for the next attempt; a full disk needs the room back
         Err(err) => {
-            let _ = std::fs::remove_file(&partial);
+            if matches!(&err, StageFileError::Io(io) if io.kind() == io::ErrorKind::StorageFull) {
+                let _ = std::fs::remove_file(&partial);
+            }
             return Err(err);
         }
     };
@@ -614,6 +660,47 @@ mod tests {
             .collect();
         std::fs::remove_dir_all(&dir).unwrap();
         (kept, bytes, report, names)
+    }
+
+    #[test]
+    fn a_cut_download_goes_on_from_where_it_was() {
+        let dir = std::env::temp_dir().join(format!("bitty-stage-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (model, _) = sample_model(true);
+        let source_path = dir.join("model.gguf");
+        std::fs::write(&source_path, &model).unwrap();
+        let source = FileSource::new(&source_path);
+        let whole_path = dir.join("whole.gguf");
+        let whole_report = write_stage_file(&source, 0, 3, &whole_path).unwrap();
+        let whole = std::fs::read(&whole_path).unwrap();
+
+        let dest = dir.join("stage.gguf");
+        let partial = dir.join("stage.gguf.partial");
+        // cut at every length: inside the header, inside the padding, inside a tensor
+        for cut in 0..whole.len() {
+            std::fs::write(&partial, &whole[..cut]).unwrap();
+            let report = write_stage_file(&source, 0, 3, &dest).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), whole, "cut at {cut}");
+            assert!(!partial.exists());
+            assert!(report.fetched_bytes <= whole_report.fetched_bytes);
+            std::fs::remove_file(&dest).unwrap();
+        }
+        // most of the file was there: only the end is fetched again
+        std::fs::write(&partial, &whole[..whole.len() - 4]).unwrap();
+        let report = write_stage_file(&source, 0, 3, &dest).unwrap();
+        assert!(report.fetched_bytes < whole_report.fetched_bytes);
+
+        // a partial file of other layers is not continued
+        std::fs::write(&partial, &whole[..whole.len() - 4]).unwrap();
+        write_stage_file(&source, 1, 2, &dest).unwrap();
+        let other = dir.join("other.gguf");
+        write_stage_file(&source, 1, 2, &other).unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&other).unwrap()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

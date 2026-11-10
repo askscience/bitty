@@ -277,7 +277,8 @@ fn other_stages(settings: &BittySettings, spec: &ModelSpec, keep: &Path) -> Vec<
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path != keep && path != &vocabulary)
+        // the partial file of `keep` is a download that goes on, not an older plan
+        .filter(|path| path != keep && path != &vocabulary && path.with_extension("") != keep)
         .filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "gguf" || extension == "partial")
