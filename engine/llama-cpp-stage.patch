@@ -1,0 +1,666 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d..8704fa8 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -28,6 +28,7 @@ else()
+     add_subdirectory(passkey)
+     add_subdirectory(retrieval)
+     add_subdirectory(simple)
++    add_subdirectory(stage-check)
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+     add_subdirectory(speculative-simple)
+diff --git a/examples/stage-check/CMakeLists.txt b/examples/stage-check/CMakeLists.txt
+new file mode 100644
+index 0000000..74beb1a
+--- /dev/null
++++ b/examples/stage-check/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-stage-check)
++add_executable(${TARGET} stage-check.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/stage-check/stage-check.cpp b/examples/stage-check/stage-check.cpp
+new file mode 100644
+index 0000000..b8ebe85
+--- /dev/null
++++ b/examples/stage-check/stage-check.cpp
+@@ -0,0 +1,286 @@
++// Checks stage execution: the model split into layer ranges and chained through hidden states
++// must give the same logits as the whole model.
++//
++//   llama-stage-check -m model.gguf [-c 8,16] [-p prompt] [-n 16] [-t threads]
++//
++// -c lists the cut points: "8,16" on a 24-layer model runs the stages [0,8) [8,16) [16,24).
++
++#include "llama.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct stage {
++    llama_model *   model = nullptr;
++    llama_context * ctx   = nullptr;
++    int             begin = 0;
++    int             end   = 0;
++};
++
++static int g_threads = 8;
++
++static bool load_stage(stage & st, const char * path, int begin, int end, int n_layer, int n_ctx) {
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0;
++    if (end != 0) {
++        mparams.stage_layer_start = begin;
++        mparams.stage_layer_end   = end;
++    }
++    st.model = llama_model_load_from_file(path, mparams);
++    if (!st.model) {
++        return false;
++    }
++    st.begin = begin;
++    st.end   = end == 0 ? n_layer : end;
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx           = n_ctx;
++    cparams.n_batch         = n_ctx;
++    cparams.n_ubatch        = n_ctx;
++    cparams.n_threads       = g_threads;
++    cparams.n_threads_batch = g_threads;
++    cparams.no_perf         = true;
++    // every stage but the last one returns hidden states for all tokens
++    cparams.embeddings   = end != 0 && end != n_layer;
++    cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
++    st.ctx = llama_init_from_model(st.model, cparams);
++    return st.ctx != nullptr;
++}
++
++static void free_stage(stage & st) {
++    if (st.ctx)   llama_free(st.ctx);
++    if (st.model) llama_model_free(st.model);
++    st = stage();
++}
++
++// decode token ids at positions [pos0, pos0 + n), every token is an output
++static bool decode_tokens(llama_context * ctx, const llama_token * tokens, int n, int pos0) {
++    std::vector<llama_token>    tok(tokens, tokens + n);
++    std::vector<llama_pos>      pos(n);
++    std::vector<int32_t>        n_seq(n, 1);
++    std::vector<llama_seq_id>   seq0(1, 0);
++    std::vector<llama_seq_id *> seq(n, seq0.data());
++    std::vector<int8_t>         out(n, 1);
++    for (int i = 0; i < n; ++i) pos[i] = pos0 + i;
++
++    llama_batch batch = {};
++    batch.n_tokens = n;
++    batch.token    = tok.data();
++    batch.pos      = pos.data();
++    batch.n_seq_id = n_seq.data();
++    batch.seq_id   = seq.data();
++    batch.logits   = out.data();
++    return llama_decode(ctx, batch) == 0;
++}
++
++// decode hidden states at positions [pos0, pos0 + n), every token is an output.
++// embedding batches carry 4 positions per token, section-major; text uses [p, p, p, 0].
++static bool decode_hidden(llama_context * ctx, const float * hidden, int n, int pos0) {
++    std::vector<llama_pos>      pos((size_t) n * 4);
++    std::vector<int32_t>        n_seq(n, 1);
++    std::vector<llama_seq_id>   seq0(1, 0);
++    std::vector<llama_seq_id *> seq(n, seq0.data());
++    std::vector<int8_t>         out(n, 1);
++    for (int i = 0; i < n; ++i) {
++        pos[0 * n + i] = pos0 + i;
++        pos[1 * n + i] = pos0 + i;
++        pos[2 * n + i] = pos0 + i;
++        pos[3 * n + i] = 0;
++    }
++
++    llama_batch batch = {};
++    batch.n_tokens = n;
++    batch.embd     = const_cast<float *>(hidden);
++    batch.pos      = pos.data();
++    batch.n_seq_id = n_seq.data();
++    batch.seq_id   = seq.data();
++    batch.logits   = out.data();
++    return llama_decode(ctx, batch) == 0;
++}
++
++// runs n tokens through the chain, returns the logits of all n positions (n * n_vocab)
++static bool run_chain(std::vector<stage> & chain, const llama_token * tokens, int n, int pos0, int n_embd, int n_vocab, std::vector<float> & logits) {
++    std::vector<float> hidden;
++    for (size_t s = 0; s < chain.size(); ++s) {
++        stage & st = chain[s];
++        const bool ok = s == 0 ? decode_tokens(st.ctx, tokens, n, pos0) : decode_hidden(st.ctx, hidden.data(), n, pos0);
++        if (!ok) {
++            fprintf(stderr, "decode failed in stage [%d, %d)\n", st.begin, st.end);
++            return false;
++        }
++        if (s + 1 < chain.size()) {
++            const float * h = llama_get_embeddings(st.ctx);
++            if (!h) {
++                fprintf(stderr, "stage [%d, %d) returned no hidden states\n", st.begin, st.end);
++                return false;
++            }
++            hidden.assign(h, h + (size_t) n * n_embd);
++        } else {
++            logits.resize((size_t) n * n_vocab);
++            for (int i = 0; i < n; ++i) {
++                const float * l = llama_get_logits_ith(st.ctx, i);
++                if (!l) {
++                    return false;
++                }
++                memcpy(logits.data() + (size_t) i * n_vocab, l, sizeof(float) * n_vocab);
++            }
++        }
++    }
++    return true;
++}
++
++static int argmax(const float * v, int n) {
++    return (int) (std::max_element(v, v + n) - v);
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path;
++    std::string prompt = "The capital of Italy is Rome. The capital of France is";
++    std::string cuts_arg;
++    int n_predict = 16;
++
++    for (int i = 1; i < argc; ++i) {
++        const std::string a = argv[i];
++        if (i + 1 >= argc) {
++            fprintf(stderr, "missing value for %s\n", a.c_str());
++            return 2;
++        }
++        if      (a == "-m") model_path = argv[++i];
++        else if (a == "-p") prompt     = argv[++i];
++        else if (a == "-c") cuts_arg   = argv[++i];
++        else if (a == "-n") n_predict  = atoi(argv[++i]);
++        else if (a == "-t") g_threads  = atoi(argv[++i]);
++        else {
++            fprintf(stderr, "unknown argument %s\n", a.c_str());
++            return 2;
++        }
++    }
++    if (model_path.empty()) {
++        fprintf(stderr, "usage: %s -m model.gguf [-c 8,16] [-p prompt] [-n 16] [-t threads]\n", argv[0]);
++        return 2;
++    }
++
++    llama_backend_init();
++
++    const int n_ctx = 512;
++
++    // reference: the whole model
++    stage ref;
++    if (!load_stage(ref, model_path.c_str(), 0, 0, 0, n_ctx)) {
++        fprintf(stderr, "failed to load the reference model\n");
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(ref.model);
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    const int n_embd  = llama_model_n_embd(ref.model);
++    const int n_layer = llama_model_n_layer(ref.model);
++
++    std::vector<llama_token> tokens(prompt.size() + 8);
++    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), tokens.data(), (int32_t) tokens.size(), true, true);
++    if (n_prompt <= 0 || n_prompt + n_predict > n_ctx) {
++        fprintf(stderr, "bad prompt length %d\n", n_prompt);
++        return 1;
++    }
++    tokens.resize(n_prompt);
++
++    std::vector<int> cuts;
++    if (cuts_arg.empty()) {
++        cuts = { n_layer / 3, 2 * n_layer / 3 };
++    } else {
++        size_t at = 0;
++        while (at < cuts_arg.size()) {
++            cuts.push_back(atoi(cuts_arg.c_str() + at));
++            const size_t comma = cuts_arg.find(',', at);
++            if (comma == std::string::npos) break;
++            at = comma + 1;
++        }
++    }
++
++    printf("model: %d layers, n_embd %d, n_vocab %d, prompt %d tokens, %d generated\n", n_layer, n_embd, n_vocab, n_prompt, n_predict);
++
++    // reference logits: prompt in one batch, then greedy generation one token at a time
++    std::vector<std::vector<float>> ref_logits; // one entry per decode call
++    std::vector<llama_token>        ref_tokens;
++    {
++        std::vector<stage> chain = { ref };
++        std::vector<float> logits;
++        if (!run_chain(chain, tokens.data(), n_prompt, 0, n_embd, n_vocab, logits)) return 1;
++        ref_logits.push_back(logits);
++        llama_token next = argmax(logits.data() + (size_t) (n_prompt - 1) * n_vocab, n_vocab);
++        for (int i = 0; i < n_predict; ++i) {
++            ref_tokens.push_back(next);
++            if (!run_chain(chain, &next, 1, n_prompt + i, n_embd, n_vocab, logits)) return 1;
++            ref_logits.push_back(logits);
++            next = argmax(logits.data(), n_vocab);
++        }
++    }
++    free_stage(ref);
++
++    // the same work through the chain of stages
++    std::vector<stage> chain;
++    int begin = 0;
++    cuts.push_back(n_layer);
++    for (int end : cuts) {
++        stage st;
++        if (!load_stage(st, model_path.c_str(), begin, end, n_layer, n_ctx)) {
++            fprintf(stderr, "failed to load stage [%d, %d)\n", begin, end);
++            return 1;
++        }
++        printf("stage [%2d, %2d): %.1f MiB of weights\n", begin, end, llama_model_size(st.model) / 1024.0 / 1024.0);
++        chain.push_back(st);
++        begin = end;
++    }
++
++    // the reference model is gone, take the vocabulary from a live one
++    vocab = llama_model_get_vocab(chain[0].model);
++
++    double max_diff   = 0.0;
++    int    n_mismatch = 0;
++    int    n_checked  = 0;
++    auto compare = [&](const std::vector<float> & a, const std::vector<float> & b) {
++        const int rows = (int) (a.size() / n_vocab);
++        for (int r = 0; r < rows; ++r) {
++            const float * x = a.data() + (size_t) r * n_vocab;
++            const float * y = b.data() + (size_t) r * n_vocab;
++            for (int v = 0; v < n_vocab; ++v) {
++                max_diff = std::max(max_diff, (double) std::fabs(x[v] - y[v]));
++            }
++            n_mismatch += argmax(x, n_vocab) != argmax(y, n_vocab);
++            n_checked++;
++        }
++    };
++
++    std::vector<float> logits;
++    if (!run_chain(chain, tokens.data(), n_prompt, 0, n_embd, n_vocab, logits)) return 1;
++    compare(ref_logits[0], logits);
++    llama_token next = argmax(logits.data() + (size_t) (n_prompt - 1) * n_vocab, n_vocab);
++    std::string text;
++    int n_token_diff = 0;
++    for (int i = 0; i < n_predict; ++i) {
++        n_token_diff += next != ref_tokens[i];
++        char piece[256];
++        const int len = llama_token_to_piece(vocab, next, piece, sizeof(piece), 0, true);
++        if (len > 0) text.append(piece, len);
++        // feed the reference token so every step is compared on the same prefix
++        llama_token fed = ref_tokens[i];
++        if (!run_chain(chain, &fed, 1, n_prompt + i, n_embd, n_vocab, logits)) return 1;
++        compare(ref_logits[i + 1], logits);
++        next = argmax(logits.data(), n_vocab);
++    }
++
++    printf("generated by the chain: %s\n", text.c_str());
++    printf("positions checked: %d, argmax mismatches: %d, generated tokens differing: %d, max |logit diff|: %g\n",
++            n_checked, n_mismatch, n_token_diff, max_diff);
++
++    for (auto & st : chain) free_stage(st);
++    llama_backend_free();
++
++    const bool ok = n_mismatch == 0 && n_token_diff == 0 && max_diff < 1e-3;
++    printf("%s\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}
+diff --git a/include/llama.h b/include/llama.h
+index 428f51f..c84b44e 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -355,6 +355,14 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++
++        // stage execution: load and run only the layers [stage_layer_start, stage_layer_end).
++        // stage_layer_end == 0 disables it (the whole model is used).
++        // a stage that does not start at layer 0 takes hidden states through llama_batch.embd,
++        // a stage that does not end at the last layer returns them through llama_get_embeddings
++        // (un-normalized, the context must be created with embeddings = true).
++        int32_t stage_layer_start;
++        int32_t stage_layer_end;
+     };
+ 
+     struct llama_sampler_seq_config {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0f7d8ab..373b692 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -133,6 +133,7 @@ static llm_attn_mask build_attn_inp_attn_mask(
+ 
+ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+     if (ubatch->token) {
++        GGML_ASSERT(tokens && "this stage does not start at layer 0: it takes hidden states (batch.embd), not tokens");
+         const int64_t n_tokens = ubatch->n_tokens;
+ 
+         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+@@ -266,7 +267,8 @@ bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
+ }
+ 
+ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
+-    if (ubatch->pos && pos) {
++    // pos stays unallocated in a stage (layer range) without attention layers
++    if (ubatch->pos && pos && pos->buffer) {
+         const int64_t n_tokens = ubatch->n_tokens;
+ 
+         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
+@@ -1204,15 +1206,19 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+ }
+ 
+ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
++    // a stage (layer range) may hold only recurrent layers or only attention layers: the inputs of
++    // the missing kind are not part of the graph and stay unallocated
++    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
++        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
++        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+-    // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+-    mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
++        // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
++        mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
++    }
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -2724,6 +2730,21 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
+     return { ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]), cpu_ids };
+ }
+ 
++// hidden states handed over by the previous stage: no token path, so tok_embd is not needed
++ggml_tensor * llm_graph_context::build_inp_embd_stage() const {
++    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
++    cb(inp->embd, "inp_embd", -1);
++    ggml_set_input(inp->embd);
++
++    ggml_tensor * cur = inp->embd;
++    res->t_inp_embd = cur;
++    res->add_input(std::move(inp));
++
++    return cur;
++}
++
+ // input embeddings with optional lora
+ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+     const int64_t n_embd_inp = hparams.n_embd_inp();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 20c43e3..ea34a81 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1263,6 +1263,7 @@ struct llm_graph_context {
+ 
+     // tok_scale: applied to token rows only
+     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
++    ggml_tensor * build_inp_embd_stage() const;
+ 
+     // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
+     // or uploaded from ubatch.embd_state
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 7b73840..6bad6a1 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -537,6 +537,20 @@ struct llama_hparams {
+     // number of effective layers (excludes nextn layers)
+     uint32_t n_layer() const;
+ 
++    // stage execution: only the layers [stage_begin, stage_end) are loaded and run (stage_end == 0: all)
++    uint32_t stage_begin = 0;
++    uint32_t stage_end   = 0;
++
++    uint32_t stage_il_begin() const { return stage_end == 0 ? 0 : stage_begin; }
++    uint32_t stage_il_end()   const { return stage_end == 0 ? n_layer() : stage_end; }
++    // true when this stage embeds tokens itself / applies the final norm and LM head itself
++    bool stage_has_input()  const { return stage_il_begin() == 0; }
++    bool stage_has_output() const { return stage_il_end() == n_layer(); }
++    // trunk layers outside the stage are neither loaded nor given memory; other blocks are unaffected
++    bool stage_has_layer(uint32_t il) const {
++        return il >= n_layer() || (il >= stage_il_begin() && il < stage_il_end());
++    }
++
+     // note that this function uses different SWA parameters from those in the hparams
+     // note: inlined on purpose for performance reasons
+     // TODO: think of a better place for this function
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index dbc91a1..89fa726 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1651,6 +1651,20 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     // per-arch hparams
+     load_arch_hparams(ml);
+ 
++    if (params.stage_layer_end != 0) {
++        if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
++            throw std::runtime_error("stage execution is only implemented for qwen35 and qwen35moe");
++        }
++        if (params.stage_layer_start < 0 || params.stage_layer_start >= params.stage_layer_end ||
++            (uint32_t) params.stage_layer_end > hparams.n_layer()) {
++            throw std::runtime_error(format("invalid stage layer range [%d, %d) for a model with %u layers",
++                    params.stage_layer_start, params.stage_layer_end, hparams.n_layer()));
++        }
++        hparams.stage_begin = params.stage_layer_start;
++        hparams.stage_end   = params.stage_layer_end;
++        LLAMA_LOG_INFO("%s: stage execution, layers [%u, %u) of %u\n", __func__, hparams.stage_begin, hparams.stage_end, hparams.n_layer());
++    }
++
+     pimpl->n_bytes = ml.n_bytes;
+ 
+     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+@@ -2485,6 +2499,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+     if (tn.bid != -1) {
+         // blocks that are not model layers (e.g. the blocks of a head) go with the output
+         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
++
++        // stage execution: the weights of layers outside the stage are never allocated or read
++        if (!hparams.stage_has_layer(tn.bid)) {
++            flags |= llama_model_loader::TENSOR_SKIP;
++        }
+     }
+     return ml.create_tensor(
+         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+@@ -3289,10 +3308,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         // DSA layers keep a K-only MLA cache plus a per-token indexer key cache,
+                         // the KDA layers stay recurrent
+                         filter_attn = [&](uint32_t il) {
+-                            return il < hparams.n_layer() && !hparams.is_recr(il);
++                            return il < hparams.n_layer() && hparams.stage_has_layer(il) && !hparams.is_recr(il);
+                         };
+                         filter_recr = [&](uint32_t il) {
+-                            return il < hparams.n_layer() && hparams.is_recr(il);
++                            return il < hparams.n_layer() && hparams.stage_has_layer(il) && hparams.is_recr(il);
+                         };
+                         filter_idx = [&](uint32_t il) {
+                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+@@ -3309,10 +3328,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         };
+                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                         filter_attn = [&](uint32_t il) {
+-                            return il < hparams.n_layer() && !hparams.is_recr(il);
++                            return il < hparams.n_layer() && hparams.stage_has_layer(il) && !hparams.is_recr(il);
+                         };
+                         filter_recr = [&](uint32_t il) {
+-                            return il < hparams.n_layer() && hparams.is_recr(il);
++                            return il < hparams.n_layer() && hparams.stage_has_layer(il) && hparams.is_recr(il);
+                         };
+ 
+                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+@@ -3547,6 +3566,8 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.stage_layer_start           =*/ 0,
++        /*.stage_layer_end             =*/ 0,
+     };
+ 
+     return result;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 736e23f..1fab52e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -37,18 +37,24 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
++    // stage execution: the token embeddings belong to the first stage, the final norm and LM head to the last
++    const std::string output_name = tn(LLM_TENSOR_OUTPUT, "weight").str();
++    const bool output_is_tied = ml.get_tensor_meta(output_name.c_str()) == nullptr;
++    const bool need_tok_embd  = hparams.stage_has_input() || (hparams.stage_has_output() && output_is_tied);
++    const int  out_flags      = hparams.stage_has_output() ? 0 : TENSOR_SKIP;
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : TENSOR_SKIP);
+ 
+     // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, out_flags);
++    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | out_flags);
+ 
+     // optional projection of the embeddings output
+     cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
+     cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
+ 
+     // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
++    if (output == NULL && hparams.stage_has_output()) {
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+     }
+ 
+@@ -143,7 +149,11 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
+-    inpL = build_inp_embd(model.tok_embd);
++    // stage execution: run only the layers [il_begin, il_end)
++    const int il_begin = hparams.stage_il_begin();
++    const int il_end   = hparams.stage_il_end();
++
++    inpL = hparams.stage_has_input() ? build_inp_embd(model.tok_embd) : build_inp_embd_stage();
+ 
+     cb(inpL, "model.input_embed", -1);
+ 
+@@ -153,7 +163,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_begin; il < il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -172,7 +182,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+         }
+ 
+-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++        if (il == il_end - 1 && crop_before_nextn(inp_out_ids)) {
+             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -204,6 +214,14 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+     }
+     cur = inpL;
+ 
++    if (!hparams.stage_has_output()) {
++        // hand the raw residual stream to the next stage: no final norm, no LM head
++        cb(cur, "stage_out", -1);
++        res->t_embd = cur;
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index c4da3e2..8d20ebc 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -40,14 +40,20 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
++    // stage execution: the token embeddings belong to the first stage, the final norm and LM head to the last
++    const std::string output_name = tn(LLM_TENSOR_OUTPUT, "weight").str();
++    const bool output_is_tied = ml.get_tensor_meta(output_name.c_str()) == nullptr;
++    const bool need_tok_embd  = hparams.stage_has_input() || (hparams.stage_has_output() && output_is_tied);
++    const int  out_flags      = hparams.stage_has_output() ? 0 : TENSOR_SKIP;
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, need_tok_embd ? 0 : TENSOR_SKIP);
+ 
+     // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, out_flags);
++    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | out_flags);
+ 
+     // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
++    if (output == NULL && hparams.stage_has_output()) {
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+     }
+ 
+@@ -162,7 +168,11 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
+-    inpL = build_inp_embd(model.tok_embd);
++    // stage execution: run only the layers [il_begin, il_end)
++    const int il_begin = hparams.stage_il_begin();
++    const int il_end   = hparams.stage_il_end();
++
++    inpL = hparams.stage_has_input() ? build_inp_embd(model.tok_embd) : build_inp_embd_stage();
+ 
+     cb(inpL, "model.input_embed", -1);
+ 
+@@ -172,7 +182,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_begin; il < il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -191,7 +201,7 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+         }
+ 
+-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++        if (il == il_end - 1 && crop_before_nextn(inp_out_ids)) {
+             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -223,6 +233,14 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+     }
+     cur = inpL;
+ 
++    if (!hparams.stage_has_output()) {
++        // hand the raw residual stream to the next stage: no final norm, no LM head
++        cb(cur, "stage_out", -1);
++        res->t_embd = cur;
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     // post-norm hidden state feeds both the LM head and the MTP seed below
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
