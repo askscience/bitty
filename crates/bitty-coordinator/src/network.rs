@@ -216,7 +216,14 @@ impl NetworkCoordinator {
                 };
                 let assignments = match self.current_assignments().await {
                     Ok(assignments) if !assignments.is_empty() => assignments,
-                    _ => continue,
+                    Ok(_) => continue,
+                    Err(err) => {
+                        println!(
+                            "no plan for topology_epoch={seen}: {}; waiting for more machines",
+                            err.message()
+                        );
+                        continue;
+                    }
                 };
                 println!(
                     "preparing {} worker(s) for topology_epoch={seen}: {}",
@@ -906,7 +913,9 @@ impl CoordinatorService for NetworkCoordinator {
             .retain(|key, _| !key.starts_with(&cached));
         self.registry.lock().await.register(profile);
         let topology_epoch = self.advance_epoch().await;
-        let assignments = self.current_assignments().await?;
+        // A network that cannot hold the model yet still takes the node: the next one that
+        // joins may be what was missing.
+        let assignments = self.current_assignments().await.unwrap_or_default();
 
         println!(
             "registered worker {node_id}; active_nodes={} assignments={}",

@@ -457,7 +457,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
         resolve_scheduler_target(&join, iroh_node.as_ref(), &cluster_token).await?
     } else {
         let leader = listen_as_connect_endpoint(&config.listen);
-        let mut coordinator = NetworkCoordinator::new(demo_layers(config.layers))
+        let mut coordinator = NetworkCoordinator::new(leader_layers(&model_file, config.layers))
             .with_model_path(&model_file)
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         if let Some(iroh_node) = &iroh_node {
@@ -3197,6 +3197,37 @@ fn request_id() -> String {
     format!("bitty-{nanos:x}")
 }
 
+/// The layers the leader plans with, at the size they have in the model file. The planner
+/// shares them by the memory of each machine, so the sizes have to be the real ones.
+fn leader_layers(model_file: &Path, fallback_count: u32) -> Vec<LayerMetadata> {
+    match bitty_model::ModelMetadata::from_gguf_path(model_file) {
+        Ok(metadata) => {
+            let layers = metadata.layer_metadata();
+            if !layers.is_empty() && layers.iter().all(|layer| layer.weight_bytes > 0) {
+                let bytes: u64 = layers.iter().map(|layer| layer.weight_bytes).sum();
+                println!(
+                    "planning with {} layers of about {} MB each",
+                    layers.len(),
+                    bytes / layers.len() as u64 / (1024 * 1024)
+                );
+                return layers;
+            }
+            eprintln!(
+                "{} does not hold every layer: the planner does not know their size and will not limit by memory",
+                model_file.display()
+            );
+            demo_layers(metadata.layer_count.max(1))
+        }
+        Err(err) => {
+            eprintln!(
+                "could not read the layers of {}: {err}; the planner will not limit by memory",
+                model_file.display()
+            );
+            demo_layers(fallback_count)
+        }
+    }
+}
+
 fn demo_layers(count: u32) -> Vec<LayerMetadata> {
     (0..count)
         .map(|layer_id| LayerMetadata {
@@ -3267,6 +3298,26 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs against a real model when `BITTY_TEST_MODEL` points at one.
+    #[test]
+    fn the_leader_plans_with_the_real_size_of_the_layers() {
+        let missing = leader_layers(Path::new("/nonexistent/model.gguf"), 7);
+        assert_eq!(missing.len(), 7);
+
+        let Ok(model) = std::env::var("BITTY_TEST_MODEL") else {
+            return;
+        };
+        let layers = leader_layers(Path::new(&model), 1);
+        assert!(layers.len() > 1);
+        assert!(layers.iter().all(|layer| layer.weight_bytes > 1024 * 1024));
+        eprintln!(
+            "{} layers, first {} MB, last {} MB",
+            layers.len(),
+            layers[0].weight_bytes >> 20,
+            layers[layers.len() - 1].weight_bytes >> 20
+        );
+    }
 
     #[test]
     fn a_stopped_worker_is_remembered() {
