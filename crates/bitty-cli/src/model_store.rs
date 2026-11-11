@@ -1,4 +1,4 @@
-use crate::settings::{ensure_parent, parse_assignment, unquote, BittySettings};
+use crate::settings::{ensure_parent, parse_assignment, BittySettings};
 use std::path::{Path, PathBuf};
 
 const BUILTIN_REGISTRY: &str = include_str!("../../../models/registry.toml");
@@ -585,7 +585,7 @@ pub fn parse_registry(contents: &str) -> Vec<ModelSpec> {
             continue;
         }
         if let Some((key, value)) = parse_assignment(line) {
-            set_spec_value(&mut current, key, value);
+            set_spec_value(&mut current, key, &value);
         }
     }
     if in_model {
@@ -598,7 +598,7 @@ pub fn parse_manifest(contents: &str) -> ModelSpec {
     let mut spec = ModelSpec::default();
     for line in contents.lines() {
         if let Some((key, value)) = parse_assignment(line) {
-            set_spec_value(&mut spec, key, value);
+            set_spec_value(&mut spec, key, &value);
         }
     }
     spec
@@ -618,7 +618,7 @@ fn set_spec_value(spec: &mut ModelSpec, key: &str, value: &str) {
         "temperature" => spec.temperature = value.parse().unwrap_or(0.7),
         "num_predict" => spec.num_predict = value.parse().unwrap_or(128),
         "num_ctx" => spec.num_ctx = value.parse().unwrap_or(2048),
-        "path" => spec.path = Some(PathBuf::from(unquote(value))),
+        "path" => spec.path = Some(PathBuf::from(value)),
         "draft_filename" => spec.draft_filename = value.into(),
         "draft_url" => spec.draft_url = value.into(),
         _ => {}

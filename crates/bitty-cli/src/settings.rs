@@ -25,7 +25,7 @@ impl BittySettings {
                 let Some((key, value)) = parse_assignment(line) else {
                     continue;
                 };
-                settings.set_value(key, value);
+                settings.set_value(key, &value);
             }
         }
         settings
@@ -120,7 +120,7 @@ impl BittySettings {
     }
 }
 
-pub fn parse_assignment(line: &str) -> Option<(&str, &str)> {
+pub fn parse_assignment(line: &str) -> Option<(&str, String)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
         return None;
@@ -129,11 +129,36 @@ pub fn parse_assignment(line: &str) -> Option<(&str, &str)> {
     Some((key.trim(), unquote(value.trim())))
 }
 
-pub fn unquote(value: &str) -> &str {
-    value
+/// The value as it was before `escape` and the quotes around it.
+///
+/// Builds before this one took the quotes away and left the escapes, so every save doubled
+/// the backslashes of a Windows path until the path was too long to start a program with.
+/// Runs of backslashes left by that are brought back to one; the two that open a network
+/// path stay.
+pub fn unquote(value: &str) -> String {
+    let Some(inner) = value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
+    else {
+        return value.to_string();
+    };
+    let mut plain = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => plain.push(chars.next().unwrap_or('\\')),
+            other => plain.push(other),
+        }
+    }
+    let network_path = plain.starts_with("\\\\");
+    let mut repaired = String::with_capacity(plain.len());
+    for ch in plain.chars() {
+        if ch == '\\' && repaired.ends_with('\\') && !(network_path && repaired.len() == 1) {
+            continue;
+        }
+        repaired.push(ch);
+    }
+    repaired
 }
 
 fn parse_bool(value: &str) -> bool {
@@ -160,5 +185,31 @@ mod tests {
         let mut settings = BittySettings::defaults(PathBuf::from("/tmp/bitty"));
         assert!(settings.set_value("default_temperature", "0.2"));
         assert_eq!(settings.get("default_temperature").as_deref(), Some("0.2"));
+    }
+
+    #[test]
+    fn a_windows_path_is_the_same_after_many_saves() {
+        let path = r"C:\Users\utente microsoft\.bitty";
+        let mut settings = BittySettings::defaults(PathBuf::from(path));
+        for _ in 0..5 {
+            let mut read = BittySettings::defaults(PathBuf::from("elsewhere"));
+            for line in settings.to_toml().lines() {
+                let (key, value) = parse_assignment(line).unwrap();
+                read.set_value(key, &value);
+            }
+            settings = read;
+        }
+        assert_eq!(settings.data_dir, PathBuf::from(path));
+    }
+
+    #[test]
+    fn a_path_doubled_by_an_older_build_is_repaired() {
+        assert_eq!(
+            unquote(r#""C:\\\\\\\\Users\\\\\\\\me\\\\\\\\.bitty""#),
+            r"C:\Users\me\.bitty"
+        );
+        assert_eq!(unquote(r#""\\\\server\\share""#), r"\\server\share");
+        assert_eq!(unquote(r#""say \"hi\"""#), r#"say "hi""#);
+        assert_eq!(unquote("12"), "12");
     }
 }

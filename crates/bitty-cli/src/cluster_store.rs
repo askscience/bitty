@@ -21,7 +21,7 @@ impl ClusterStore {
                 };
                 store
                     .aliases
-                    .insert(name.trim().to_string(), unquote(invite.trim()).to_string());
+                    .insert(name.trim().to_string(), crate::settings::unquote(invite.trim()));
             }
         }
         store
@@ -120,13 +120,6 @@ fn short_hash(value: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{:08x}", (hash & 0xffff_ffff) as u32)
-}
-
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
 }
 
 fn escape(value: &str) -> String {

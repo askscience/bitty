@@ -34,6 +34,12 @@ The first time a node starts, Windows Firewall may ask whether `bitty.exe` may
 accept connections. Nodes that reach each other through iroh work without it,
 because every connection is opened from the inside.
 
+Builds up to `747bd74` doubled the backslashes of the paths in `config.toml` and
+`runtime\runtime.toml` at every save. After enough restarts the node no longer
+started, with `Os { code: 206 ... }` (file name too long). Later builds read the
+doubled paths back as they should be, so the updater alone repairs such a
+machine.
+
 ## What the updater does
 
 Every minute, and when the machine starts (Linux) or the user logs in

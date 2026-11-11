@@ -3155,9 +3155,9 @@ fn read_state_file(path: &Path) -> Option<RuntimeState> {
         };
         match key {
             "pid" => state.pid = value.parse().unwrap_or_default(),
-            "mode" => state.mode = value.into(),
-            "model" => state.model = value.into(),
-            "target" => state.target = value.into(),
+            "mode" => state.mode = value,
+            "model" => state.model = value,
+            "target" => state.target = value,
             _ => {}
         }
     }
