@@ -68,6 +68,8 @@ pub struct NetworkCoordinator {
     holdings: Arc<Mutex<HashMap<NodeId, (String, Instant)>>>,
     /// What the leader asks of its nodes, given out one at a time with the heartbeats.
     orders: Arc<Mutex<HashMap<NodeId, Vec<String>>>>,
+    /// The builds each node was already told to leave, so that it is told once.
+    update_asked: Arc<Mutex<HashMap<NodeId, String>>>,
     /// Lines `ORDER NODE` a person writes for the leader, taken and removed at a heartbeat.
     orders_file: Option<PathBuf>,
     /// Where the reports of the nodes are written, one file for each node.
@@ -75,7 +77,20 @@ pub struct NetworkCoordinator {
 }
 
 /// The orders a node understands.
-pub const NODE_ORDERS: [&str; 2] = ["logs", "restart"];
+pub const NODE_ORDERS: [&str; 3] = ["logs", "restart", "update"];
+
+/// The build of this program, when it is a released one.
+const OWN_BUILD: Option<&str> = option_env!("BITTY_GIT_SHA");
+
+/// Whether a node with this build is to be told to update: it runs a released build that is
+/// not the one of the leader. Its updater decides; when the node is the newer one nothing
+/// happens.
+fn runs_another_build(own: Option<&str>, build: &str) -> bool {
+    match own {
+        Some(own) => !build.is_empty() && build != "local" && build != own,
+        None => false,
+    }
+}
 
 /// How often the progress of a download on a node is logged.
 const HOLDINGS_LOG_EVERY: Duration = Duration::from_secs(300);
@@ -265,6 +280,7 @@ impl NetworkCoordinator {
             model_name: None,
             holdings: Arc::default(),
             orders: Arc::default(),
+            update_asked: Arc::default(),
             orders_file: None,
             reports_dir: None,
         }
@@ -1436,7 +1452,23 @@ impl CoordinatorService for NetworkCoordinator {
             .lock()
             .await
             .retain(|key, _| !key.starts_with(&cached));
+        let build = profile.build.clone();
         self.registry.lock().await.register(profile);
+        if runs_another_build(OWN_BUILD, &build) {
+            let first = self
+                .update_asked
+                .lock()
+                .await
+                .insert(node_id.clone(), build.clone())
+                .as_deref()
+                != Some(build.as_str());
+            if first {
+                println!(
+                    "{node_id} runs build {build}, not the one of the leader: asking it to update"
+                );
+                self.order(&node_id, "update").await;
+            }
+        }
         let topology_epoch = self.advance_epoch().await;
         // A network that cannot hold the model yet still takes the node: the next one that
         // joins may be what was missing.
@@ -1557,6 +1589,20 @@ impl CoordinatorService for NetworkCoordinator {
             model_path,
             profiles: profiles.iter().map(Into::into).collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::runs_another_build;
+
+    #[test]
+    fn only_a_released_build_that_differs_is_told_to_update() {
+        assert!(runs_another_build(Some("aaa"), "bbb"));
+        assert!(!runs_another_build(Some("aaa"), "aaa"));
+        assert!(!runs_another_build(Some("aaa"), ""));
+        assert!(!runs_another_build(Some("aaa"), "local"));
+        assert!(!runs_another_build(None, "bbb"));
     }
 }
 

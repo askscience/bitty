@@ -54,11 +54,11 @@ fn processor_features() -> String {
 pub enum StageProcessError {
     #[error("cannot start the stage engine {path}: {source}")]
     Spawn { path: PathBuf, source: io::Error },
-    #[error("the stage engine exited or closed its pipe: {0}")]
+    #[error("the stage engine could not be reached: {0}")]
     Io(#[from] io::Error),
     /// The engine went away before it said its weights were loaded. The text says how it
     /// ended, what this processor can do and the last lines the engine wrote.
-    #[error("the stage engine exited or closed its pipe while loading: {0}")]
+    #[error("the stage engine exited or closed its pipe: {0}")]
     Died(String),
     #[error("the stage engine sent an invalid handshake")]
     BadHandshake,
@@ -133,6 +133,43 @@ pub struct StageProcess {
     stdin: ChildStdin,
     stdout: ChildStdout,
     info: StageInfo,
+    /// The end of what the engine wrote for people, for the error when it dies.
+    last_output: Arc<Mutex<Vec<u8>>>,
+}
+
+/// The error for an engine whose pipe closed: how it ended, what the processor has and the
+/// last lines it wrote. Waits a moment for the exit status and stops an engine that has none.
+fn died(child: &mut Child, last_output: &Mutex<Vec<u8>>, err: &io::Error) -> StageProcessError {
+    let mut status = None;
+    for _ in 0..20 {
+        status = child.try_wait().ok().flatten();
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let ended = match status {
+        Some(status) => status.to_string(),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("still running, stopped ({err})")
+        }
+    };
+    // the thread that keeps the output ends with the pipe: give it the moment it needs
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let kept = last_output.lock().unwrap_or_else(|lock| lock.into_inner());
+    let output = String::from_utf8_lossy(&kept)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    StageProcessError::Died(format!(
+        "{ended}; processor: {}; last output: {}",
+        processor_features(),
+        if output.is_empty() { "none" } else { &output }
+    ))
 }
 
 impl StageProcess {
@@ -205,7 +242,7 @@ impl StageProcess {
         // The last of what the engine writes is kept: when it dies it is the only account of
         // why. `BITTY_STAGE_LOG` also shows all of it as it comes.
         let last_output = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let reader = child.stderr.take().map(|mut stderr| {
+        let _reader = child.stderr.take().map(|mut stderr| {
             let last_output = last_output.clone();
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 4096];
@@ -226,37 +263,7 @@ impl StageProcess {
 
         let mut hello = [0u8; 28];
         if let Err(err) = stdout.read_exact(&mut hello) {
-            let mut status = None;
-            for _ in 0..20 {
-                status = child.try_wait().ok().flatten();
-                if status.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            let ended = match status {
-                Some(status) => status.to_string(),
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    format!("still running, stopped ({err})")
-                }
-            };
-            if let Some(reader) = reader {
-                let _ = reader.join();
-            }
-            let kept = last_output.lock().unwrap_or_else(|lock| lock.into_inner());
-            let output = String::from_utf8_lossy(&kept)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            return Err(StageProcessError::Died(format!(
-                "{ended}; processor: {}; last output: {}",
-                processor_features(),
-                if output.is_empty() { "none" } else { &output }
-            )));
+            return Err(died(&mut child, &last_output, &err));
         }
         let word = |index: usize| {
             u32::from_le_bytes(hello[4 + index * 4..8 + index * 4].try_into().unwrap())
@@ -283,6 +290,7 @@ impl StageProcess {
             stdin,
             stdout,
             info,
+            last_output,
         })
     }
 
@@ -438,12 +446,16 @@ impl StageProcess {
         head[12..16].copy_from_slice(&position.to_le_bytes());
         head[16..20].copy_from_slice(&tokens.to_le_bytes());
         head[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        self.stdin.write_all(&head)?;
-        self.stdin.write_all(payload)?;
-        self.stdin.flush()?;
-
         let mut reply = [0u8; 16];
-        self.stdout.read_exact(&mut reply)?;
+        let sent = self
+            .stdin
+            .write_all(&head)
+            .and_then(|_| self.stdin.write_all(payload))
+            .and_then(|_| self.stdin.flush())
+            .and_then(|_| self.stdout.read_exact(&mut reply));
+        if let Err(err) = sent {
+            return Err(died(&mut self.child, &self.last_output, &err));
+        }
         let word =
             |index: usize| u32::from_le_bytes(reply[index * 4..index * 4 + 4].try_into().unwrap());
         let (status, kind, rows, len) = (word(0), word(1), word(2), word(3));
@@ -451,7 +463,9 @@ impl StageProcess {
             return Err(StageProcessError::BadReply);
         }
         let mut bytes = vec![0u8; len as usize];
-        self.stdout.read_exact(&mut bytes)?;
+        if let Err(err) = self.stdout.read_exact(&mut bytes) {
+            return Err(died(&mut self.child, &self.last_output, &err));
+        }
         if status != 0 {
             return Err(StageProcessError::Engine(
                 String::from_utf8_lossy(&bytes).into_owned(),

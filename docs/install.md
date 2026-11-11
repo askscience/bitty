@@ -171,6 +171,7 @@ On the leader:
 ```
 bitty ask bitty-1234abcd logs
 bitty ask bitty-1234abcd restart
+bitty ask bitty-1234abcd update
 ```
 
 `logs`: with its next heartbeat the node sends its build, the last lines of its
@@ -182,7 +183,12 @@ could not load its layers.
 `restart`: a node that runs in the background ends, and its updater starts it
 again within a minute. A node somebody started in a terminal stays.
 
-When the engine of a node dies while it loads, the error the leader logs says
+`update`: the node runs the updater of its installation at once, so a machine
+whose timer or scheduled task does not work is still kept current. The leader
+gives this order by itself to a node that registers with a released build
+other than its own.
+
+When the engine of a node dies, the error the leader logs says
 how it ended (exit code or signal), what the processor of that machine has
 (`avx`, `avx2`, `fma`, `f16c`) and the last lines the engine wrote.
 

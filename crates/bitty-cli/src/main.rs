@@ -1324,6 +1324,67 @@ fn restart_for_the_leader(config: &NodeConfig) -> Option<String> {
     }
 }
 
+/// Where the installer put the updater of this installation, and how it is run.
+fn updater_command() -> Option<std::process::Command> {
+    let bin = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    if cfg!(windows) {
+        let script = bin.join("bitty-update.ps1");
+        if !script.is_file() {
+            return None;
+        }
+        let mut command = std::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .arg("-Update");
+        Some(command)
+    } else {
+        let script = bin.join("bitty-update");
+        if !script.is_file() {
+            return None;
+        }
+        let mut command = std::process::Command::new(script);
+        command.arg("--update");
+        Some(command)
+    }
+}
+
+/// The leader asked this node to update: the updater of the installation runs now, apart
+/// from this process, which it stops when there is a new build.
+fn run_updater_for_the_leader() {
+    let Some(mut command) = updater_command() else {
+        eprintln!("the leader asked this node to update: it was not installed with an updater");
+        return;
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: it must outlive this node, unseen
+        command.creation_flags(0x0000_0200 | 0x0800_0000);
+    }
+    match command.spawn() {
+        Ok(_) => eprintln!("the leader asked this node to update: the updater runs"),
+        Err(err) => {
+            eprintln!("the leader asked this node to update: the updater did not start: {err}")
+        }
+    }
+}
+
 /// The most a report for the leader may be.
 const NODE_REPORT_BYTES: usize = 24 * 1024;
 
@@ -1611,6 +1672,7 @@ async fn stay_registered(
                     match response.order.as_str() {
                         "" => {}
                         "logs" => report = node_report(config),
+                        "update" => run_updater_for_the_leader(),
                         "restart" => {
                             if let Some(reason) = restart_for_the_leader(config) {
                                 return Err(reason.into());
@@ -2203,7 +2265,7 @@ fn parse_start(args: &mut impl Iterator<Item = String>) -> Result<StartConfig, S
 }
 
 fn parse_ask(args: &mut impl Iterator<Item = String>) -> Result<AskConfig, String> {
-    let usage = "usage: bitty ask NODE logs|restart";
+    let usage = "usage: bitty ask NODE logs|restart|update";
     let mut words = Vec::new();
     let mut data_dir = None;
     while let Some(arg) = args.next() {
@@ -2241,6 +2303,10 @@ fn run_ask(config: AskConfig) -> Result<(), Box<dyn std::error::Error>> {
                 .join("logs")
                 .join(format!("node-{}.log", config.node))
                 .display()
+        ),
+        "update" => println!(
+            "asked {} to update: its updater runs now and starts the node again on a new build",
+            config.node
         ),
         _ => println!(
             "asked {} to start again: its updater brings it back within a minute",
@@ -3571,7 +3637,7 @@ fn print_help() {
     println!("  bitty cp SOURCE DEST");
     println!("  bitty settings get|set|path");
     println!("  bitty logs [--lines N|--path|--clear]");
-    println!("  bitty ask NODE logs|restart");
+    println!("  bitty ask NODE logs|restart|update");
     println!("  bitty invite [--name NAME] [--replace]");
     println!("  bitty join INVITE_OR_NAME [--name NAME] [--model PATH]");
     println!("  bitty use NAME_OR_INVITE [--name NAME]");
