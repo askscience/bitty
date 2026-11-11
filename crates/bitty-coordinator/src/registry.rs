@@ -80,6 +80,16 @@ impl Registry {
         }
     }
 
+    /// Lowers the free memory of a node, never raises it.
+    pub fn lower_free_memory(&mut self, node_id: &NodeId, memory_mb: u64) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        let known = node.profile.available_ram_mb;
+        if known == 0 || memory_mb < known {
+            node.profile.available_ram_mb = memory_mb.clamp(1, node.profile.ram_mb.max(1));
+        }
+    }
     pub fn profiles(&self) -> Vec<HardwareProfile> {
         self.nodes
             .values()
@@ -163,6 +173,18 @@ mod tests {
             layer_eligible: true,
             max_layers: 0,
         }
+    }
+
+    #[test]
+    fn a_dead_engine_only_lowers_the_free_memory() {
+        let mut registry = Registry::default();
+        registry.register(profile(16384, 11000));
+        let id = NodeId::new("node-a");
+
+        registry.lower_free_memory(&id, 9000);
+        assert_eq!(registry.profile(&id).unwrap().available_ram_mb, 9000);
+        registry.lower_free_memory(&id, 10000);
+        assert_eq!(registry.profile(&id).unwrap().available_ram_mb, 9000);
     }
 
     #[test]

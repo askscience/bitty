@@ -239,36 +239,43 @@ const FREE_MEMORY_FRACTION: f64 = 0.9;
 const FREE_MEMORY_STRETCH: f64 = 1.25;
 
 impl HardwareProfile {
-    /// A node with a graphics card loads its layers into the card.
+    /// A node whose engine works on a graphics card. Its layers are shared between the card
+    /// and the memory of the machine.
     pub fn loads_into_gpu(&self) -> bool {
         self.gpu_tflops > 0.0 && self.vram_mb > 0
     }
 
-    /// The most a stage may take on this node: past it the node swaps or stalls. The leader
-    /// plans inside it and the node refuses a stage that is larger, with the same rule.
-    pub fn hard_memory_bytes(&self, reserve_fraction: f64) -> u64 {
-        let whole = if self.loads_into_gpu() {
-            self.vram_mb.saturating_mul(1024 * 1024)
-        } else {
-            self.memory_bytes()
-        };
-        let hard = (whole as f64 * (1.0 - reserve_fraction)).max(0.0) as u64;
-        if self.loads_into_gpu() || self.available_ram_mb == 0 {
+    fn ram_limit_bytes(&self, reserve_fraction: f64, free_fraction: f64) -> u64 {
+        let hard = (self.memory_bytes() as f64 * (1.0 - reserve_fraction)).max(0.0) as u64;
+        if self.available_ram_mb == 0 {
             return hard;
         }
         let free = self.available_ram_mb.saturating_mul(1024 * 1024) as f64;
-        hard.min((free * FREE_MEMORY_STRETCH) as u64)
+        hard.min((free * free_fraction) as u64)
+    }
+
+    fn vram_limit_bytes(&self, reserve_fraction: f64) -> u64 {
+        if !self.loads_into_gpu() {
+            return 0;
+        }
+        let whole = self.vram_mb.saturating_mul(1024 * 1024);
+        (whole as f64 * (1.0 - reserve_fraction)).max(0.0) as u64
+    }
+
+    /// The most a stage may take on this node: past it the node swaps or stalls. The leader
+    /// plans inside it and the node refuses a stage that is larger, with the same rule. A card
+    /// never lowers it: the layers that do not fit in the card stay in the memory of the
+    /// machine.
+    pub fn hard_memory_bytes(&self, reserve_fraction: f64) -> u64 {
+        self.ram_limit_bytes(reserve_fraction, FREE_MEMORY_STRETCH)
+            .max(self.vram_limit_bytes(reserve_fraction))
     }
 
     /// What a stage may take without the node noticing: a share of the memory that was free
     /// when the node started. A node that does not say how much it has free gets the hard limit.
     pub fn free_memory_bytes(&self, reserve_fraction: f64) -> u64 {
-        let hard = self.hard_memory_bytes(reserve_fraction);
-        if self.loads_into_gpu() || self.available_ram_mb == 0 {
-            return hard;
-        }
-        let free = self.available_ram_mb.saturating_mul(1024 * 1024) as f64;
-        hard.min((free * FREE_MEMORY_FRACTION) as u64)
+        self.ram_limit_bytes(reserve_fraction, FREE_MEMORY_FRACTION)
+            .max(self.vram_limit_bytes(reserve_fraction))
     }
 
     /// The bytes of layers the disk of this node can hold. `None`: no limit known.
@@ -875,6 +882,54 @@ fn checksum(payload: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn machine(
+        ram_mb: u64,
+        available_ram_mb: u64,
+        vram_mb: u64,
+        gpu_tflops: f64,
+    ) -> HardwareProfile {
+        HardwareProfile {
+            node_id: NodeId::new("node"),
+            cpu_tflops: 1.0,
+            gpu_tflops,
+            memory_gb: ram_mb as f64 / 1024.0,
+            memory_bandwidth_gbps: 20.0,
+            disk_bandwidth_mbps: 500.0,
+            network_rtt_ms: 10.0,
+            uplink_mbps: 100.0,
+            os: "linux".into(),
+            tier: NodeTier::D,
+            ram_mb,
+            available_ram_mb,
+            free_disk_mb: 0,
+            build: String::new(),
+            vram_mb,
+            architecture: "x86_64".into(),
+            gpus: Vec::new(),
+            os_reclaim_score: 0.0,
+            worker_endpoint: String::new(),
+            model_path: String::new(),
+            backend_type: "cpu".into(),
+            layer_eligible: true,
+            max_layers: u32::MAX,
+        }
+    }
+
+    #[test]
+    fn a_small_card_does_not_lower_what_a_machine_can_take() {
+        const MB: u64 = 1024 * 1024;
+        // 32 GB of memory, 24 GB free, a card of 4 GB the engine does not use
+        let idle_card = machine(32_000, 24_000, 4096, 0.0);
+        assert_eq!(idle_card.free_memory_bytes(0.15), 21_600 * MB);
+        // the same machine with layers on the card: the rest still goes to its memory
+        let used_card = machine(32_000, 24_000, 4096, 2.0);
+        assert_eq!(used_card.free_memory_bytes(0.15), 21_600 * MB);
+        assert_eq!(used_card.hard_memory_bytes(0.15), 27_200 * MB);
+        // a large card on a machine with little memory raises the limit
+        let large_card = machine(8_000, 4_000, 24_000, 12.0);
+        assert_eq!(large_card.hard_memory_bytes(0.15), 20_400 * MB);
+    }
 
     #[test]
     fn activation_checksum_detects_corruption() {

@@ -472,6 +472,21 @@ impl NetworkCoordinator {
                         .lock()
                         .await
                         .note_free(&manifest.node_id, memory_mb, disk_mb);
+                } else if err.message().contains("stage engine exited") {
+                    // An engine that dies while it loads most often ran out of memory, and
+                    // the node cannot say so. The leader counts the node as able to take
+                    // three quarters of what it was given, so the next plan asks less of it.
+                    let lowered_mb = manifest.byte_len / (1024 * 1024) * 3 / 4;
+                    println!(
+                        "the engine of worker {} died loading layers {}..{}: planning it with {lowered_mb} MB free",
+                        manifest.node_id.0,
+                        manifest.range.start_layer,
+                        manifest.range.end_layer_exclusive,
+                    );
+                    self.registry
+                        .lock()
+                        .await
+                        .lower_free_memory(&manifest.node_id, lowered_mb);
                 }
             }
             loaded.map_err(|err| {
@@ -544,11 +559,17 @@ impl NetworkCoordinator {
                         .any(|(node, _, _)| node == &assignment.node_id)
                 })
             });
-            if missing.is_empty() && no_new_node {
-                if let Ok(kept) = halda.keep(&plan.ranges, &profiles, &self.layers) {
-                    return Ok(kept);
+            let dropped = if !missing.is_empty() {
+                format!("{} did not come back", missing.join(", "))
+            } else if !no_new_node {
+                "a machine outside it can take layers now".to_string()
+            } else {
+                match halda.keep(&plan.ranges, &profiles, &self.layers) {
+                    Ok(kept) => return Ok(kept),
+                    Err(err) => format!("it no longer fits its machines: {err}"),
                 }
-            }
+            };
+            println!("the kept plan is dropped: {dropped}");
         }
 
         let assignments = fresh.map_err(|err| Status::failed_precondition(err.to_string()))?;

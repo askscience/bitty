@@ -115,7 +115,15 @@ The node has the last word. Before it loads its layers it looks at the memory
 free at that moment, and it refuses layers that are past its limit. The leader
 then plans again with the number the node gave. The same holds for the disk:
 a node first removes the layer files of an older plan, and when the new ones
-still do not fit it says how much room it has.
+still do not fit it says how much room it has. An engine that dies while it
+loads its layers is taken as the same answer without a number: the leader
+plans that machine again with three quarters of what it was given.
+
+The limits are those of the memory of the machine, also when it has a graphics
+card. The engine puts on the card only the layers `BITTY_GPU_LAYERS` names,
+and without that setting the card is not counted at all, neither for speed nor
+for room. With it, a card larger than the memory of the machine raises the
+limit and a smaller one changes nothing.
 
 A download of layers that is cut, by a restart, an update or a line that
 drops, goes on from where it was the next time.
@@ -130,7 +138,8 @@ every range that moves is a download of gigabytes. After a restart of the
 leader, or when a machine drops out, the leader waits 10 minutes for the
 missing machines of the plan before it plans without them
 (`BITTY_PLAN_WAIT_SECS`); an update restarts a node in far less. Requests in
-that time are answered with what the leader is waiting for.
+that time are answered with what the leader is waiting for. When the leader
+drops a plan it writes why in its log (`the kept plan is dropped: ...`).
 
 The leader names the model. A node that registers is told the model of the
 leader, by its name in the registry or by the URL of the GGUF. A background node

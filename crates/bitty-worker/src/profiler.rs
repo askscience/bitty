@@ -45,10 +45,22 @@ impl HardwareProfiler {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| gpus.iter().map(|gpu| gpu.vram_mb).max().unwrap_or(0));
+        // The engine loads into the card only the layers `BITTY_GPU_LAYERS` names. Without it
+        // the card does no work and holds nothing, so the node is planned as a CPU node.
+        let engine_uses_gpu = std::env::var("BITTY_GPU_LAYERS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .is_some_and(|layers| layers > 0);
         let gpu_tflops = std::env::var("BITTY_GPU_TFLOPS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| estimate_gpu_tflops(&gpus, vram_mb));
+            .unwrap_or_else(|| {
+                if engine_uses_gpu {
+                    estimate_gpu_tflops(&gpus, vram_mb)
+                } else {
+                    0.0
+                }
+            });
         let tier = tier_for(cpu_count, ram_mb, gpu_tflops, vram_mb);
         let backend_type = std::env::var("BITTY_BACKEND")
             .ok()
