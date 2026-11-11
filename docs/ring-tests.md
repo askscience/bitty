@@ -58,3 +58,32 @@ A server with 1 vCPU and 2 GB cannot hold a layer of the 35B model. It joins
 only in the 0.8B runs, to see what a slow far machine costs in the ring. It
 joins after the three machines have their numbers, because a new node changes
 the plan.
+
+## Measured on 2026-11-11: two machines
+
+Leader 0..36, office PC 36..40, joined over iroh. Prompt "Explain in a few
+sentences how a steam engine works.", `--seed 7 --max-tokens 80`, 68 tokens
+come out. Median of three runs, milliseconds per token after the first pass.
+
+| Run | Passes | Draft tokens kept | Total | Leader 0..36 | Office PC 36..40 | Draft and the rest |
+| --- | --- | --- | --- | --- | --- | --- |
+| plain | 68 | none | 368 | 265 | 97 | 6 |
+| draft of 2 | 31 | 37 of 60 | 401 | 253 | 60 | 88 |
+| draft of 4 | 25 | 43 of 93 | 503 | 298 | 75 | 130 |
+| draft of 8 | 25 | 43 of 93 | 490 | 298 | 63 | 129 |
+
+What it says:
+
+- The ring of two is as fast as the leader alone (about 380 ms per token with
+  the whole model). A layer on the office PC costs about 25 ms with the
+  network, against 7 ms on the leader: that machine is there for the memory.
+- The draft does not pay here. It halves the passes, but a pass that carries
+  three tokens costs the leader nearly three times one token, so only the
+  network share shrinks (97 to 60), and the draft model costs more than that.
+- A draft of 8 gives exactly what a draft of 4 gives: the same 93 tokens were
+  drafted. Why the length stops there is not known yet.
+- The leader started with the path of the model file did not find its draft
+  model; these runs had `BITTY_DRAFT_MODEL` set by hand.
+
+Not measured yet: the Windows PC in the ring, a cut that gives the office PC
+more layers, the 0.8B runs.
