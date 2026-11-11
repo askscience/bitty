@@ -28,6 +28,7 @@ pub async fn connect_worker(
             endpoint_addr: target.endpoint_addr,
             token: target.token.or(cluster_token).unwrap_or_default(),
             connection: None,
+            link: String::new(),
         }));
     }
     let client = WorkerServiceClient::connect(normalize_endpoint(endpoint))
@@ -161,6 +162,8 @@ pub struct IrohWorkerClient {
     /// Kept between requests: a token is one request to every worker, and a handshake for
     /// each of them would cost more than the layers.
     connection: Option<iroh::endpoint::Connection>,
+    /// How the last request travelled, to say so in the log when it changes.
+    link: String,
 }
 
 impl IrohWorkerClient {
@@ -194,7 +197,43 @@ impl IrohWorkerClient {
         };
         let response =
             iroh_transport::request_on_stream(send, recv, frame, DEFAULT_FRAME_LIMIT).await?;
+        self.note_link();
         response.decode_message(op)
+    }
+}
+
+impl IrohWorkerClient {
+    /// Says in the log whether the worker is reached straight or through a relay, each time
+    /// that changes. Through a relay every token crosses a server far away, which can cost
+    /// more than the layers.
+    fn note_link(&mut self) {
+        let Some(path) = self
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.paths().into_iter().find(|path| path.is_selected()))
+        else {
+            return;
+        };
+        let link = link_text(path.is_relay(), &format!("{:?}", path.remote_addr()));
+        if link != self.link {
+            let rtt = path
+                .rtt()
+                .map(|rtt| format!(", round trip {} ms", rtt.as_millis()))
+                .unwrap_or_default();
+            eprintln!(
+                "bitty: link to {}: {link}{rtt}",
+                self.endpoint_addr.id.fmt_short()
+            );
+            self.link = link;
+        }
+    }
+}
+
+fn link_text(relay: bool, addr: &str) -> String {
+    if relay {
+        format!("through a relay ({addr})")
+    } else {
+        format!("direct ({addr})")
     }
 }
 

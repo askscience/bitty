@@ -176,7 +176,20 @@ When the plan gives a machine fewer layers than a file it already holds, for
 example 36..40 when it has 25..40, the new file is cut out of the old one on
 the disk and nothing comes over the network.
 
-### Reading and restarting a far machine from the leader
+### Straight or through a relay
+
+Each node writes in its log how it reaches the next one, and again when that
+changes:
+
+```
+bitty: link to 90a1b52b49: direct (Ip(192.168.1.20:55424)), round trip 2 ms
+bitty: link to 1d0da13c2f: through a relay (Relay(https://use1-1.relay...)), round trip 240 ms
+```
+
+A link through a relay makes every token cross a server far away. When the
+time per token is far above the time the workers report, look for these lines.
+
+## Reading and restarting a far machine from the leader
 
 On the leader:
 
