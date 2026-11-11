@@ -80,10 +80,14 @@ What it says:
 - The draft does not pay here. It halves the passes, but a pass that carries
   three tokens costs the leader nearly three times one token, so only the
   network share shrinks (97 to 60), and the draft model costs more than that.
-- A draft of 8 gives exactly what a draft of 4 gives: the same 93 tokens were
-  drafted. Why the length stops there is not known yet.
+- A draft of 8 gives exactly what a draft of 4 gives: the engines keep copies
+  of their state for 4 tokens (`BITTY_STAGE_ROLLBACK`), so a longer draft is
+  cut to 4. The leader now says so in its log. A real draft of 8 needs that
+  setting on every node, and each token more costs a copy of the state.
 - The leader started with the path of the model file did not find its draft
-  model; these runs had `BITTY_DRAFT_MODEL` set by hand.
+  model; these runs had `BITTY_DRAFT_MODEL` set by hand. Corrected since.
+- The office PC fetched 36..40 from the model URL although it held 25..40.
+  Corrected since: a stage is cut out of a wider one that is on the disk.
 
 Not measured yet: the Windows PC in the ring, a cut that gives the office PC
 more layers, the 0.8B runs.

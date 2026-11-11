@@ -225,6 +225,12 @@ pub fn pull_stage(
     let whole = spec.model_path(settings);
     let report = if !is_url && whole.exists() {
         bitty_model::write_stage_file(&bitty_model::FileSource::new(whole), start, end, &dest)?
+    } else if let Some(wider) = wider_stage(settings, &spec, start, end, &dest) {
+        eprintln!(
+            "bitty: layers {start}..{end} are taken from {}",
+            wider.display()
+        );
+        bitty_model::write_stage_file(&bitty_model::FileSource::new(wider), start, end, &dest)?
     } else if spec.url.is_empty() {
         return Err(format!("model {} has no download URL", spec.id()).into());
     } else {
@@ -232,6 +238,39 @@ pub fn pull_stage(
         bitty_model::write_stage_file(&source, start, end, &dest)?
     };
     Ok((dest, report))
+}
+
+/// The layers `[start, end)` named by a stage file, whole or still coming.
+fn stage_range(name: &str) -> Option<(u32, u32)> {
+    name.strip_suffix(".gguf")
+        .and_then(|name| name.rsplit_once(".layers-"))
+        .and_then(|(_, range)| range.split_once('-'))
+        .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)))
+}
+
+/// A finished stage file on disk that holds all of `[start, end)` and more: the smallest one.
+/// Layers this machine already has are cut out of it and not fetched again.
+fn wider_stage(
+    settings: &BittySettings,
+    spec: &ModelSpec,
+    start: u32,
+    end: u32,
+    dest: &Path,
+) -> Option<PathBuf> {
+    if start >= end {
+        return None;
+    }
+    std::fs::read_dir(spec.model_dir(settings).join("stages"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != dest)
+        .filter_map(|path| {
+            let (from, to) = stage_range(path.file_name()?.to_str()?)?;
+            (from <= start && end <= to).then_some((to - from, path))
+        })
+        .min()
+        .map(|(_, path)| path)
 }
 
 /// The stage file for `[start, end)`, fetched only when it is not on disk yet.
@@ -363,6 +402,9 @@ pub fn stored_name(settings: &BittySettings, model: &str) -> Option<String> {
     )
 }
 
+/// How long a partial file may lie untouched before it counts as a download given up.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// What a node holds of a model and what it is still fetching, in words: the leader logs it,
 /// so the state of a far machine can be read without going there.
 pub fn holdings(settings: &BittySettings, model: &str) -> String {
@@ -382,20 +424,23 @@ pub fn holdings(settings: &BittySettings, model: &str) -> String {
             Some(name) => (name, true),
             None => (name.as_str(), false),
         };
-        let Some((start, end)) = name
-            .strip_suffix(".gguf")
-            .and_then(|name| name.rsplit_once(".layers-"))
-            .and_then(|(_, range)| range.split_once('-'))
-            .and_then(|(start, end)| Some((start.parse::<u32>().ok()?, end.parse::<u32>().ok()?)))
-        else {
+        let Some((start, end)) = stage_range(name) else {
             continue;
         };
         // the stage with no layers holds the embeddings and the head only
         if start == end {
             continue;
         }
-        let mb = entry.metadata().map(|meta| meta.len()).unwrap_or(0) / (1024 * 1024);
-        parts.push((start, partial, end, mb));
+        let meta = entry.metadata().ok();
+        let mb = meta.as_ref().map_or(0, |meta| meta.len()) / (1024 * 1024);
+        // a partial file nothing has written to for minutes is a download that was given up,
+        // for example when the plan changed: it is not what the node is doing now
+        let stale = partial
+            && meta
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_PARTIAL);
+        parts.push((start, partial, end, mb, stale));
     }
     if parts.is_empty() {
         return "holds no layers".into();
@@ -403,8 +448,10 @@ pub fn holdings(settings: &BittySettings, model: &str) -> String {
     parts.sort();
     parts
         .iter()
-        .map(|(start, partial, end, mb)| {
-            if *partial {
+        .map(|(start, partial, end, mb, stale)| {
+            if *stale {
+                format!("stopped fetching {start}..{end} at {mb} MiB")
+            } else if *partial {
                 format!("fetching {start}..{end}, {mb} MiB so far")
             } else {
                 format!("holds {start}..{end}")
@@ -459,7 +506,10 @@ pub fn draft_model(settings: &BittySettings, model: &str) -> Option<DraftFile> {
             url: String::new(),
         });
     }
-    let (spec, is_url) = stage_spec(settings, model).ok()?;
+    // the leader may have been started with the path of the installed file: it is the same
+    // model as its name
+    let named = network_name(settings, model);
+    let (spec, is_url) = stage_spec(settings, named.as_deref().unwrap_or(model)).ok()?;
     if is_url {
         return None;
     }

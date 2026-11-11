@@ -402,13 +402,26 @@ pub fn write_stage_file(
     let source_len = source.len()?;
     let (layout, prefix) = read_layout(source, source_len)?;
     let metadata = &layout.header.metadata;
+    let mut source_metadata = &prefix[layout.metadata_start as usize..layout.metadata_end as usize];
+    let mut source_metadata_count = layout.metadata_count;
     if let (Some(GgufMetadataValue::U64(from)), Some(GgufMetadataValue::U64(to))) =
         (metadata.get(STAGE_START_KEY), metadata.get(STAGE_END_KEY))
     {
-        return Err(StageFileError::SourceIsStage {
-            start: *from,
-            end: *to,
-        });
+        // A stage holds all of a narrower stage: layers a machine has need not come over the
+        // network again when the plan gives it fewer of them. The two entries that say what
+        // the source holds are the last ones this writer put, and they go.
+        let mut said = Vec::new();
+        put_u32_entry(&mut said, STAGE_START_KEY, *from as u32);
+        put_u32_entry(&mut said, STAGE_END_KEY, *to as u32);
+        let covers = *from <= u64::from(start) && u64::from(end) <= *to;
+        if !covers || !source_metadata.ends_with(&said) {
+            return Err(StageFileError::SourceIsStage {
+                start: *from,
+                end: *to,
+            });
+        }
+        source_metadata = &source_metadata[..source_metadata.len() - said.len()];
+        source_metadata_count -= 2;
     }
     let layers = block_count(&layout).ok_or(StageFileError::NoBlockCount)?;
     // 0..0 is the vocabulary file: every metadata value and no tensor
@@ -472,8 +485,8 @@ pub fn write_stage_file(
     header.extend_from_slice(crate::gguf::GGUF_MAGIC);
     header.extend_from_slice(&layout.header.version.to_le_bytes());
     header.extend_from_slice(&(kept.len() as u64).to_le_bytes());
-    header.extend_from_slice(&(layout.metadata_count + 2).to_le_bytes());
-    header.extend_from_slice(&prefix[layout.metadata_start as usize..layout.metadata_end as usize]);
+    header.extend_from_slice(&(source_metadata_count + 2).to_le_bytes());
+    header.extend_from_slice(source_metadata);
     put_u32_entry(&mut header, STAGE_START_KEY, start);
     put_u32_entry(&mut header, STAGE_END_KEY, end);
     for (tensor, offset) in kept.iter().zip(&new_offsets) {
@@ -663,6 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn a_wider_stage_gives_a_narrower_one() {
+        let dir =
+            std::env::temp_dir().join(format!("bitty-stage-file-{}-narrow", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (model, _) = sample_model(true);
+        let source_path = dir.join("model.gguf");
+        std::fs::write(&source_path, &model).unwrap();
+        let wide = dir.join("wide.gguf");
+        write_stage_file(&FileSource::new(&source_path), 1, 3, &wide).unwrap();
+        let direct = dir.join("direct.gguf");
+        write_stage_file(&FileSource::new(&source_path), 2, 3, &direct).unwrap();
+        let narrow = dir.join("narrow.gguf");
+        write_stage_file(&FileSource::new(&wide), 2, 3, &narrow).unwrap();
+
+        let tensors = |path: &Path| {
+            let bytes = std::fs::read(path).unwrap();
+            let layout = parse_gguf_prefix(&bytes, bytes.len() as u64).unwrap();
+            assert_eq!(
+                layout.header.metadata.get(STAGE_START_KEY),
+                Some(&GgufMetadataValue::U64(2))
+            );
+            assert_eq!(
+                layout.header.metadata.get(STAGE_END_KEY),
+                Some(&GgufMetadataValue::U64(3))
+            );
+            layout
+                .header
+                .tensors
+                .iter()
+                .map(|tensor| {
+                    let at = (layout.data_start + tensor.offset) as usize;
+                    (
+                        tensor.name.clone(),
+                        bytes[at..at + tensor.byte_len as usize].to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tensors(&narrow), tensors(&direct));
+        assert_eq!(
+            parse_gguf_file(&narrow).unwrap().metadata.len(),
+            parse_gguf_file(&direct).unwrap().metadata.len()
+        );
+        // the layers a stage does not hold cannot come out of it
+        assert!(matches!(
+            write_stage_file(&FileSource::new(&wide), 0, 2, &dir.join("no.gguf")),
+            Err(StageFileError::SourceIsStage { start: 1, end: 3 })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_cut_download_goes_on_from_where_it_was() {
         let dir = std::env::temp_dir().join(format!("bitty-stage-resume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -778,7 +843,7 @@ mod tests {
         ));
         write_stage_file(&source, 0, 1, &stage).unwrap();
         assert!(matches!(
-            write_stage_file(&FileSource::new(&stage), 0, 1, &dir.join("again.gguf")),
+            write_stage_file(&FileSource::new(&stage), 1, 2, &dir.join("again.gguf")),
             Err(StageFileError::SourceIsStage { start: 0, end: 1 })
         ));
         std::fs::remove_dir_all(&dir).unwrap();

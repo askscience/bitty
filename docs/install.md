@@ -163,6 +163,12 @@ the progress of a download every five minutes, for example
 `bitty-c5e9968c: fetching 10..34, 5120 MiB so far` and later
 `bitty-c5e9968c: holds 10..34`. So the state of a far machine can be read on the
 leader without going there. A node on an older build says nothing.
+`stopped fetching 29..40 at 2381 MiB` is a download that was given up, for
+example because the plan changed: nothing has written to it for minutes.
+
+When the plan gives a machine fewer layers than a file it already holds, for
+example 36..40 when it has 25..40, the new file is cut out of the old one on
+the disk and nothing comes over the network.
 
 ### Reading and restarting a far machine from the leader
 

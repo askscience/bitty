@@ -1300,12 +1300,17 @@ impl NetworkCoordinator {
     /// request goes without. `wanted` comes with the request: negative for no draft, 0 for the
     /// default. The workers cannot take back more tokens than their engines keep copies for.
     async fn draft_for(&self, wanted: i32, vocab_size: u32) -> (Option<SharedDraft>, usize) {
-        let tokens = match wanted {
+        let asked = match wanted {
             wanted if wanted < 0 => 0,
             0 => default_draft_tokens(),
             wanted => wanted as usize,
+        };
+        let tokens = asked.min(StageOptions::from_env().rollback as usize);
+        if tokens < asked {
+            println!(
+                "a draft of {asked} was asked for, the engines take back {tokens} tokens at most (BITTY_STAGE_ROLLBACK on every node): drafting {tokens}"
+            );
         }
-        .min(StageOptions::from_env().rollback as usize);
         let Some(path) = self.draft_path.clone() else {
             return (None, 0);
         };
