@@ -474,7 +474,15 @@ impl NetworkCoordinator {
                         .note_free(&manifest.node_id, memory_mb, disk_mb);
                 }
             }
-            loaded.map_err(|err| Status::failed_precondition(err.to_string()))?;
+            loaded.map_err(|err| {
+                Status::failed_precondition(format!(
+                    "worker {} could not load layers {}..{}: {}",
+                    manifest.node_id.0,
+                    manifest.range.start_layer,
+                    manifest.range.end_layer_exclusive,
+                    err.message()
+                ))
+            })?;
             self.shard_cache.lock().await.insert(cache_key, manifest);
         }
         Ok(client)
