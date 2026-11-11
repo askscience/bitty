@@ -1273,13 +1273,15 @@ fn plan_file_name(model: Option<&str>) -> String {
 }
 
 /// The model the leader serves, when this node runs another one and both can be named.
-/// A node started with a file of its own keeps it.
+/// A model bitty fetched has a name also when the registry no longer lists it: an old
+/// installation may still start with one. A node started with a file of its own keeps it.
 fn other_model_of_the_leader(config: &NodeConfig, leader_model: &str) -> Option<String> {
     if leader_model.is_empty() {
         return None;
     }
     let settings = BittySettings::load(bitty_data_dir(config.data_dir.as_deref()));
-    let mine = model_store::network_name(&settings, &config.model)?;
+    let mine = model_store::network_name(&settings, &config.model)
+        .or_else(|| model_store::stored_name(&settings, &config.model))?;
     (mine != leader_model).then(|| leader_model.to_string())
 }
 
@@ -3726,6 +3728,19 @@ mod tests {
         assert_eq!(other_model_of_the_leader(&own, "qwen3.5-0.8b"), None);
         assert_eq!(
             other_model_of_the_leader(&installed, "qwen3.5-0.8b"),
+            Some("qwen3.5-0.8b".into())
+        );
+
+        // a model an old installation fetched and the registry no longer lists is another model
+        let unlisted = NodeConfig {
+            model: dir
+                .join("models/bitnet-b1.58/latest/ggml-model-i2_s.gguf")
+                .display()
+                .to_string(),
+            ..config.clone()
+        };
+        assert_eq!(
+            other_model_of_the_leader(&unlisted, "qwen3.5-0.8b"),
             Some("qwen3.5-0.8b".into())
         );
 

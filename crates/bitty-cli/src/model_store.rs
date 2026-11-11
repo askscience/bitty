@@ -349,6 +349,20 @@ pub fn network_name(settings: &BittySettings, model: &str) -> Option<String> {
         .map(|spec| spec.name)
 }
 
+/// The name of a model that lies in the store of this machine, whether the registry still
+/// lists it or not. `None` for a file anywhere else.
+pub fn stored_name(settings: &BittySettings, model: &str) -> Option<String> {
+    let inside = Path::new(model).strip_prefix(&settings.models_dir).ok()?;
+    Some(
+        inside
+            .components()
+            .next()?
+            .as_os_str()
+            .to_str()?
+            .to_string(),
+    )
+}
+
 /// What a node holds of a model and what it is still fetching, in words: the leader logs it,
 /// so the state of a far machine can be read without going there.
 pub fn holdings(settings: &BittySettings, model: &str) -> String {
