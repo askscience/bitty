@@ -19,9 +19,10 @@ impl ClusterStore {
                 let Some((name, invite)) = line.split_once('=') else {
                     continue;
                 };
-                store
-                    .aliases
-                    .insert(name.trim().to_string(), crate::settings::unquote(invite.trim()));
+                store.aliases.insert(
+                    name.trim().to_string(),
+                    crate::settings::unquote(invite.trim()),
+                );
             }
         }
         store

@@ -207,11 +207,12 @@ impl IrohWorkerClient {
     /// that changes. Through a relay every token crosses a server far away, which can cost
     /// more than the layers.
     fn note_link(&mut self) {
-        let Some(path) = self
-            .connection
-            .as_ref()
-            .and_then(|connection| connection.paths().into_iter().find(|path| path.is_selected()))
-        else {
+        let Some(path) = self.connection.as_ref().and_then(|connection| {
+            connection
+                .paths()
+                .into_iter()
+                .find(|path| path.is_selected())
+        }) else {
             return;
         };
         let link = link_text(path.is_relay(), &format!("{:?}", path.remote_addr()));

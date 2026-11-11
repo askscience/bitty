@@ -189,6 +189,17 @@ bitty: link to 1d0da13c2f: through a relay (Relay(https://use1-1.relay...)), rou
 A link through a relay makes every token cross a server far away. When the
 time per token is far above the time the workers report, look for these lines.
 
+Two machines in different homes often cannot reach each other straight, and
+then the relay stays. So each node times a connection to every relay when it
+starts and sits behind the nearest one:
+
+```
+bitty: relay https://euc1-1.relay.n0.iroh-canary.iroh.link./, 34 ms away
+```
+
+`BITTY_RELAY=default` in `~/.bitty/env` leaves the choice to iroh, which has
+been seen to pick a relay on the other side of the ocean.
+
 ## Reading and restarting a far machine from the leader
 
 On the leader:

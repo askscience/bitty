@@ -2598,14 +2598,16 @@ impl IrohNode {
 
 async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::error::Error>> {
     let secret_key = load_or_create_iroh_secret(data_dir)?;
-    let endpoint = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![
             BITTY_SCHEDULER_ALPN.to_vec(),
             BITTY_WORKER_ALPN.to_vec(),
-        ])
-        .bind()
-        .await?;
+        ]);
+    if let Some(relay) = nearest_relay().await {
+        builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(relay)));
+    }
+    let endpoint = builder.bind().await?;
     let _ = timeout(Duration::from_secs(10), endpoint.online()).await;
     let node_id = endpoint.id().to_string();
     let bound_sockets = endpoint
@@ -2618,6 +2620,46 @@ async fn start_iroh_node(data_dir: &PathBuf) -> Result<IrohNode, Box<dyn std::er
         node_id,
         bound_sockets,
     })
+}
+
+/// The relay this node sits behind when a peer cannot reach it straight. iroh picks one of its
+/// relays by its own probes and has been seen to settle on the other side of the ocean, which
+/// puts a second of travel on every token. So the node times a plain connection to each relay
+/// and keeps only the nearest. `BITTY_RELAY=default` leaves the choice to iroh.
+async fn nearest_relay() -> Option<iroh::RelayUrl> {
+    if std::env::var("BITTY_RELAY").is_ok_and(|value| value == "default") {
+        return None;
+    }
+    let relays: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
+    let mut probes = tokio::task::JoinSet::new();
+    for relay in relays {
+        probes.spawn(async move {
+            let host = relay.host_str()?.trim_end_matches('.').to_string();
+            let mut best: Option<Duration> = None;
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let connect = tokio::net::TcpStream::connect((host.as_str(), 443));
+                if let Ok(Ok(_)) = timeout(Duration::from_secs(2), connect).await {
+                    let took = started.elapsed();
+                    best = Some(best.map_or(took, |best| best.min(took)));
+                }
+            }
+            best.map(|best| (best, relay))
+        });
+    }
+    let mut timed = Vec::new();
+    while let Some(probe) = probes.join_next().await {
+        if let Ok(Some(found)) = probe {
+            timed.push(found);
+        }
+    }
+    let (took, relay) = pick_nearest(timed)?;
+    eprintln!("bitty: relay {relay}, {} ms away", took.as_millis());
+    Some(relay)
+}
+
+fn pick_nearest<T>(timed: Vec<(Duration, T)>) -> Option<(Duration, T)> {
+    timed.into_iter().min_by_key(|(took, _)| *took)
 }
 
 /// A client that only dials out. `wait_until_online` holds it until its own relay connection is
@@ -3666,6 +3708,17 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_nearest_relay_wins() {
+        let timed = vec![
+            (Duration::from_millis(126), "america"),
+            (Duration::from_millis(34), "europe"),
+            (Duration::from_millis(173), "asia"),
+        ];
+        assert_eq!(pick_nearest(timed).map(|(_, relay)| relay), Some("europe"));
+        assert!(pick_nearest(Vec::<(Duration, &str)>::new()).is_none());
+    }
+
     use super::*;
 
     /// Runs against a real model when `BITTY_TEST_MODEL` points at one.
