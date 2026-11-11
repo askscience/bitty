@@ -71,6 +71,10 @@ impl Registry {
         node.observed_tokens_per_second = heartbeat.observed_tokens_per_second;
         node.avg_forward_latency_ms = heartbeat.avg_forward_latency_ms;
         node.activation_bytes_per_second = heartbeat.activation_bytes_per_second;
+        // what the node measured counts more than what it guessed when it registered
+        if heartbeat.leader_rtt_ms > 0.0 {
+            node.profile.network_rtt_ms = heartbeat.leader_rtt_ms;
+        }
         if !heartbeat.backend_type.is_empty() {
             node.backend_type = heartbeat.backend_type.clone();
             node.profile.backend_type = heartbeat.backend_type;

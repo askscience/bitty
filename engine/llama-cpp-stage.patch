@@ -347,10 +347,10 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..bffc2b5
+index 0000000..8de3ea2
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,677 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
@@ -394,6 +394,12 @@ index 0000000..bffc2b5
 +//   8 EOG_TOKENS     answers kind TOKENS with every token id that ends generation
 +//   9 MARK           keeps a copy of the session state at its present position, in place of
 +//                    the copy made before; a later decode may start again from there
++//  10 ABORT          no answer. A decode with the flag 0x200 in `op` is a guess: the stage
++//                    MARKs the session first, and stops as soon as anything arrives on stdin
++//                    while it runs. It then puts the session back where the guess started and
++//                    answers status 2 with no payload. An ABORT that arrives after the decode
++//                    has answered is read and ignored, so the caller never has to know whether
++//                    it was in time.
 +
 +#include "llama.h"
 +
@@ -410,6 +416,13 @@ index 0000000..bffc2b5
 +#include <vector>
 +
 +#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
 +#include <fcntl.h>
 +#include <io.h>
 +#define STDIN_FILENO  0
@@ -422,7 +435,13 @@ index 0000000..bffc2b5
 +static int fd_dup2(int from, int to) { return _dup2(from, to); }
 +// frames are binary: without this Windows would translate line endings and stop at Ctrl-Z
 +static void fd_binary(int fd) { _setmode(fd, _O_BINARY); }
++static bool stdin_has_data() {
++    DWORD        waiting = 0;
++    const HANDLE pipe    = (HANDLE) _get_osfhandle(STDIN_FILENO);
++    return PeekNamedPipe(pipe, nullptr, 0, nullptr, &waiting, nullptr) && waiting > 0;
++}
 +#else
++#include <poll.h>
 +#include <unistd.h>
 +typedef ssize_t io_count;
 +static io_count fd_read(int fd, void * buf, size_t len) { return read(fd, buf, len); }
@@ -430,10 +449,18 @@ index 0000000..bffc2b5
 +static int fd_dup(int fd) { return dup(fd); }
 +static int fd_dup2(int from, int to) { return dup2(from, to); }
 +static void fd_binary(int) {}
++static bool stdin_has_data() {
++    struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
++    return poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP)) != 0;
++}
 +#endif
 +
-+enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8, OP_MARK = 9 };
-+enum : uint32_t { OP_MASK = 0xff, OP_FLAG_ROWS = 0x100 };
++// a guess is running: the caller writes to stdin only to stop it
++static bool guess_running = false;
++static bool guess_stopped(void *) { return guess_running && stdin_has_data(); }
++
++enum : uint32_t { OP_DECODE_TOKENS = 1, OP_DECODE_HIDDEN = 2, OP_END = 3, OP_PING = 4, OP_TOKEN_TEXT = 5, OP_TOKENIZE = 6, OP_CHAT_PROMPT = 7, OP_EOG_TOKENS = 8, OP_MARK = 9, OP_ABORT = 10 };
++enum : uint32_t { OP_MASK = 0xff, OP_FLAG_ROWS = 0x100, OP_FLAG_GUESS = 0x200 };
 +enum : uint32_t { KIND_NONE = 0, KIND_HIDDEN = 1, KIND_LOGITS = 2, KIND_BYTES = 3, KIND_TOKENS = 4, KIND_TOP_LOGITS = 5, KIND_TOP_ROWS = 6 };
 +
 +static const uint32_t PROTOCOL_VERSION = 1;
@@ -536,6 +563,24 @@ index 0000000..bffc2b5
 +        return true;
 +    }
 +
++    // puts the session back at its MARK after a decode that stopped half way: the layers it
++    // went through have changed their state, the others have not
++    bool restore(session & s) {
++        if (!s.marked) return false;
++        if (!s.mark.empty() &&
++            llama_state_seq_set_data_ext(ctx, s.mark.data(), s.mark.size(), s.seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++            return false;
++        }
++        llama_memory_t mem = llama_get_memory(ctx);
++        if (s.mark_pos == 0) {
++            llama_memory_seq_rm(mem, s.seq, -1, -1);
++        } else if (!llama_memory_seq_rm(mem, s.seq, (llama_pos) s.mark_pos, -1)) {
++            return false;
++        }
++        s.next_pos = s.mark_pos;
++        return true;
++    }
++
 +    // returns the session that continues at `pos`, opening it when pos is 0
 +    session * open(uint64_t id, uint32_t pos, std::string & err) {
 +        auto it = sessions.find(id);
@@ -574,7 +619,8 @@ index 0000000..bffc2b5
 +
 +    // runs n tokens of one session; out receives the hidden states, or the logits of the last
 +    // token, or with `rows` those of every token
-+    bool decode(session & s, const llama_token * tokens, const float * hidden, int n, bool rows, std::vector<float> & out, std::string & err) {
++    bool decode(session & s, const llama_token * tokens, const float * hidden, int n, bool rows, std::vector<float> & out, std::string & err, bool & stopped) {
++        stopped = false;
 +        if ((int64_t) s.next_pos + n > n_ctx_seq) {
 +            err = "session would exceed the stage context of " + std::to_string(n_ctx_seq) + " tokens";
 +            return false;
@@ -617,6 +663,11 @@ index 0000000..bffc2b5
 +            batch.logits   = outputs.data();
 +
 +            const int rc = llama_decode(ctx, batch);
++            if (rc == 2 && guess_running) {
++                stopped = true;
++                err     = "the guess was stopped";
++                return false;
++            }
 +            if (rc != 0) {
 +                err = "llama_decode failed with code " + std::to_string(rc);
 +                return false;
@@ -736,6 +787,7 @@ index 0000000..bffc2b5
 +        fprintf(stderr, "bitty-stage: failed to create the context\n");
 +        return 1;
 +    }
++    llama_set_abort_callback(srv.ctx, guess_stopped, nullptr);
 +    }
 +
 +    {
@@ -754,8 +806,9 @@ index 0000000..bffc2b5
 +        uint32_t op, pos, n_tokens, len;
 +        uint64_t sid;
 +        memcpy(&op, head, 4);
-+        const bool rows = (op & OP_FLAG_ROWS) != 0;
-+        op &= ~(uint32_t) OP_FLAG_ROWS;
++        const bool rows  = (op & OP_FLAG_ROWS) != 0;
++        const bool guess = (op & OP_FLAG_GUESS) != 0;
++        op &= ~(uint32_t) (OP_FLAG_ROWS | OP_FLAG_GUESS);
 +        memcpy(&sid, head + 4, 8);
 +        memcpy(&pos, head + 12, 4);
 +        memcpy(&n_tokens, head + 16, 4);
@@ -770,6 +823,9 @@ index 0000000..bffc2b5
 +        bool ok = true;
 +        std::string err;
 +        switch (op) {
++            case OP_ABORT:
++                // the guess it was meant for has answered already
++                break;
 +            case OP_DECODE_TOKENS:
 +            case OP_DECODE_HIDDEN: {
 +                const bool   is_tokens = op == OP_DECODE_TOKENS;
@@ -800,10 +856,22 @@ index 0000000..bffc2b5
 +                    ok = respond_error(out_fd, err);
 +                    break;
 +                }
++                if (guess && !srv.mark(*s)) {
++                    srv.drop(sid);
++                    ok = respond_error(out_fd, "the state of the session could not be copied");
++                    break;
++                }
++                bool stopped  = false;
++                guess_running = guess;
 +                const bool done = srv.decode(*s,
 +                        is_tokens ? (const llama_token *) payload.data() : nullptr,
 +                        is_tokens ? nullptr : (const float *) payload.data(),
-+                        (int) n_tokens, rows && srv.last, result, err);
++                        (int) n_tokens, rows && srv.last, result, err, stopped);
++                guess_running = false;
++                if (stopped && srv.restore(*s)) {
++                    ok = respond(out_fd, 2, KIND_NONE, 0, nullptr, 0);
++                    break;
++                }
 +                if (!done) {
 +                    // the state may hold part of the request: the session cannot continue
 +                    srv.drop(sid);

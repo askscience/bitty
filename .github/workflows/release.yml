@@ -75,18 +75,29 @@ jobs:
           git fetch -q --depth 1 origin "$LLAMA_COMMIT"
           git checkout -q FETCH_HEAD
           git apply ../engine/llama-cpp-stage.patch
-          # a build that runs on any x86-64 machine with AVX2, and needs no extra libraries
+          # no extra libraries, and three builds of the engine: the plain one needs AVX2, "-avx"
+          # runs on processors up to 2012 that only have AVX, "-sse" on the ones without it.
+          # bitty starts the one its machine can run.
           flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=OFF
                  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
                  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF)
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -B build -A x64 "${flags[@]}" -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            flags+=(-A x64 -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
           else
-            cmake -B build "${flags[@]}" -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+            flags+=(-DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc")
           fi
-          cmake --build build --config Release --target bitty-stage --parallel 4
+          no_avx2=(-DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF)
           mkdir -p ../engine-bin
-          cp "$(find build/bin -name 'bitty-stage${{ matrix.exe }}' | head -n 1)" ../engine-bin/
+          build_engine() {
+            local variant="$1"; shift
+            cmake -B "build$variant" "${flags[@]}" "$@"
+            cmake --build "build$variant" --config Release --target bitty-stage --parallel 4
+            cp "$(find "build$variant/bin" -name 'bitty-stage${{ matrix.exe }}' | head -n 1)" \
+               "../engine-bin/bitty-stage$variant${{ matrix.exe }}"
+          }
+          build_engine ""
+          build_engine -avx "${no_avx2[@]}"
+          build_engine -sse "${no_avx2[@]}" -DGGML_AVX=OFF
 
       - name: Test model cache
         id: model
@@ -112,11 +123,20 @@ jobs:
       - name: End-to-end check
         run: scripts/ci-smoke.sh "$PWD/target/release/bitty${{ matrix.exe }}" "$PWD/engine-bin/bitty-stage${{ matrix.exe }}" "$PWD/test-model/model.gguf"
 
+      - name: The engines for older processors
+        run: |
+          native() { if command -v cygpath > /dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
+          for variant in -avx -sse; do
+            BITTY_STAGE_BIN="$(native "$PWD/engine-bin/bitty-stage$variant${{ matrix.exe }}")" \
+            BITTY_TEST_MODEL="$(native "$PWD/test-model/model.gguf")" \
+              cargo test --release --locked -p bitty-inference --test stage_engine
+          done
+
       - name: Package
         run: |
           name="bitty-${{ matrix.name }}"
           mkdir -p "dist/$name"
-          cp "target/release/bitty${{ matrix.exe }}" "engine-bin/bitty-stage${{ matrix.exe }}" "dist/$name/"
+          cp "target/release/bitty${{ matrix.exe }}" engine-bin/bitty-stage* "dist/$name/"
           echo "$BITTY_GIT_SHA" > "dist/$name/VERSION"
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -198,7 +218,7 @@ jobs:
           version="${GITHUB_SHA::12}"
           sha256sum bitty-linux-x86_64.tar.gz bitty-windows-x86_64.zip > SHA256SUMS
           echo "$version" > VERSION
-          notes="Rolling build of the qwen-llama-cpp branch, commit $GITHUB_SHA. Installed and kept up to date by scripts/install.sh (Linux) and scripts/install.ps1 (Windows). CPU build for x86-64 with AVX2."
+          notes="Rolling build of the qwen-llama-cpp branch, commit $GITHUB_SHA. Installed and kept up to date by scripts/install.sh (Linux) and scripts/install.ps1 (Windows). CPU builds for x86-64: AVX2, AVX and SSE4.2, picked by bitty at run time."
           if gh release view nightly > /dev/null 2>&1; then
             gh release edit nightly --notes "$notes" --prerelease
           else

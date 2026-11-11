@@ -19,8 +19,13 @@ const OP_TOKENIZE: u32 = 6;
 const OP_CHAT_PROMPT: u32 = 7;
 const OP_EOG_TOKENS: u32 = 8;
 const OP_MARK: u32 = 9;
+const OP_ABORT: u32 = 10;
 /// Added to a decode op: the final stage answers for every token of the request.
 const OP_FLAG_ROWS: u32 = 0x100;
+/// Added to a decode op: the request is a guess, which the engine can be told to stop.
+const OP_FLAG_GUESS: u32 = 0x200;
+/// The status of a guess that was stopped.
+const STATUS_STOPPED: u32 = 2;
 
 const KIND_HIDDEN: u32 = 1;
 const KIND_LOGITS: u32 = 2;
@@ -68,6 +73,9 @@ pub enum StageProcessError {
     Engine(String),
     #[error("the stage engine sent an unexpected reply")]
     BadReply,
+    /// A guess was stopped before its answer; callers of the guess calls see `None`.
+    #[error("the guess was stopped")]
+    Stopped,
 }
 
 /// What the engine reported about the model and its range once the weights were loaded.
@@ -130,11 +138,42 @@ pub enum StageOutput {
 /// One running `bitty-stage` child. Calls block; the process dies with this value.
 pub struct StageProcess {
     child: Child,
-    stdin: ChildStdin,
+    wire: Arc<Mutex<Wire>>,
     stdout: ChildStdout,
     info: StageInfo,
     /// The end of what the engine wrote for people, for the error when it dies.
     last_output: Arc<Mutex<Vec<u8>>>,
+}
+
+/// The way into the engine, shared with the handles that stop a guess.
+struct Wire {
+    stdin: ChildStdin,
+    /// The guess the engine is working on.
+    running: Option<u64>,
+    /// A guess that was stopped before it reached the engine.
+    stopped: Option<u64>,
+}
+
+/// Stops a guess of one engine from another thread, while the thread that asked for it waits
+/// for the answer.
+#[derive(Clone)]
+pub struct StageAbort(Arc<Mutex<Wire>>);
+
+impl StageAbort {
+    /// Stops the guess with this tag: at once when the engine is working on it, before it
+    /// starts when it has not been sent yet. A guess that has already answered is left alone.
+    pub fn stop(&self, tag: u64) {
+        let mut wire = self.0.lock().unwrap_or_else(|lock| lock.into_inner());
+        if wire.running == Some(tag) {
+            wire.running = None;
+            let mut head = [0u8; 24];
+            head[0..4].copy_from_slice(&OP_ABORT.to_le_bytes());
+            // an engine that is gone is found by the call that waits for it
+            let _ = wire.stdin.write_all(&head).and_then(|_| wire.stdin.flush());
+        } else {
+            wire.stopped = Some(tag);
+        }
+    }
 }
 
 /// The error for an engine whose pipe closed: how it ended, what the processor has and the
@@ -287,7 +326,11 @@ impl StageProcess {
         };
         Ok(Self {
             child,
-            stdin,
+            wire: Arc::new(Mutex::new(Wire {
+                stdin,
+                running: None,
+                stopped: None,
+            })),
             stdout,
             info,
             last_output,
@@ -335,6 +378,71 @@ impl StageProcess {
         self.decode(op, session, position, tokens, hidden)
     }
 
+    /// The handle that stops the guesses of this engine.
+    pub fn abort_handle(&self) -> StageAbort {
+        StageAbort(self.wire.clone())
+    }
+
+    /// [`StageProcess::decode_tokens`] for tokens that may turn out wrong. The engine keeps a
+    /// copy of the session first, so the next request can start at `position` again, and
+    /// [`StageAbort::stop`] with the same `tag` ends the work early: the answer is then
+    /// `None` and the session is where it was.
+    pub fn guess_tokens(
+        &mut self,
+        session: u64,
+        position: u32,
+        tokens: &[u32],
+        tag: u64,
+    ) -> Result<Option<StageOutput>, StageProcessError> {
+        let payload: Vec<u8> = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect();
+        self.guess(
+            OP_DECODE_TOKENS,
+            session,
+            position,
+            tokens.len() as u32,
+            &payload,
+            tag,
+        )
+    }
+
+    /// [`StageProcess::decode_hidden`] for a guess, see [`StageProcess::guess_tokens`].
+    pub fn guess_hidden(
+        &mut self,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        hidden: &[u8],
+        tag: u64,
+    ) -> Result<Option<StageOutput>, StageProcessError> {
+        self.guess(OP_DECODE_HIDDEN, session, position, tokens, hidden, tag)
+    }
+
+    fn guess(
+        &mut self,
+        op: u32,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        payload: &[u8],
+        tag: u64,
+    ) -> Result<Option<StageOutput>, StageProcessError> {
+        match self.exchange(
+            op | OP_FLAG_GUESS,
+            session,
+            position,
+            tokens,
+            payload,
+            Some(tag),
+        ) {
+            Ok(reply) => Self::output(reply, tokens).map(Some),
+            Err(StageProcessError::Stopped) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Keeps a copy of the session state at its present position. A later decode may start
     /// from that position again, however many tokens were run in between.
     pub fn mark(&mut self, session: u64) -> Result<(), StageProcessError> {
@@ -349,7 +457,14 @@ impl StageProcess {
         tokens: u32,
         payload: &[u8],
     ) -> Result<StageOutput, StageProcessError> {
-        let (kind, rows, bytes) = self.call(op, session, position, tokens, payload)?;
+        let reply = self.call(op, session, position, tokens, payload)?;
+        Self::output(reply, tokens)
+    }
+
+    fn output(
+        (kind, rows, bytes): (u32, u32, Vec<u8>),
+        tokens: u32,
+    ) -> Result<StageOutput, StageProcessError> {
         if kind == KIND_TOP_ROWS {
             return if rows == tokens && crate::sampling::decode_top_logit_rows(&bytes).is_some() {
                 Ok(StageOutput::TopLogitRows(bytes))
@@ -440,6 +555,18 @@ impl StageProcess {
         tokens: u32,
         payload: &[u8],
     ) -> Result<(u32, u32, Vec<u8>), StageProcessError> {
+        self.exchange(op, session, position, tokens, payload, None)
+    }
+
+    fn exchange(
+        &mut self,
+        op: u32,
+        session: u64,
+        position: u32,
+        tokens: u32,
+        payload: &[u8],
+        guess: Option<u64>,
+    ) -> Result<(u32, u32, Vec<u8>), StageProcessError> {
         let mut head = [0u8; 24];
         head[0..4].copy_from_slice(&op.to_le_bytes());
         head[4..12].copy_from_slice(&session.to_le_bytes());
@@ -447,13 +574,27 @@ impl StageProcess {
         head[16..20].copy_from_slice(&tokens.to_le_bytes());
         head[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         let mut reply = [0u8; 16];
-        let sent = self
-            .stdin
-            .write_all(&head)
-            .and_then(|_| self.stdin.write_all(payload))
-            .and_then(|_| self.stdin.flush())
-            .and_then(|_| self.stdout.read_exact(&mut reply));
-        if let Err(err) = sent {
+        let sent = {
+            let mut wire = self.wire.lock().unwrap_or_else(|lock| lock.into_inner());
+            // only the last guess that was asked for can still be stopped
+            let stopped = wire.stopped.take();
+            if guess.is_some() && stopped == guess {
+                return Err(StageProcessError::Stopped);
+            }
+            let sent = wire
+                .stdin
+                .write_all(&head)
+                .and_then(|_| wire.stdin.write_all(payload))
+                .and_then(|_| wire.stdin.flush());
+            wire.running = guess;
+            sent
+        };
+        let answered = sent.and_then(|_| self.stdout.read_exact(&mut reply));
+        self.wire
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .running = None;
+        if let Err(err) = answered {
             return Err(died(&mut self.child, &self.last_output, &err));
         }
         let word =
@@ -465,6 +606,9 @@ impl StageProcess {
         let mut bytes = vec![0u8; len as usize];
         if let Err(err) = self.stdout.read_exact(&mut bytes) {
             return Err(died(&mut self.child, &self.last_output, &err));
+        }
+        if status == STATUS_STOPPED && guess.is_some() {
+            return Err(StageProcessError::Stopped);
         }
         if status != 0 {
             return Err(StageProcessError::Engine(
@@ -484,22 +628,65 @@ impl Drop for StageProcess {
 }
 
 /// Finds the `bitty-stage` binary: `BITTY_STAGE_BIN`, then next to this executable, then `PATH`.
+/// A release carries the engine three times, and the one this processor can run is taken:
+/// `bitty-stage` needs AVX2, `bitty-stage-avx` only AVX, `bitty-stage-sse` neither. Starting the
+/// wrong one ends in an illegal instruction the moment the first layer is computed.
 pub fn find_stage_engine() -> Option<PathBuf> {
-    // "bitty-stage.exe" on Windows
-    let name = format!("bitty-stage{}", std::env::consts::EXE_SUFFIX);
     if let Some(path) = std::env::var_os("BITTY_STAGE_BIN") {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
+    // "bitty-stage.exe" on Windows; the plain name is the fallback of every variant
+    let names: Vec<String> = [engine_variant(cpu_level()), ""]
+        .iter()
+        .map(|variant| format!("bitty-stage{variant}{}", std::env::consts::EXE_SUFFIX))
+        .collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(candidate) = exe.parent().map(|dir| dir.join(&name)) {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        dirs.extend(exe.parent().map(Path::to_path_buf));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs.iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+/// What the processor of this machine can run, from the widest instructions down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuLevel {
+    Avx2,
+    Avx,
+    Sse,
+}
+
+pub fn cpu_level() -> CpuLevel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("bmi2")
+        {
+            CpuLevel::Avx2
+        } else if is_x86_feature_detected!("avx") {
+            CpuLevel::Avx
+        } else {
+            CpuLevel::Sse
         }
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| Path::new(&dir).join(&name))
-        .find(|candidate| candidate.is_file())
+    // other processors have one build of the engine
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        CpuLevel::Avx2
+    }
+}
+
+fn engine_variant(level: CpuLevel) -> &'static str {
+    match level {
+        CpuLevel::Avx2 => "",
+        CpuLevel::Avx => "-avx",
+        CpuLevel::Sse => "-sse",
+    }
 }

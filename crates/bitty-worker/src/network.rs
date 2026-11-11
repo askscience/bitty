@@ -33,6 +33,11 @@ pub struct NetworkWorker<E = FakeLayerExecutor> {
     /// Connections to the workers this one hands its results to, by endpoint.
     peers: Arc<Mutex<HashMap<String, Arc<Mutex<WorkerRpcClient>>>>>,
     chain_results: ChainMailbox,
+    /// The steps of the chain run their layers here, one after the other as they came.
+    stages: Line,
+    /// Their results are handed to the next worker here, in the same order.
+    handovers: Line,
+    taken_back: TakenBack,
 }
 
 // written out because the derive would ask the executor itself to be `Clone`
@@ -49,7 +54,83 @@ impl<E> Clone for NetworkWorker<E> {
             iroh_endpoint: self.iroh_endpoint.clone(),
             peers: self.peers.clone(),
             chain_results: self.chain_results.clone(),
+            stages: self.stages.clone(),
+            handovers: self.handovers.clone(),
+            taken_back: self.taken_back.clone(),
         }
+    }
+}
+
+type Work = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Work that is done in the order it came, one piece at a time. A request may have two
+/// steps on their way at once, a token and the guess for the one after it: the engine keeps
+/// no positions of its own, so the second must never overtake the first.
+#[derive(Clone, Default)]
+struct Line(Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Work>>>);
+
+impl Line {
+    fn push(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
+        let sender = self.0.get_or_init(|| {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Work>();
+            tokio::spawn(async move {
+                while let Some(work) = receiver.recv().await {
+                    // in a task of its own: a piece that panics does not end the line
+                    let _ = tokio::spawn(work).await;
+                }
+            });
+            sender
+        });
+        let _ = sender.send(Box::pin(work));
+    }
+}
+
+/// The guesses the coordinator took back, and the one the layers are working on.
+#[derive(Clone, Default)]
+struct TakenBack {
+    inner: Arc<std::sync::Mutex<TakenBackInner>>,
+}
+
+#[derive(Default)]
+struct TakenBackInner {
+    steps: std::collections::HashSet<(String, u32)>,
+    running: Option<(String, u32)>,
+}
+
+impl TakenBack {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TakenBackInner> {
+        self.inner.lock().unwrap_or_else(|lock| lock.into_inner())
+    }
+
+    /// Notes that the step is taken back. `true` when the layers are working on it.
+    fn take_back(&self, key: (String, u32)) -> bool {
+        let mut inner = self.lock();
+        let running = inner.running.as_ref() == Some(&key);
+        inner.steps.insert(key);
+        running
+    }
+
+    /// `false` when the step was taken back before its turn came.
+    fn start(&self, key: &(String, u32), guess: bool) -> bool {
+        let mut inner = self.lock();
+        if inner.steps.contains(key) {
+            return false;
+        }
+        if guess {
+            inner.running = Some(key.clone());
+        }
+        true
+    }
+
+    /// `true` when the step was taken back while the layers worked on it.
+    fn finish(&self, key: &(String, u32)) -> bool {
+        let mut inner = self.lock();
+        inner.running = None;
+        inner.steps.contains(key)
+    }
+
+    fn forget(&self, request_id: &str) {
+        self.lock().steps.retain(|key| key.0 != request_id);
     }
 }
 
@@ -186,6 +267,9 @@ where
             iroh_endpoint: None,
             peers: Arc::new(Mutex::new(HashMap::new())),
             chain_results: ChainMailbox::default(),
+            stages: Line::default(),
+            handovers: Line::default(),
+            taken_back: TakenBack::default(),
         }
     }
 
@@ -239,10 +323,12 @@ where
         let worker = RingWorker::new(self.node_id.clone(), assignment, self.executor.clone());
         let started = Instant::now();
         let payload_len = activation.payload.len() as u64;
-        let output = worker
-            .forward(activation)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let output = worker.forward(activation).await.map_err(|err| match err {
+            crate::ring::RingWorkerError::Executor(bitty_inference::ExecutorError::Stopped) => {
+                Status::cancelled(err.to_string())
+            }
+            err => Status::internal(err.to_string()),
+        })?;
         let output = trim_logits(output, bitty_inference::sampling::top_logits_limit());
         metrics::record_activation_bytes("rx", payload_len);
         metrics::record_activation_bytes("tx", output.payload.len() as u64);
@@ -265,16 +351,29 @@ where
         route: Vec<String>,
         mut hop_micros: Vec<u64>,
     ) {
+        let guess = activation.guess;
+        if !self.taken_back.start(&key, guess) {
+            return;
+        }
         let started = Instant::now();
         let result = self.run_stage(activation).await;
+        // a guess that was taken back goes no further, whether the layers finished it or not
+        if self.taken_back.finish(&key) {
+            return;
+        }
         hop_micros.push(started.elapsed().as_micros() as u64);
         let output = match result {
             Ok(output) => output,
+            Err(status) if guess && status.code() == tonic::Code::Cancelled => return,
             Err(status) => {
                 let error = format!("worker {}: {}", self.node_id.0, status_text(&status));
-                return self
-                    .report_chain_failure(key, route.last(), error, hop_micros)
-                    .await;
+                let worker = self.clone();
+                self.handovers.push(async move {
+                    worker
+                        .report_chain_failure(key, route.last(), error, hop_micros)
+                        .await;
+                });
+                return;
             }
         };
         let Some((next, rest)) = route.split_first() else {
@@ -293,19 +392,25 @@ where
             route: rest.to_vec(),
             error: String::new(),
             hop_micros: hop_micros.clone(),
+            cancel: false,
         };
-        if let Err(status) = self.send_chain_step(next, step).await {
-            let error = format!(
-                "worker {} could not hand its result to {}: {}",
-                self.node_id.0,
-                endpoint_name(next),
-                status_text(&status)
-            );
-            // the last worker is the only one the coordinator listens to; when it is the
-            // one that cannot be reached, the coordinator finds out by its own timeout
-            self.report_chain_failure(key, rest.last(), error, hop_micros)
-                .await;
-        }
+        let (worker, next, rest) = (self.clone(), next.clone(), rest.to_vec());
+        self.handovers.push(async move {
+            if let Err(status) = worker.send_chain_step(&next, step).await {
+                let error = format!(
+                    "worker {} could not hand its result to {}: {}",
+                    worker.node_id.0,
+                    endpoint_name(&next),
+                    status_text(&status)
+                );
+                // the last worker is the only one the coordinator listens to; when it is
+                // the one that cannot be reached, the coordinator finds out by its own
+                // timeout
+                worker
+                    .report_chain_failure(key, rest.last(), error, hop_micros)
+                    .await;
+            }
+        });
     }
 
     /// Tells the coordinator that a token was lost on the way, through the last worker of
@@ -338,6 +443,7 @@ where
             route: Vec::new(),
             error,
             hop_micros,
+            cancel: false,
         };
         if let Err(status) = self.send_chain_step(last, step).await {
             eprintln!(
@@ -599,6 +705,7 @@ where
         }
         self.executor.end_request(&request_id).await;
         self.chain_results.forget(&request_id);
+        self.taken_back.forget(&request_id);
         Ok(Response::new(CleanupResponse { cleaned: true }))
     }
 
@@ -614,6 +721,12 @@ where
             .activation
             .ok_or_else(|| Status::invalid_argument("missing activation"))?;
         let key = (activation.request_id.clone(), activation.token_position);
+        if step.cancel {
+            if self.taken_back.take_back(key.clone()) {
+                self.executor.stop_guess(&key.0, key.1).await;
+            }
+            return Ok(Response::new(ChainAck { accepted: true }));
+        }
         if !step.error.is_empty() {
             // a worker before this one failed and sent the news here, to the end of the route
             self.chain_results.deliver(
@@ -629,7 +742,7 @@ where
         let activation = ActivationTensor::try_from(activation)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let worker = self.clone();
-        tokio::spawn(async move {
+        self.stages.push(async move {
             worker
                 .run_chain_step(key, activation, step.route, step.hop_micros)
                 .await;
@@ -694,6 +807,47 @@ mod tests {
     use super::*;
     use bitty_protocol::security::BITTY_TOKEN_HEADER;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn a_line_does_its_work_in_the_order_it_came() {
+        let line = Line::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for index in 0..20u64 {
+            let seen = seen.clone();
+            line.push(async move {
+                // the first pieces take the longest: without the line they would end last
+                tokio::time::sleep(std::time::Duration::from_millis(20 - index)).await;
+                seen.lock().unwrap().push(index);
+            });
+        }
+        let (done, wait) = oneshot::channel();
+        line.push(async move {
+            let _ = done.send(());
+        });
+        wait.await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_guess_taken_back_does_not_start_and_is_forgotten_with_its_request() {
+        let taken_back = TakenBack::default();
+        let (token, guess) = (("req".to_string(), 4), ("req".to_string(), 5));
+
+        // taken back while it waits: nothing is running, it will not start
+        assert!(taken_back.start(&token, false));
+        assert!(!taken_back.take_back(guess.clone()));
+        assert!(!taken_back.finish(&token));
+        assert!(!taken_back.start(&guess, true));
+
+        // taken back while the layers work on it: the engine is to be stopped
+        let running = ("req".to_string(), 7);
+        assert!(taken_back.start(&running, true));
+        assert!(taken_back.take_back(running.clone()));
+        assert!(taken_back.finish(&running));
+
+        taken_back.forget("req");
+        assert!(taken_back.start(&guess, true));
+    }
 
     #[test]
     fn worker_pre_shared_token_rejects_missing_metadata() {

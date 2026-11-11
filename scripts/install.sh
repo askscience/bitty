@@ -72,7 +72,8 @@ update_binaries() {
         fetch "$BASE_URL/VERSION" "$work/VERSION" || fail "cannot reach $BASE_URL"
         latest="$(tr -d '[:space:]' < "$work/VERSION")"
         [ -n "$latest" ] || fail "the release has an empty VERSION file"
-        if [ "$latest" = "$current" ] && [ -x "$PREFIX/bin/bitty" ] && [ -x "$PREFIX/bin/bitty-stage" ]; then
+        if [ "$latest" = "$current" ] && [ -x "$PREFIX/bin/bitty" ] && [ -x "$PREFIX/bin/bitty-stage" ] \
+            && [ -x "$PREFIX/bin/bitty-stage-sse" ]; then
             return 1
         fi
         archive="$work/$name.tar.gz"
@@ -89,13 +90,21 @@ update_binaries() {
     for file in bitty bitty-stage install.sh VERSION; do
         [ -f "$work/new/$name/$file" ] || fail "the archive has no $file"
     done
-    chmod +x "$work/new/$name/bitty" "$work/new/$name/bitty-stage" "$work/new/$name/install.sh"
+    chmod +x "$work/new/$name/bitty" "$work/new/$name"/bitty-stage* "$work/new/$name/install.sh"
     "$work/new/$name/bitty" version > /dev/null || fail "the new bitty does not run on this machine; nothing was changed"
 
     # copy next to the target first, then rename: a running node keeps its old file and nobody
     # ever sees half a binary
     local pair source target
-    for pair in "bitty:bin/bitty" "bitty-stage:bin/bitty-stage" "install.sh:bin/bitty-update" "VERSION:VERSION"; do
+    local pairs=("bitty:bin/bitty" "bitty-stage:bin/bitty-stage" "install.sh:bin/bitty-update" "VERSION:VERSION")
+    # the engines for older processors: bitty picks the one its machine can run
+    local variant
+    for variant in avx sse; do
+        if [ -f "$work/new/$name/bitty-stage-$variant" ]; then
+            pairs+=("bitty-stage-$variant:bin/bitty-stage-$variant")
+        fi
+    done
+    for pair in "${pairs[@]}"; do
         source="$work/new/$name/${pair%%:*}"
         target="$PREFIX/${pair#*:}"
         cp -p "$source" "$target.new"

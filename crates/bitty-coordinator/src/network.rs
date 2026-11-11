@@ -186,6 +186,14 @@ fn default_draft_tokens() -> usize {
         .unwrap_or(0)
 }
 
+/// `BITTY_PIPELINE=1` sends a guess for the next token behind every token, for every
+/// request (`--pipeline` asks for it with one request).
+fn pipeline_wanted() -> bool {
+    std::env::var("BITTY_PIPELINE")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// `BITTY_CHAIN=0` makes every worker answer the coordinator, as it was before the workers
 /// learned to pass the result to each other.
 fn chain_wanted() -> bool {
@@ -884,41 +892,78 @@ impl NetworkCoordinator {
         Some(route)
     }
 
-    /// Sends one token through the workers: the first gets it from here, each hands its
-    /// result to the next, and the last one keeps the logits for the coordinator. Returns
-    /// them with the time each worker spent on its layers.
-    async fn chain_token(
+    /// The worker a token enters the chain by, and the one that keeps its result.
+    fn chain_ends(
         worker_clients: &mut [WorkerRpcClient],
-        route: &[String],
-        activation: &ActivationTensor,
-    ) -> Result<(ActivationTensor, Vec<u64>), Status> {
+    ) -> Result<(&mut WorkerRpcClient, &mut WorkerRpcClient), Status> {
         let (first, rest) = worker_clients
             .split_first_mut()
             .ok_or_else(|| Status::failed_precondition("no workers registered"))?;
         let last = rest
             .last_mut()
             .ok_or_else(|| Status::failed_precondition("a chain needs two workers"))?;
-        let step = ChainStep {
-            activation: Some(ProtoActivationTensor::from(activation)),
-            route: route[1..].to_vec(),
-            error: String::new(),
-            hop_micros: Vec::new(),
-        };
+        Ok((first, last))
+    }
+
+    /// Hands a token to the first worker of the chain. It comes back as soon as the worker
+    /// has it: the workers do their steps in the order they got them.
+    async fn chain_send(
+        first: &mut WorkerRpcClient,
+        route: &[String],
+        activation: &ActivationTensor,
+    ) -> Result<(), Status> {
+        first
+            .forward_chain(ChainStep {
+                activation: Some(ProtoActivationTensor::from(activation)),
+                route: route[1..].to_vec(),
+                error: String::new(),
+                hop_micros: Vec::new(),
+                cancel: false,
+            })
+            .await
+    }
+
+    /// Takes a guess back from every worker: the ones that have not started it never will,
+    /// the one that is working on it stops, the ones that finished it are told with the
+    /// next token to go back.
+    async fn chain_take_back(worker_clients: &mut [WorkerRpcClient], request_id: &str, step: u32) {
+        let activation = ActivationTensor::new(
+            request_id.to_string(),
+            step,
+            0,
+            0,
+            vec![0],
+            ActivationDType::Tokens,
+            Vec::new(),
+        );
+        futures::future::join_all(worker_clients.iter_mut().map(|client| {
+            client.forward_chain(ChainStep {
+                activation: Some(ProtoActivationTensor::from(&activation)),
+                route: Vec::new(),
+                error: String::new(),
+                hop_micros: Vec::new(),
+                cancel: true,
+            })
+        }))
+        .await;
+    }
+
+    /// Waits on the last worker for the result of a step, with the time each worker spent
+    /// on its layers.
+    async fn chain_wait(
+        last: &mut WorkerRpcClient,
+        request_id: &str,
+        step: u32,
+    ) -> Result<(ActivationTensor, Vec<u64>), Status> {
         let limit = chain_timeout();
-        let wait = async {
-            tokio::time::timeout(
-                limit,
-                last.await_chain_result(&activation.request_id, activation.token_position),
-            )
+        let result = tokio::time::timeout(limit, last.await_chain_result(request_id, step))
             .await
             .unwrap_or_else(|_| {
                 Err(Status::deadline_exceeded(format!(
                     "no answer from the workers in {} seconds",
                     limit.as_secs()
                 )))
-            })
-        };
-        let (_, result) = tokio::try_join!(first.forward_chain(step), wait)?;
+            })?;
         if !result.error.is_empty() {
             return Err(Status::internal(result.error));
         }
@@ -998,9 +1043,26 @@ impl NetworkCoordinator {
         // last certain token and the guesses in one pass and answer for each of them. The
         // guesses are kept as long as the model chooses the same token; at the first other
         // one the workers go back. The text is the one the model would have written alone.
+        //
+        // The pipeline is the other way to use the draft: its guess for the next token
+        // goes out right behind every token, as a pass of its own. While the last worker
+        // still works on the token, the first one already works on the guess. A right
+        // guess is half done when its turn comes; a wrong one is taken back.
+        let pipeline = (request.pipeline || pipeline_wanted())
+            && request.draft_tokens >= 0
+            && worker_clients.len() > 1;
         let (mut draft, draft_tokens) = self
-            .draft_for(request.draft_tokens, codec.vocab_size())
+            .draft_for(
+                if pipeline {
+                    request.draft_tokens.max(1)
+                } else {
+                    request.draft_tokens
+                },
+                codec.vocab_size(),
+            )
             .await;
+        // the step of the guess that is on its way through the workers
+        let mut flying: Option<u32> = None;
         // the whole text: the prompt and every token chosen so far
         let mut text_tokens = std::mem::take(&mut current_input);
         // how many of them the workers hold
@@ -1017,7 +1079,7 @@ impl NetworkCoordinator {
             let mut guesses = Vec::new();
             // The workers can only take back tokens of their last pass, and not its first
             // one: a guess goes with one certain token, not with the prompt.
-            if let (Some(model), 1) = (&draft, pending.len()) {
+            if let (Some(model), 1, false) = (&draft, pending.len(), pipeline) {
                 let count =
                     draft_tokens.min((max_new_tokens - produced).saturating_sub(1) as usize);
                 let (model, codec) = (model.clone(), codec.clone());
@@ -1058,8 +1120,64 @@ impl NetworkCoordinator {
                 activation.rewind_to = fed as u32;
             }
 
+            // the token this pass is expected to choose, already sent on as a guess
+            let mut ahead = None;
             if let Some(endpoints) = &route {
-                match Self::chain_token(&mut worker_clients, endpoints, &activation).await {
+                // a guess that was right is the pass of its token: it went out a pass ago
+                let riding = flying.take().is_some();
+                let result = async {
+                    let (first, last) = Self::chain_ends(&mut worker_clients)?;
+                    if !riding {
+                        Self::chain_send(first, endpoints, &activation).await?;
+                    }
+                    // Not behind the prompt: its pass is the one that may start again. And
+                    // not when this pass chooses the last token.
+                    let model = draft.as_ref().filter(|_| {
+                        pipeline && pending.len() == 1 && step > 0 && produced + 1 < max_new_tokens
+                    });
+                    if let Some(model) = model {
+                        let (model, codec) = (model.clone(), codec.clone());
+                        let (request, text) = (request_id.clone(), text_tokens.clone());
+                        let proposed = tokio::task::spawn_blocking(move || {
+                            let mut model =
+                                model.lock().unwrap_or_else(|poison| poison.into_inner());
+                            let guess = model.propose(&request, &text, 1, |_| false);
+                            model.settle(&request, 0);
+                            guess.map(|tokens| {
+                                tokens.first().copied().filter(|token| !codec.is_end(*token))
+                            })
+                        })
+                        .await;
+                        match proposed {
+                            Ok(Ok(Some(token))) => {
+                                let mut guess = ActivationTensor::new(
+                                    run_id.clone(),
+                                    step + 1,
+                                    0,
+                                    0,
+                                    vec![1],
+                                    ActivationDType::Tokens,
+                                    token.to_le_bytes().to_vec(),
+                                );
+                                guess.guess = true;
+                                Self::chain_send(first, endpoints, &guess).await?;
+                                flying = Some(step + 1);
+                                ahead = Some(token);
+                            }
+                            // the end of the text needs no pass
+                            Ok(Ok(None)) => {}
+                            Ok(Err(err)) => eprintln!(
+                                "bitty-coordinator: the draft model failed ({err}); this token goes without a guess"
+                            ),
+                            Err(err) => eprintln!(
+                                "bitty-coordinator: the draft model failed ({err}); this token goes without a guess"
+                            ),
+                        }
+                    }
+                    Self::chain_wait(last, &run_id, step).await
+                }
+                .await;
+                match result {
                     Ok((output, micros)) => {
                         if step > 0 {
                             for (total, micros) in hop_micros.iter_mut().zip(micros) {
@@ -1229,6 +1347,22 @@ impl NetworkCoordinator {
             if done {
                 break;
             }
+            if let Some(token) = ahead {
+                guessed += 1;
+                if text_tokens.last() == Some(&token) {
+                    // the next pass is the guess: it has the number this one is given now
+                    kept += 1;
+                } else {
+                    if let Some(step) = flying.take() {
+                        Self::chain_take_back(&mut worker_clients, &run_id, step).await;
+                    }
+                    rewind = true;
+                    step += 1;
+                }
+            }
+        }
+        if let Some(step) = flying {
+            Self::chain_take_back(&mut worker_clients, &run_id, step).await;
         }
         if let Some(model) = &draft {
             let (model, request) = (model.clone(), request_id.clone());

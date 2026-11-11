@@ -183,6 +183,8 @@ struct GenerateOptions {
     /// Tokens the draft model guesses for one pass: 0 for the leader's default, negative
     /// for none.
     draft_tokens: i32,
+    /// Send the draft's guess for the next token behind every token.
+    pipeline: bool,
     /// Token of the cluster, for a scheduler reached over plain TCP.
     cluster_token: Option<String>,
 }
@@ -381,7 +383,34 @@ impl Cli {
     }
 }
 
+/// A node that serves layers is of no use asleep, and a machine nobody touches goes to sleep by
+/// itself: the ring then waits ten minutes for it and is planned again without it. While the
+/// node runs, Windows is told that the system is needed (the screen may still turn off).
+/// `BITTY_ALLOW_SLEEP=1` leaves the machine to its power plan.
+fn keep_the_machine_awake() {
+    #[cfg(windows)]
+    {
+        if std::env::var("BITTY_ALLOW_SLEEP").is_ok_and(|value| value == "1") {
+            return;
+        }
+        const ES_CONTINUOUS: u32 = 0x8000_0000;
+        const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+        extern "system" {
+            fn SetThreadExecutionState(flags: u32) -> u32;
+        }
+        // the request lasts as long as the thread that made it, so it gets one of its own
+        std::thread::spawn(|| {
+            // SAFETY: a plain Win32 call that takes flags and returns the previous ones
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+            loop {
+                std::thread::park();
+            }
+        });
+    }
+}
+
 async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    keep_the_machine_awake();
     if config.node_id.is_empty() {
         config.node_id = stored_node_id(&bitty_data_dir(config.data_dir.as_deref()));
     }
@@ -1176,10 +1205,15 @@ async fn register_and_heartbeat(
 
     match target {
         SchedulerTarget::Local(coordinator) => {
+            // the worker beside the scheduler is as near as a node gets
+            let mut beside = profile.clone();
+            if std::env::var_os("BITTY_NETWORK_RTT_MS").is_none() {
+                beside.network_rtt_ms = 0.0;
+            }
             let registration = coordinator
                 .register_worker(request_with_token(
                     RegisterWorkerRequest {
-                        profile: Some((&profile).into()),
+                        profile: Some((&beside).into()),
                         protocol_version: BITTY_PROTOCOL_VERSION,
                         inference_backend_id: STAGE_BACKEND_ID.into(),
                     },
@@ -1208,6 +1242,7 @@ async fn register_and_heartbeat(
                             backend_type: profile.backend_type.clone(),
                             holdings: node_holdings(config),
                             report: String::new(),
+                            leader_rtt_ms: 0.0,
                         },
                         cluster_token,
                     ))
@@ -1606,6 +1641,44 @@ impl RemoteScheduler {
 /// Heartbeats that may fail in a row before the worker registers again.
 const HEARTBEAT_FAILURES_BEFORE_REJOIN: u32 = 5;
 
+/// How far the leader is: the shortest of the last round trips. The shortest one is the
+/// nearest to the time of the network alone, the others waited on something.
+#[derive(Default)]
+struct LinkTime(std::collections::VecDeque<f64>);
+
+impl LinkTime {
+    const KEPT: usize = 8;
+
+    fn note(&mut self, started: std::time::Instant) {
+        if self.0.len() == Self::KEPT {
+            self.0.pop_front();
+        }
+        self.0
+            .push_back((started.elapsed().as_secs_f64() * 1000.0).max(0.01));
+    }
+
+    fn best(&self) -> Option<f64> {
+        self.0.iter().copied().reduce(f64::min)
+    }
+}
+
+/// Asks the leader three times for nothing, to know how far it is before the node is
+/// given its layers. The name is one no node has, so the leader changes nothing.
+async fn measure_link(scheduler: &mut RemoteScheduler, node_id: &str, link: &mut LinkTime) {
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let asked = scheduler
+            .heartbeat(HeartbeatRequest {
+                node_id: format!("{node_id}-link"),
+                ..Default::default()
+            })
+            .await;
+        if asked.is_ok() {
+            link.note(started);
+        }
+    }
+}
+
 /// Registers with a remote scheduler and keeps the registration alive for as long as the node
 /// runs. A scheduler that restarts (an update, a reboot) has forgotten its workers: it answers
 /// the next heartbeat with "not accepted", or does not answer at all for a while. In both cases
@@ -1618,10 +1691,19 @@ async fn stay_registered(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let label = scheduler.label();
     let mut retry = Duration::from_secs(1);
+    let mut link = LinkTime::default();
+    let measure = std::env::var_os("BITTY_NETWORK_RTT_MS").is_none();
     loop {
+        let mut measured = profile.clone();
+        if measure {
+            measure_link(&mut scheduler, &profile.node_id.0, &mut link).await;
+            if let Some(rtt) = link.best() {
+                measured.network_rtt_ms = rtt;
+            }
+        }
         let registration = scheduler
             .register(RegisterWorkerRequest {
-                profile: Some(profile.into()),
+                profile: Some((&measured).into()),
                 protocol_version: BITTY_PROTOCOL_VERSION,
                 inference_backend_id: STAGE_BACKEND_ID.into(),
             })
@@ -1654,6 +1736,7 @@ async fn stay_registered(
         loop {
             sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
             let snapshot = worker_stats.snapshot().await;
+            let asked = std::time::Instant::now();
             let response = scheduler
                 .heartbeat(HeartbeatRequest {
                     node_id: profile.node_id.0.clone(),
@@ -1666,8 +1749,16 @@ async fn stay_registered(
                     backend_type: profile.backend_type.clone(),
                     holdings: node_holdings(config),
                     report: std::mem::take(&mut report),
+                    leader_rtt_ms: if measure {
+                        link.best().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    },
                 })
                 .await;
+            if response.is_ok() {
+                link.note(asked);
+            }
             match response {
                 Ok(response) if response.accepted => {
                     failures = 0;
@@ -1777,6 +1868,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                     raw: config.options.raw,
                     thinking: config.options.thinking,
                     draft_tokens: config.options.draft_tokens,
+                    pipeline: config.options.pipeline,
                 },
             )
             .await?;
@@ -1804,6 +1896,7 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
                 raw: config.options.raw,
                 thinking: config.options.thinking,
                 draft_tokens: config.options.draft_tokens,
+                pipeline: config.options.pipeline,
             },
             config.options.cluster_token.as_deref().unwrap_or_default(),
         ))
@@ -2096,6 +2189,7 @@ fn parse_generate(args: &mut impl Iterator<Item = String>) -> Result<GenerateCon
             "--think" => config.options.thinking = true,
             "--draft" => config.options.draft_tokens = parse_draft(args)?,
             "--no-draft" => config.options.draft_tokens = -1,
+            "--pipeline" => config.options.pipeline = true,
             "--cluster-token" => {
                 config.options.cluster_token = Some(required_next(args, "--cluster-token")?)
             }
@@ -2178,6 +2272,7 @@ fn parse_run(args: &mut impl Iterator<Item = String>) -> Result<RunConfig, Strin
             "--think" => config.options.thinking = true,
             "--draft" => config.options.draft_tokens = parse_draft(args)?,
             "--no-draft" => config.options.draft_tokens = -1,
+            "--pipeline" => config.options.pipeline = true,
             "--num-ctx" | "--system" | "--template" => {
                 let _ = required_next(args, arg.as_str()).ok();
             }
@@ -3691,7 +3786,7 @@ fn print_help() {
     println!("  bitty node --join 'iroh://INVITE' --model PATH");
     println!("  bitty node --no-iroh --join HOST:PORT --model PATH");
     println!("  bitty generate --prompt TEXT [--node TARGET] [--max-tokens N] [--temperature T]");
-    println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--draft N] [--cluster-token TOKEN]");
+    println!("                 [--top-k K] [--top-p P] [--seed N] [--think] [--raw] [--draft N] [--pipeline] [--cluster-token TOKEN]");
     println!("  bitty chat [MODEL] [--prompt TEXT] [--node TARGET]");
     println!("  bitty status [--node TARGET]");
     println!(

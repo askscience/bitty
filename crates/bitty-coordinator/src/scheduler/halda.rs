@@ -24,6 +24,13 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// A node that answers the leader faster than this is near: it is beside it, or a short
+/// direct link away. A node that has not measured its link yet counts as near.
+const NEAR_MS: f64 = 30.0;
+/// Nodes that are far come in by how far they are, in steps of this size; inside a step
+/// the stronger one comes first.
+const FAR_BAND_MS: f64 = 20.0;
+
 #[derive(Clone, Debug)]
 pub struct Halda {
     config: SchedulerConfig,
@@ -92,6 +99,64 @@ impl Halda {
             }
         }
 
+        // The token goes through the nodes one after the other: a node more does not make
+        // the layers faster, it adds a trip. So the nodes that are near do the work, and
+        // one that is far comes in only while the nearer ones cannot hold the model in the
+        // memory they have free.
+        let mut far = ranked
+            .iter()
+            .filter(|node| node.network_rtt_ms >= NEAR_MS)
+            .cloned()
+            .collect::<Vec<_>>();
+        far.sort_by(|a, b| {
+            let band = |node: &HardwareProfile| (node.network_rtt_ms / FAR_BAND_MS) as u64;
+            band(a).cmp(&band(b))
+        });
+        let mut lens = None;
+        for count in 0..far.len() {
+            let allowed = &far[..count];
+            let near = ranked
+                .iter()
+                .filter(|node| {
+                    node.network_rtt_ms < NEAR_MS
+                        || allowed.iter().any(|far| far.node_id == node.node_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if near.is_empty() {
+                continue;
+            }
+            if let Ok((found, false)) = self.lay_out(&near, layers) {
+                lens = Some(found);
+                ranked = near;
+                break;
+            }
+        }
+        let lens = match lens {
+            Some(lens) => lens,
+            None => self.lay_out(&ranked, layers)?.0,
+        };
+
+        let mut cursor = 0_u32;
+        let ranges = ranked
+            .iter()
+            .zip(lens)
+            .map(|(node, len)| {
+                let start = cursor;
+                cursor += len;
+                (node, start, cursor)
+            })
+            .collect::<Vec<_>>();
+        self.build(&ranges, nodes, layers)
+    }
+
+    /// How many layers each node takes, in the order of `ranked`, and whether a node had to
+    /// go past the memory it has free.
+    fn lay_out(
+        &self,
+        ranked: &[HardwareProfile],
+        layers: &[LayerMetadata],
+    ) -> Result<(Vec<u32>, bool), HaldaError> {
         let total_score = ranked
             .iter()
             .map(HardwareProfile::effective_compute_score)
@@ -147,6 +212,7 @@ impl Halda {
         // engine, so it can hold only one range: the layers left over make the existing ranges
         // longer, fastest node first, and are never handed out as a second range.
         let mut left_over = total_layers - cursor;
+        let mut past_free = false;
         for hard in [false, true] {
             for index in 0..lens.len() {
                 if left_over == 0 {
@@ -164,6 +230,7 @@ impl Halda {
                 {
                     lens[index] += 1;
                     left_over -= 1;
+                    past_free |= hard;
                 }
             }
         }
@@ -175,17 +242,7 @@ impl Halda {
             });
         }
 
-        let mut cursor = 0_u32;
-        let ranges = ranked
-            .iter()
-            .zip(lens)
-            .map(|(node, len)| {
-                let start = cursor;
-                cursor += len;
-                (node, start, cursor)
-            })
-            .collect::<Vec<_>>();
-        self.build(&ranges, nodes, layers)
+        Ok((lens, past_free))
     }
 
     /// A plan made earlier, as it stands on the nodes of now: the same ranges on the same
@@ -475,6 +532,60 @@ mod tests {
         let mut profile = node(index, NodeTier::D, ram_gb as f64);
         profile.available_ram_mb = free_gb * 1024;
         profile
+    }
+
+    fn linked(mut profile: HardwareProfile, rtt_ms: f64) -> HardwareProfile {
+        profile.network_rtt_ms = rtt_ms;
+        profile
+    }
+
+    fn holders(assignments: &[LayerAssignment]) -> Vec<String> {
+        let mut names = assignments
+            .iter()
+            .map(|assignment| assignment.node_id.0.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_far_node_stays_out_while_the_near_ones_hold_the_model() {
+        let nodes = vec![
+            linked(cpu_node(0, 32, 28), 0.0),
+            linked(cpu_node(1, 8, 6), 1.5),
+            linked(cpu_node(2, 16, 14), 70.0),
+        ];
+        let plan = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert_eq!(holders(&plan), ["node-0", "node-1"]);
+    }
+
+    #[test]
+    fn the_nearest_far_node_comes_in_when_the_near_ones_are_too_small() {
+        let nodes = vec![
+            linked(cpu_node(0, 16, 12), 0.0),
+            linked(cpu_node(1, 8, 6), 1.5),
+            linked(cpu_node(2, 32, 28), 180.0),
+            linked(cpu_node(3, 32, 28), 70.0),
+        ];
+        let plan = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert_eq!(holders(&plan), ["node-0", "node-1", "node-3"]);
+    }
+
+    #[test]
+    fn every_node_works_when_only_all_of_them_hold_the_model() {
+        let nodes = vec![
+            linked(cpu_node(0, 16, 10), 0.0),
+            linked(cpu_node(1, 16, 10), 90.0),
+            linked(cpu_node(2, 16, 10), 200.0),
+        ];
+        let plan = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert_eq!(holders(&plan), ["node-0", "node-1", "node-2"]);
     }
 
     fn len_of(assignments: &[LayerAssignment], index: usize) -> u32 {

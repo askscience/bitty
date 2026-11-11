@@ -147,6 +147,17 @@ pub struct StageExecutor {
     /// that was given new layers does not finish downloading the old ones first.
     wanted: Arc<std::sync::atomic::AtomicU64>,
     engine: Arc<Mutex<Engine>>,
+    /// Stops a guess of the running engine; reachable while `engine` is locked by the
+    /// thread that waits for the guess.
+    abort: Arc<Mutex<Option<crate::stage_process::StageAbort>>>,
+}
+
+/// The name a guess has for the engine: one request never has two with the same position.
+fn guess_tag(request_id: &str, token_position: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (request_id, token_position).hash(&mut hasher);
+    hasher.finish()
 }
 
 impl std::fmt::Debug for StageExecutor {
@@ -168,6 +179,7 @@ impl StageExecutor {
             options: StageOptions::from_env(),
             stage_source: None,
             wanted: Arc::default(),
+            abort: Arc::default(),
             engine: Arc::default(),
         }
     }
@@ -307,6 +319,7 @@ impl StageExecutor {
             rollback: self.options.rollback,
         })
         .map_err(|err| ExecutorError::Failed(err.to_string()))?;
+        *self.abort.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(process.abort_handle());
         engine.process = Some(process);
         Ok(())
     }
@@ -446,24 +459,43 @@ impl LayerExecutor for StageExecutor {
             let every_row = activation.every_row;
 
             let process = engine.process.as_mut().expect("process started");
+            let tag = guess_tag(&activation.request_id, activation.token_position);
             let result = if first {
                 let ids: Vec<u32> = activation
                     .payload
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
                     .collect();
-                process.decode_tokens(session_id, position, &ids, every_row)
-            } else {
-                process.decode_hidden(
+                if activation.guess {
+                    process.guess_tokens(session_id, position, &ids, tag)
+                } else {
+                    process
+                        .decode_tokens(session_id, position, &ids, every_row)
+                        .map(Some)
+                }
+            } else if activation.guess {
+                process.guess_hidden(
                     session_id,
                     position,
                     tokens as u32,
                     &activation.payload,
-                    every_row,
+                    tag,
                 )
+            } else {
+                process
+                    .decode_hidden(
+                        session_id,
+                        position,
+                        tokens as u32,
+                        &activation.payload,
+                        every_row,
+                    )
+                    .map(Some)
             };
             let output = match engine.settle(result) {
-                Ok(output) => output,
+                Ok(Some(output)) => output,
+                // the engine put the session back where the guess started
+                Ok(None) => return Err(ExecutorError::Stopped),
                 Err(err) => {
                     // the engine dropped the session with the failed request
                     engine.sessions.remove(&activation.request_id);
@@ -509,7 +541,8 @@ impl LayerExecutor for StageExecutor {
                     (values, vec![width])
                 }
             };
-            let (rewind_to, every_row) = (activation.rewind_to, activation.every_row);
+            let (rewind_to, every_row, guess) =
+                (activation.rewind_to, activation.every_row, activation.guess);
             let mut payload = Vec::with_capacity(values.len() * 4);
             for value in &values {
                 payload.extend_from_slice(&value.to_le_bytes());
@@ -526,6 +559,7 @@ impl LayerExecutor for StageExecutor {
             // the stages that follow must go back and answer in the same way
             output.rewind_to = rewind_to;
             output.every_row = every_row;
+            output.guess = guess;
             Ok(output)
         })
         .await
@@ -538,6 +572,17 @@ impl LayerExecutor for StageExecutor {
         {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => format!("<token:{token_id}>"),
+        }
+    }
+
+    async fn stop_guess(&self, request_id: &str, token_position: u32) {
+        let abort = self
+            .abort
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone();
+        if let Some(abort) = abort {
+            abort.stop(guess_tag(request_id, token_position));
         }
     }
 

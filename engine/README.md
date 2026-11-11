@@ -175,6 +175,32 @@ by one, and where two tokens are that close the choice can fall on the other.
 `engine/spec_check.py` checks that every token chosen this way is within 0.5 of
 the best one when the model reads the same text token by token.
 
+### The pipeline
+
+`--pipeline` (or `BITTY_PIPELINE=1` on the leader) uses the draft model the
+other way. In a ring only one machine works at a time: the others wait for the
+token to come round. With the pipeline the leader sends the token and, right
+behind it, the draft's guess for the next one as a pass of its own. While the
+last machine works on the token, the first already works on the guess.
+
+- The guess was right: its pass is already on its way, the next token costs
+  only what is left of it.
+- The guess was wrong: the leader takes it back. A machine that has not
+  started it drops it, the one that is working on it stops within a few
+  milliseconds (op `ABORT` of the engine) and puts its state back, one that
+  finished it goes back with the next token.
+
+Each worker does the steps of a request in the order they came, so a guess
+never overtakes its token. One token is decoded at a time, so the text is the
+one of a request without a draft: the smoke test compares the two, with guesses
+that are right and with guesses that are wrong.
+
+What it can give: with two machines the time of the shorter stage, on the
+tokens the draft gets right. A ring cut in equal parts, or with long trips
+between the machines, gains more. It needs two workers or more and a route
+from worker to worker; `--no-draft` turns it off. It is not used together with
+`--draft N`.
+
 Engines are started with `GOMP_SPINCOUNT=1000` unless that variable or
 `OMP_WAIT_POLICY` is already set: idle threads spin briefly and then sleep.
 The libgomp default spins long enough to take the cores from the other stages

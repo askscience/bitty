@@ -77,6 +77,28 @@ kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)
 echo "$kept"
 [ "${kept%% *}" -ge 8 ] || die "the workers kept too few draft tokens: $kept"
 
+echo "== pipeline"
+# the guess for the next token travels behind every token; the text must stay the same,
+# with guesses that are right (greedy) and with guesses that are often wrong (sampled)
+sampled() {
+    "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+        --prompt "Write a short poem about the sea." --seed 11 --max-tokens 48 --temperature "$1" "${@:2}" 2>> "$WORK/client.log"
+}
+for temperature in 0 1.2; do
+    plain="$(sampled "$temperature" --no-draft)" || die "no text at temperature $temperature"
+    piped="$(sampled "$temperature" --pipeline)" || die "no text with the pipeline at temperature $temperature"
+    [ "$plain" = "$piped" ] || die "the pipeline changed the text at temperature $temperature: '$plain' / '$piped'"
+    kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)"
+    echo "temperature $temperature: $kept"
+    guessed="${kept#* of }"
+    [ "${guessed%% *}" -ge 20 ] || die "the pipeline sent too few guesses: $kept"
+    if [ "$temperature" = 0 ]; then
+        [ "${kept%% *}" -ge 20 ] || die "the pipeline kept too few guesses: $kept"
+    else
+        [ "${kept%% *}" -lt "${guessed%% *}" ] || die "no guess was wrong, the way back was not tried: $kept"
+    fi
+done
+
 echo "== the leader asks a node for its logs"
 "$BITTY" ask n1 logs --data-dir "$DATA/n0" || die "bitty ask"
 report="$WORK/n0/logs/node-n1.log"

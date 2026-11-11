@@ -77,6 +77,9 @@ message ActivationTensor {
   // The final stage answers with the best logits of every token of the payload, not only of
   // the last one.
   bool every_row = 11;
+  // The tokens of the payload are a guess: the request may be told to go back to where
+  // they start, and a worker may be told to stop working on them (see ChainStep.cancel).
+  bool guess = 12;
 }
 
 message TokenOutput {
@@ -119,6 +122,9 @@ message GenerateRequest {
   // Tokens the draft model of the coordinator guesses for one pass of the workers. 0 takes
   // the coordinator's default, a negative number asks for no draft.
   sint32 draft_tokens = 11;
+  // Start each token from the guess of the draft model while the workers are still on the
+  // token before it. A wrong guess is stopped and run again.
+  bool pipeline = 12;
 }
 
 message GenerateResponse {
@@ -152,6 +158,9 @@ message HeartbeatRequest {
   string holdings = 6;
   // The last lines of the logs of the node, sent once after the leader asked for them.
   string report = 7;
+  // The shortest round trip of the last heartbeats of the node, as the node measured it.
+  // 0 when it has not measured any.
+  double leader_rtt_ms = 8;
 }
 
 message HeartbeatResponse {
@@ -223,6 +232,10 @@ message ChainStep {
   string error = 3;
   // Time each worker so far spent on its layers, in microseconds.
   repeated uint64 hop_micros = 4;
+  // The step named by the request and the position of the activation is taken back: a
+  // worker that has not started it drops it, one that is working on it stops. Nothing is
+  // handed on and no result is kept. Only a guess can be taken back.
+  bool cancel = 5;
 }
 
 message ChainAck {

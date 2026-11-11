@@ -395,6 +395,9 @@ pub struct ActivationTensor {
     /// The final stage answers for every token of the payload, not only for the last one.
     #[serde(default)]
     pub every_row: bool,
+    /// The tokens of the payload are a guess that may be taken back.
+    #[serde(default)]
+    pub guess: bool,
 }
 
 impl ActivationTensor {
@@ -420,6 +423,7 @@ impl ActivationTensor {
             compression: CompressionKind::None,
             rewind_to: 0,
             every_row: false,
+            guess: false,
         }
     }
 
@@ -514,6 +518,9 @@ pub struct Heartbeat {
     /// The last lines of the logs of the node, when the leader asked for them.
     #[serde(default)]
     pub report: String,
+    /// The shortest round trip of the last heartbeats, as the node measured it; 0 for none.
+    #[serde(default)]
+    pub leader_rtt_ms: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -719,6 +726,7 @@ impl From<&ActivationTensor> for pb::ActivationTensor {
             compression: activation.compression.as_str().into(),
             rewind_to: activation.rewind_to,
             every_row: activation.every_row,
+            guess: activation.guess,
         }
     }
 }
@@ -749,6 +757,7 @@ impl TryFrom<pb::ActivationTensor> for ActivationTensor {
             compression: CompressionKind::try_from(activation.compression.as_str())?,
             rewind_to: activation.rewind_to,
             every_row: activation.every_row,
+            guess: activation.guess,
         };
         validation::validate_activation_tensor(&activation)?;
         Ok(activation)
@@ -860,6 +869,7 @@ impl From<&Heartbeat> for pb::HeartbeatRequest {
             backend_type: heartbeat.backend_type.clone(),
             holdings: heartbeat.holdings.clone(),
             report: heartbeat.report.clone(),
+            leader_rtt_ms: heartbeat.leader_rtt_ms,
         }
     }
 }
@@ -874,6 +884,7 @@ impl From<pb::HeartbeatRequest> for Heartbeat {
             backend_type: heartbeat.backend_type,
             holdings: heartbeat.holdings,
             report: heartbeat.report,
+            leader_rtt_ms: heartbeat.leader_rtt_ms,
         }
     }
 }
@@ -1009,6 +1020,7 @@ mod tests {
             compression: "none".into(),
             rewind_to: 0,
             every_row: false,
+            guess: false,
         })
         .unwrap_err();
 
@@ -1029,6 +1041,7 @@ mod tests {
             compression: "none".into(),
             rewind_to: 0,
             every_row: false,
+            guess: false,
         })
         .unwrap_err();
 

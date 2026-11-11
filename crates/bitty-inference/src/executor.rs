@@ -8,6 +8,9 @@ pub enum ExecutorError {
     ChecksumFailed,
     #[error("execution failed: {0}")]
     Failed(String),
+    /// A guess was told to stop; the request is where it was before the guess.
+    #[error("the guess was stopped")]
+    Stopped,
 }
 
 #[async_trait]
@@ -30,6 +33,10 @@ pub trait LayerExecutor: Send + Sync {
 
     /// Drops any per-request state (KV cache, recurrent state) held for `request_id`.
     async fn end_request(&self, _request_id: &str) {}
+
+    /// Stops the guess of `request_id` with this `token_position`, if it is being worked on
+    /// or about to be: its `execute_range` then ends with [`ExecutorError::Stopped`].
+    async fn stop_guess(&self, _request_id: &str, _token_position: u32) {}
 
     async fn final_logits(&self, activation: ActivationTensor) -> Result<Logits, ExecutorError> {
         if !activation.verify_checksum() {

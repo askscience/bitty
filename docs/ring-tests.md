@@ -15,6 +15,7 @@ and the median counts. A number that was not measured is not written down.
 | plain | `bitty run qwen3.5-35b-a3b "..." --no-draft` | tokens per second of the ring, and where the time goes |
 | draft of 2, 4, 8 | the same with `--draft N` | whether guesses pay on a real network; one machine said 2.26 tokens per pass with 4 |
 | temperature 0.7 | `--draft 4 --temperature 0.7` | how much a greedy draft loses when the answer is sampled |
+| pipeline | the same with `--pipeline` | whether a guess that travels behind its token pays: the time of the shorter stage on right guesses, the cost of the draft and of the way back on wrong ones |
 
 The draft pays when a pass over the network costs more than the draft's own
 tokens on the leader. On one machine it did not (153 against 104 ms per token),

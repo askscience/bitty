@@ -327,6 +327,7 @@ Supported user-facing flags include:
 - `--top-p`
 - `--think`
 - `--draft N` / `--no-draft` (a small model on the leader guesses N tokens for each pass of the ring, see `engine/README.md`)
+- `--pipeline` (the guess for the next token travels behind every token, see `engine/README.md`)
 - `--system`
 - `--template`
 - `--data-dir`

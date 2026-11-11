@@ -103,6 +103,26 @@ bitty run qwen3.5-35b-a3b "hello"
 No machine needs the whole 22 GB model. A node downloads the vocabulary and
 then only the layers it is given.
 
+### Which machines get layers
+
+A token goes through the machines one after the other. One machine more does
+not make the layers faster, it adds a trip over the network. So the planner
+uses the machines that are near the leader, and takes one that is far only
+while the nearer ones cannot hold the model in the memory they have free. Far
+machines come in by how far they are, the nearest first.
+
+Near means that the leader answers in less than 30 ms. Every node measures
+this by itself: three times before it registers, and then with every
+heartbeat. The shortest of the last eight round trips counts.
+`BITTY_NETWORK_RTT_MS=120` in the `env` file of a node gives the number by
+hand and turns the measuring off.
+
+The number is the trip to the leader, not the trip between two nodes. Two far
+nodes that sit beside each other are still counted as two far trips.
+
+A plan that holds is kept: a node is not moved because its link got slower or
+faster. The measure counts the next time the leader has to plan.
+
 ### How many layers a machine gets
 
 The layers are shared in proportion to speed, inside what the memory and the
@@ -258,7 +278,14 @@ curl -fsSL https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scr
 
 ## What the prebuilt binaries are
 
-- x86-64 only, and the processor needs AVX2 (Intel from 2013, AMD from 2015).
+- x86-64 only. The engine comes in three builds: `bitty-stage` for processors
+  with AVX2 (Intel from 2013, AMD from 2015), `bitty-stage-avx` for older ones
+  with AVX, `bitty-stage-sse` for the ones with SSE4.2 only. The node looks at
+  its processor and starts the one that fits. The older the build the slower
+  a layer. `BITTY_STAGE_BIN` names one by hand.
+- A node keeps its machine awake while it runs (Windows and Linux with
+  systemd), so a machine left alone stays in the ring. `BITTY_ALLOW_SLEEP=1`
+  in the `env` file lets it sleep.
 - CPU only. For a GPU build the engine yourself with Vulkan as described in
   [engine/README.md](../engine/README.md) and point `BITTY_STAGE_BIN` at it in
   the `env` file. The updater keeps updating `bitty` and leaves your engine

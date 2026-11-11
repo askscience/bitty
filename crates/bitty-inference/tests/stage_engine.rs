@@ -190,3 +190,124 @@ fn vocabulary_process_handles_text_without_weights() {
     assert!(codec.is_end(*end.last().unwrap()));
     assert!(!codec.is_end(raw[0]));
 }
+
+/// A guess that is stopped half way, or never started, leaves the session where it was: the
+/// token that follows gets the logits it would have got without the guess.
+#[test]
+fn a_stopped_guess_leaves_no_trace() {
+    use bitty_inference::stage_process::{StageOutput, StageProcess, StageProcessConfig};
+    let (Some(engine), Some(model)) = (
+        std::env::var_os("BITTY_STAGE_BIN"),
+        std::env::var_os("BITTY_TEST_MODEL"),
+    ) else {
+        eprintln!("skipped: set BITTY_STAGE_BIN and BITTY_TEST_MODEL");
+        return;
+    };
+    let layers = bitty_model::ModelMetadata::from_gguf_path(&model)
+        .unwrap()
+        .layer_count;
+    let stage = |start: u32, end: u32| {
+        StageProcess::spawn(&StageProcessConfig {
+            engine: engine.clone().into(),
+            model: model.clone().into(),
+            start_layer: start,
+            end_layer_exclusive: end,
+            threads: 2,
+            gpu_layers: 0,
+            context: 1024,
+            sessions: 2,
+            top_logits: 0,
+            rollback: 4,
+        })
+        .unwrap()
+    };
+    let hidden = |output: StageOutput| match output {
+        StageOutput::Hidden(values) => values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>(),
+        other => panic!("expected hidden states, got {other:?}"),
+    };
+    let logits = |output: StageOutput| match output {
+        StageOutput::Logits(values) => values,
+        other => panic!("expected logits, got {other:?}"),
+    };
+    let same = |left: &[f32], right: &[f32]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| (left - right).abs() < 1e-3)
+    };
+
+    let prompt: Vec<u32> = (1000..1024).collect();
+    let (next, wrong) = (2000u32, 3000u32);
+    let at = prompt.len() as u32;
+    let (mut first, mut last) = (stage(0, layers / 2), stage(layers / 2, layers));
+
+    // what the model answers without any guess
+    let through = hidden(first.decode_tokens(1, 0, &prompt, false).unwrap());
+    last.decode_hidden(1, 0, at, &through, false).unwrap();
+    let through = hidden(first.decode_tokens(1, at, &[next], false).unwrap());
+    let expected = logits(last.decode_hidden(1, at, 1, &through, false).unwrap());
+
+    let prompt_hidden = hidden(first.decode_tokens(2, 0, &prompt, false).unwrap());
+    last.decode_hidden(2, 0, at, &prompt_hidden, false).unwrap();
+
+    // a guess stopped before it reached the engine
+    first.abort_handle().stop(7);
+    assert!(first.guess_tokens(2, at, &[wrong], 7).unwrap().is_none());
+
+    // a long guess stopped while the engine works on it, on both kinds of stage
+    let long = vec![wrong; 400];
+    let stop = first.abort_handle();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.stop(8);
+    });
+    let started = std::time::Instant::now();
+    let stopped = first.guess_tokens(2, at, &long, 8).unwrap();
+    stopper.join().unwrap();
+    eprintln!(
+        "first stage: {} after {:?}",
+        if stopped.is_none() {
+            "stopped"
+        } else {
+            "finished"
+        },
+        started.elapsed()
+    );
+    assert!(stopped.is_none(), "400 tokens were decoded in 30 ms");
+
+    let long_hidden = prompt_hidden.repeat(400 / prompt.len() + 1);
+    let width = prompt_hidden.len() / prompt.len();
+    let stop = last.abort_handle();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.stop(9);
+    });
+    let stopped = last
+        .guess_hidden(2, at, 400, &long_hidden[..400 * width], 9)
+        .unwrap();
+    stopper.join().unwrap();
+    assert!(stopped.is_none(), "400 tokens were decoded in 30 ms");
+
+    // a guess that ran to its end and was wrong: the next request starts where it started
+    let through = hidden(first.guess_tokens(2, at, &[wrong], 10).unwrap().unwrap());
+    let wrong_logits = logits(last.guess_hidden(2, at, 1, &through, 10).unwrap().unwrap());
+    assert!(!same(&wrong_logits, &expected));
+    // a stop that comes too late changes nothing
+    first.abort_handle().stop(10);
+    last.abort_handle().stop(10);
+
+    let through = hidden(first.decode_tokens(2, at, &[next], false).unwrap());
+    let answer = logits(last.decode_hidden(2, at, 1, &through, false).unwrap());
+    assert!(same(&answer, &expected), "the session kept part of a guess");
+
+    // and a guess that was right goes on as if it had been certain
+    let through = hidden(first.guess_tokens(2, at + 1, &[next], 11).unwrap().unwrap());
+    last.guess_hidden(2, at + 1, 1, &through, 11)
+        .unwrap()
+        .unwrap();
+    first.decode_tokens(2, at + 2, &[next], false).unwrap();
+}

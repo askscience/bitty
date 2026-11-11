@@ -67,19 +67,24 @@ function Invoke-Bitty([string[]]$Arguments) {
     $info.FileName = $Bitty
     $info.Arguments = ($Arguments -join ' ')
     $info.UseShellExecute = $false
+    # what bitty says when it fails goes to the log: a bare exit code explains nothing
+    $info.RedirectStandardError = $true
     $process = [Diagnostics.Process]::Start($info)
+    $said = $process.StandardError.ReadToEndAsync()
     # two minutes are far more than any of these commands needs
     if (-not $process.WaitForExit(120000)) {
         Write-Log ("bitty {0} did not finish in two minutes" -f ($Arguments -join ' '))
         return 1
     }
     $code = $process.ExitCode
-    if ($code -ne 0) { Write-Log ("bitty {0} failed with exit code {1}" -f ($Arguments -join ' '), $code) }
+    if ($code -ne 0) {
+        $why = ''
+        if ($said.Wait(2000)) { $why = ($said.Result -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | ' }
+        Write-Log ("bitty {0} failed with exit code {1}: {2}" -f ($Arguments -join ' '), $code, $why)
+    }
     return $code
 }
 
-# A running .exe cannot be overwritten on Windows, but it can be renamed: move the old file
-# aside, put the new one in its place, and delete the old one once the node has restarted.
 function Install-File([string]$Source, [string]$Target) {
     if (Test-Path $Target) {
         $old = "$Target.old-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -106,7 +111,9 @@ function Update-Binaries {
             if ($latest -is [byte[]]) { $latest = [Text.Encoding]::UTF8.GetString($latest) }
             $latest = "$latest".Trim()
             if (-not $latest) { throw 'the release has an empty VERSION file' }
-            $complete = (Test-Path $Bitty) -and (Test-Path (Join-Path $BinDir 'bitty-stage.exe'))
+            # an installation made by an older updater lacks the engines for older processors
+            $complete = (Test-Path $Bitty) -and (Test-Path (Join-Path $BinDir 'bitty-stage.exe')) -and
+                (Test-Path (Join-Path $BinDir 'bitty-stage-sse.exe'))
             if ($latest -eq (Get-InstalledVersion) -and $complete) { return $false }
 
             $archive = Join-Path $work "$Name.zip"
@@ -133,6 +140,10 @@ function Update-Binaries {
         New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
         Install-File (Join-Path $new 'bitty.exe') $Bitty
         Install-File (Join-Path $new 'bitty-stage.exe') (Join-Path $BinDir 'bitty-stage.exe')
+        # the engines for older processors: bitty picks the one its machine can run
+        foreach ($variant in 'bitty-stage-avx.exe', 'bitty-stage-sse.exe') {
+            if (Test-Path (Join-Path $new $variant)) { Install-File (Join-Path $new $variant) (Join-Path $BinDir $variant) }
+        }
         Copy-Item -Path (Join-Path $new 'install.ps1') -Destination $Updater -Force
         Copy-Item -Path (Join-Path $new 'VERSION') -Destination $VersionFile -Force
         return $true
