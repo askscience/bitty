@@ -157,6 +157,7 @@ async fn run_network_worker(
                     activation_bytes_per_second: 0,
                     backend_type: profile.backend_type.clone(),
                     holdings: String::new(),
+                    report: String::new(),
                 },
                 config.token.as_deref(),
             )?)

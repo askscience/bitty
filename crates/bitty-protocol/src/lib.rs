@@ -511,6 +511,9 @@ pub struct Heartbeat {
     /// What the node holds of the model and what it is still fetching.
     #[serde(default)]
     pub holdings: String,
+    /// The last lines of the logs of the node, when the leader asked for them.
+    #[serde(default)]
+    pub report: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,6 +859,7 @@ impl From<&Heartbeat> for pb::HeartbeatRequest {
             activation_bytes_per_second: heartbeat.activation_bytes_per_second,
             backend_type: heartbeat.backend_type.clone(),
             holdings: heartbeat.holdings.clone(),
+            report: heartbeat.report.clone(),
         }
     }
 }
@@ -869,6 +873,7 @@ impl From<pb::HeartbeatRequest> for Heartbeat {
             activation_bytes_per_second: heartbeat.activation_bytes_per_second,
             backend_type: heartbeat.backend_type,
             holdings: heartbeat.holdings,
+            report: heartbeat.report,
         }
     }
 }

@@ -528,6 +528,7 @@ where
         Ok(Response::new(HeartbeatResponse {
             accepted: true,
             topology_epoch: update.topology_epoch,
+            order: String::new(),
         }))
     }
 

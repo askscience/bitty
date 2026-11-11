@@ -4,6 +4,7 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -26,12 +27,39 @@ const KIND_LOGITS: u32 = 2;
 const KIND_TOP_LOGITS: u32 = 5;
 const KIND_TOP_ROWS: u32 = 6;
 
+/// How much of the output of the engine is kept for the report of its death.
+const KEPT_OUTPUT_BYTES: usize = 800;
+
+/// The instruction sets the engine is built for, and whether this processor has them. An
+/// engine started on a processor without one of them ends at once with an illegal instruction.
+fn processor_features() -> String {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let has = |present: bool| if present { "yes" } else { "no" };
+        format!(
+            "avx={} avx2={} fma={} f16c={}",
+            has(std::arch::is_x86_feature_detected!("avx")),
+            has(std::arch::is_x86_feature_detected!("avx2")),
+            has(std::arch::is_x86_feature_detected!("fma")),
+            has(std::arch::is_x86_feature_detected!("f16c")),
+        )
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        std::env::consts::ARCH.to_string()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StageProcessError {
     #[error("cannot start the stage engine {path}: {source}")]
     Spawn { path: PathBuf, source: io::Error },
     #[error("the stage engine exited or closed its pipe: {0}")]
     Io(#[from] io::Error),
+    /// The engine went away before it said its weights were loaded. The text says how it
+    /// ended, what this processor can do and the last lines the engine wrote.
+    #[error("the stage engine exited or closed its pipe while loading: {0}")]
+    Died(String),
     #[error("the stage engine sent an invalid handshake")]
     BadHandshake,
     #[error("the stage engine speaks protocol {0}, this build expects {PROTOCOL_VERSION}")]
@@ -150,11 +178,7 @@ impl StageProcess {
     }
 
     fn start(mut command: Command, engine: &Path) -> Result<Self, StageProcessError> {
-        let stderr = if std::env::var_os("BITTY_STAGE_LOG").is_some() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        };
+        let show_output = std::env::var_os("BITTY_STAGE_LOG").is_some();
         // An engine that waits for its turn must get out of the way. By default the OpenMP
         // threads of llama.cpp spin for milliseconds after every batch, and on a machine that
         // runs several stages they take the cores from the stage that is working. Sleeping at
@@ -169,7 +193,7 @@ impl StageProcess {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| StageProcessError::Spawn {
                 path: engine.to_path_buf(),
@@ -178,11 +202,61 @@ impl StageProcess {
         let stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = child.stdout.take().expect("piped stdout");
 
+        // The last of what the engine writes is kept: when it dies it is the only account of
+        // why. `BITTY_STAGE_LOG` also shows all of it as it comes.
+        let last_output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader = child.stderr.take().map(|mut stderr| {
+            let last_output = last_output.clone();
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stderr.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    if show_output {
+                        let _ = io::stderr().write_all(&chunk[..read]);
+                    }
+                    let mut kept = last_output.lock().unwrap_or_else(|lock| lock.into_inner());
+                    kept.extend_from_slice(&chunk[..read]);
+                    let over = kept.len().saturating_sub(KEPT_OUTPUT_BYTES);
+                    kept.drain(..over);
+                }
+            })
+        });
+
         let mut hello = [0u8; 28];
         if let Err(err) = stdout.read_exact(&mut hello) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(StageProcessError::Io(err));
+            let mut status = None;
+            for _ in 0..20 {
+                status = child.try_wait().ok().flatten();
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let ended = match status {
+                Some(status) => status.to_string(),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    format!("still running, stopped ({err})")
+                }
+            };
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
+            let kept = last_output.lock().unwrap_or_else(|lock| lock.into_inner());
+            let output = String::from_utf8_lossy(&kept)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(StageProcessError::Died(format!(
+                "{ended}; processor: {}; last output: {}",
+                processor_features(),
+                if output.is_empty() { "none" } else { &output }
+            )));
         }
         let word = |index: usize| {
             u32::from_le_bytes(hello[4 + index * 4..8 + index * 4].try_into().unwrap())

@@ -77,6 +77,13 @@ kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)
 echo "$kept"
 [ "${kept%% *}" -ge 8 ] || die "the workers kept too few draft tokens: $kept"
 
+echo "== the leader asks a node for its logs"
+"$BITTY" ask n1 logs --data-dir "$DATA/n0" || die "bitty ask"
+report="$WORK/n0/logs/node-n1.log"
+for _ in $(seq 1 20); do [ -f "$report" ] && break; sleep 2; done
+grep -q "^node n1 build" "$report" || die "the logs of the worker did not reach the leader"
+! grep -q "token=tok" "$report" || die "the report of the worker carries the token"
+
 echo "== leader restart"
 kill "$LEADER"
 sleep 3

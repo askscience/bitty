@@ -66,7 +66,16 @@ pub struct NetworkCoordinator {
     model_name: Option<String>,
     /// What each node last said it holds, and when that was logged.
     holdings: Arc<Mutex<HashMap<NodeId, (String, Instant)>>>,
+    /// What the leader asks of its nodes, given out one at a time with the heartbeats.
+    orders: Arc<Mutex<HashMap<NodeId, Vec<String>>>>,
+    /// Lines `ORDER NODE` a person writes for the leader, taken and removed at a heartbeat.
+    orders_file: Option<PathBuf>,
+    /// Where the reports of the nodes are written, one file for each node.
+    reports_dir: Option<PathBuf>,
 }
+
+/// The orders a node understands.
+pub const NODE_ORDERS: [&str; 2] = ["logs", "restart"];
 
 /// How often the progress of a download on a node is logged.
 const HOLDINGS_LOG_EVERY: Duration = Duration::from_secs(300);
@@ -88,6 +97,19 @@ struct KeptPlan {
     file: Option<PathBuf>,
     /// Until then a node of the plan that is missing is waited for.
     wait_until: Instant,
+}
+
+/// A node id as part of a file name.
+fn file_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Nodes the leader gives no layers to: `BITTY_LEAVE_OUT`, node ids separated by commas.
@@ -242,6 +264,71 @@ impl NetworkCoordinator {
             })),
             model_name: None,
             holdings: Arc::default(),
+            orders: Arc::default(),
+            orders_file: None,
+            reports_dir: None,
+        }
+    }
+
+    /// The file of orders for the nodes and the directory their reports go to.
+    pub fn with_orders(mut self, file: impl Into<PathBuf>, reports: impl Into<PathBuf>) -> Self {
+        self.orders_file = Some(file.into());
+        self.reports_dir = Some(reports.into());
+        self
+    }
+
+    /// Asks something of a node. It is told with its next heartbeat.
+    pub async fn order(&self, node: &NodeId, order: &str) {
+        let mut orders = self.orders.lock().await;
+        let waiting = orders.entry(node.clone()).or_default();
+        if !waiting.iter().any(|waiting| waiting == order) {
+            waiting.push(order.to_string());
+        }
+    }
+
+    /// Takes the orders a person wrote into the file, then the next one for this node.
+    async fn next_order(&self, node: &NodeId) -> String {
+        if let Some(file) = &self.orders_file {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let _ = std::fs::remove_file(file);
+                for line in text.lines() {
+                    let mut words = line.split_whitespace();
+                    match (words.next(), words.next()) {
+                        (Some(order), Some(target)) if NODE_ORDERS.contains(&order) => {
+                            println!("order for {target}: {order}");
+                            self.order(&NodeId::new(target), order).await;
+                        }
+                        (None, _) => {}
+                        _ => println!("an order that is not understood: {line}"),
+                    }
+                }
+            }
+        }
+        let mut orders = self.orders.lock().await;
+        match orders.get_mut(node) {
+            Some(waiting) if !waiting.is_empty() => waiting.remove(0),
+            _ => String::new(),
+        }
+    }
+
+    /// Writes what a node reported about itself where the person at the leader can read it.
+    fn save_report(&self, heartbeat: &Heartbeat) {
+        if heartbeat.report.is_empty() {
+            return;
+        }
+        let Some(dir) = &self.reports_dir else {
+            return;
+        };
+        let file = dir.join(format!("node-{}.log", file_safe(&heartbeat.node_id.0)));
+        let written = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&file, heartbeat.report.as_bytes()));
+        match written {
+            Ok(()) => println!("{} sent its logs: {}", heartbeat.node_id.0, file.display()),
+            Err(err) => eprintln!(
+                "bitty-coordinator: the logs of {} were not written to {}: {err}",
+                heartbeat.node_id.0,
+                file.display()
+            ),
         }
     }
 
@@ -505,6 +592,10 @@ impl NetworkCoordinator {
                         }
                     );
                 }
+            }
+            if loaded.is_err() {
+                // whatever went wrong, the node knows more than the leader does
+                self.order(&manifest.node_id, "logs").await;
             }
             loaded.map_err(|err| {
                 Status::failed_precondition(format!(
@@ -1327,10 +1418,10 @@ impl CoordinatorService for NetworkCoordinator {
             profile.ram_mb,
             profile.available_ram_mb,
             profile.free_disk_mb,
-            if profile.worker_endpoint.is_empty() {
-                "no address"
-            } else {
-                profile.worker_endpoint.as_str()
+            // the address of an iroh node carries the token of the cluster: not for the log
+            match profile.worker_endpoint.split('?').next() {
+                Some(address) if !address.is_empty() => address,
+                _ => "no address",
             },
             if left_out {
                 ", left out by BITTY_LEAVE_OUT"
@@ -1373,11 +1464,19 @@ impl CoordinatorService for NetworkCoordinator {
         }
         let heartbeat = Heartbeat::from(request.into_inner());
         self.note_holdings(&heartbeat).await;
+        self.save_report(&heartbeat);
+        let node_id = heartbeat.node_id.clone();
         let accepted = self.registry.lock().await.heartbeat(heartbeat);
+        let order = if accepted {
+            self.next_order(&node_id).await
+        } else {
+            String::new()
+        };
 
         Ok(Response::new(HeartbeatResponse {
             accepted,
             topology_epoch: self.epoch().await,
+            order,
         }))
     }
 

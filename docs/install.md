@@ -164,6 +164,30 @@ the progress of a download every five minutes, for example
 `bitty-c5e9968c: holds 10..34`. So the state of a far machine can be read on the
 leader without going there. A node on an older build says nothing.
 
+### Reading and restarting a far machine from the leader
+
+On the leader:
+
+```
+bitty ask bitty-1234abcd logs
+bitty ask bitty-1234abcd restart
+```
+
+`logs`: with its next heartbeat the node sends its build, the last lines of its
+own log and of the log of its updater, each kind of line once and without the
+token of the cluster. The leader keeps them in
+`~/.bitty/logs/node-bitty-1234abcd.log`. The leader asks by itself when a node
+could not load its layers.
+
+`restart`: a node that runs in the background ends, and its updater starts it
+again within a minute. A node somebody started in a terminal stays.
+
+When the engine of a node dies while it loads, the error the leader logs says
+how it ended (exit code or signal), what the processor of that machine has
+(`avx`, `avx2`, `fma`, `f16c`) and the last lines the engine wrote.
+
+Both need this build on the node. An older node ignores them.
+
 To give a machine less than it would get, put one of these in its `env` file
 and restart the node:
 

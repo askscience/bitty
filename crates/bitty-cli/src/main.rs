@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(CliCommand::Connect(config)) => run_connect(config).await,
         Ok(CliCommand::Use(config)) => run_use(config).await,
         Ok(CliCommand::Clusters(config)) => run_clusters(config).await,
+        Ok(CliCommand::Ask(config)) => run_ask(config),
         Ok(CliCommand::Generate(config)) => run_generate(config).await,
         Ok(CliCommand::Chat(config)) => run_chat(config).await,
         Ok(CliCommand::Status(config)) => run_status(config).await,
@@ -134,6 +135,7 @@ enum CliCommand {
     Connect(JoinConfig),
     Use(UseConfig),
     Clusters(DataDirConfig),
+    Ask(AskConfig),
     Generate(GenerateConfig),
     Chat(ChatConfig),
     Status(StatusConfig),
@@ -225,6 +227,14 @@ struct ModelCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DataDirConfig {
+    data_dir: Option<String>,
+}
+
+/// `bitty ask NODE logs|restart`, given on the leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AskConfig {
+    node: String,
+    order: String,
     data_dir: Option<String>,
 }
 
@@ -358,6 +368,7 @@ impl Cli {
             "connect" => parse_join(&mut args).map(CliCommand::Connect),
             "use" => parse_use(&mut args).map(CliCommand::Use),
             "clusters" => parse_data_dir(&mut args).map(CliCommand::Clusters),
+            "ask" => parse_ask(&mut args).map(CliCommand::Ask),
             "generate" => parse_generate(&mut args).map(CliCommand::Generate),
             "chat" => parse_chat(&mut args).map(CliCommand::Chat),
             "status" => parse_status(&mut args).map(CliCommand::Status),
@@ -471,6 +482,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
             .with_model_path(&model_file)
             .with_plan_file(data_dir.join(plan_file_name(network_model.as_deref())))
             .with_model_name(network_model)
+            .with_orders(data_dir.join("orders"), data_dir.join("logs"))
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         // The small model that guesses tokens for the ring. It is used from the moment the
         // file is whole on disk; until then requests go without it.
@@ -1195,6 +1207,7 @@ async fn register_and_heartbeat(
                             activation_bytes_per_second: snapshot.activation_bytes_per_second,
                             backend_type: profile.backend_type.clone(),
                             holdings: node_holdings(config),
+                            report: String::new(),
                         },
                         cluster_token,
                     ))
@@ -1291,6 +1304,111 @@ fn take_model_of_the_leader(config: &NodeConfig, model: &str) -> String {
             config.model
         ),
     }
+}
+
+/// The leader asked this node to start again. A background node ends here and its updater
+/// starts it within a minute. A node somebody runs in a terminal stays: nothing would bring
+/// it back.
+fn restart_for_the_leader(config: &NodeConfig) -> Option<String> {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    match read_runtime_state(&data_dir) {
+        Some(state) if state.pid == std::process::id() => {
+            Some("the leader asked this node to start again".into())
+        }
+        _ => {
+            eprintln!(
+                "the leader asked this node to start again: it is not a background node, it stays"
+            );
+            None
+        }
+    }
+}
+
+/// The most a report for the leader may be.
+const NODE_REPORT_BYTES: usize = 24 * 1024;
+
+/// What a node says about itself when the leader asks: its build, where it runs and the last
+/// lines of its own log and of the log of its updater. The token of the cluster is taken out.
+fn node_report(config: &NodeConfig) -> String {
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let exe = std::env::current_exe().ok();
+    let mut report = format!(
+        "node {} build {} os {} arch {}\nprogram {}\ndata {}\n",
+        config.node_id,
+        bitty_version(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        exe.as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        data_dir.display(),
+    );
+    let mut files = vec![("log", logger::log_path(&data_dir), 150)];
+    // the installer keeps the log of the updater next to the `bin` directory
+    if let Some(prefix) = exe.as_deref().and_then(Path::parent).and_then(Path::parent) {
+        files.push(("update log", prefix.join("update.log"), 60));
+    }
+    for (title, path, lines) in files {
+        report.push_str(&format!("\n== {title}: {}\n", path.display()));
+        match std::fs::read(&path) {
+            Ok(bytes) => report.push_str(&last_distinct_lines(
+                &String::from_utf8_lossy(&bytes),
+                lines,
+            )),
+            Err(err) => report.push_str(&format!("cannot read it: {err}\n")),
+        }
+    }
+    let report = without_tokens(&report);
+    if report.len() <= NODE_REPORT_BYTES {
+        return report;
+    }
+    let mut start = report.len() - NODE_REPORT_BYTES;
+    while !report.is_char_boundary(start) {
+        start += 1;
+    }
+    report[start..].to_string()
+}
+
+/// The last `count` lines of a log, each kind of line once. A log is mostly the same few
+/// lines many times over, and those would push out the ones that say something.
+fn last_distinct_lines(text: &str, count: usize) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    for line in text.lines().rev() {
+        // the number in front of a line is its time: two lines that differ only there are one
+        let kind = line.trim_start_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit());
+        if kind.trim().is_empty() || kind.contains("bitty command: start --if-started") {
+            continue;
+        }
+        if seen.insert(kind.to_string()) {
+            kept.push(line);
+            if kept.len() == count {
+                break;
+            }
+        }
+    }
+    kept.reverse();
+    let mut lines = kept.join("\n");
+    lines.push('\n');
+    lines
+}
+
+/// Text with every `token=...` value replaced, so that a log can leave the machine.
+fn without_tokens(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("token=") {
+        let value = at + "token=".len();
+        clean.push_str(&rest[..value]);
+        clean.push_str("...");
+        let after = &rest[value..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    clean.push_str(rest);
+    clean
 }
 
 /// What this node holds of its model, for the log of the leader.
@@ -1469,6 +1587,7 @@ async fn stay_registered(
         }
 
         let mut failures = 0;
+        let mut report = String::new();
         loop {
             sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
             let snapshot = worker_stats.snapshot().await;
@@ -1483,10 +1602,23 @@ async fn stay_registered(
                     activation_bytes_per_second: snapshot.activation_bytes_per_second,
                     backend_type: profile.backend_type.clone(),
                     holdings: node_holdings(config),
+                    report: std::mem::take(&mut report),
                 })
                 .await;
             match response {
-                Ok(response) if response.accepted => failures = 0,
+                Ok(response) if response.accepted => {
+                    failures = 0;
+                    match response.order.as_str() {
+                        "" => {}
+                        "logs" => report = node_report(config),
+                        "restart" => {
+                            if let Some(reason) = restart_for_the_leader(config) {
+                                return Err(reason.into());
+                            }
+                        }
+                        other => eprintln!("the leader asked for {other}: not known to this build"),
+                    }
+                }
                 Ok(_) => {
                     eprintln!(
                         "scheduler {label} no longer knows node {}; registering again",
@@ -2068,6 +2200,54 @@ fn parse_start(args: &mut impl Iterator<Item = String>) -> Result<StartConfig, S
         }
     }
     Ok(config)
+}
+
+fn parse_ask(args: &mut impl Iterator<Item = String>) -> Result<AskConfig, String> {
+    let usage = "usage: bitty ask NODE logs|restart";
+    let mut words = Vec::new();
+    let mut data_dir = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => data_dir = Some(required_next(args, "--data-dir")?),
+            _ => words.push(arg),
+        }
+    }
+    match words.as_slice() {
+        [node, order] if bitty_coordinator::network::NODE_ORDERS.contains(&order.as_str()) => {
+            Ok(AskConfig {
+                node: node.clone(),
+                order: order.clone(),
+                data_dir,
+            })
+        }
+        _ => Err(usage.into()),
+    }
+}
+
+/// Leaves an order for a node where the running leader finds it at the next heartbeat.
+fn run_ask(config: AskConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let data_dir = bitty_data_dir(config.data_dir.as_deref());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("orders"))?;
+    writeln!(file, "{} {}", config.order, config.node)?;
+    match config.order.as_str() {
+        "logs" => println!(
+            "asked {} for its logs: they come within seconds to {}",
+            config.node,
+            data_dir
+                .join("logs")
+                .join(format!("node-{}.log", config.node))
+                .display()
+        ),
+        _ => println!(
+            "asked {} to start again: its updater brings it back within a minute",
+            config.node
+        ),
+    }
+    Ok(())
 }
 
 fn parse_data_dir(args: &mut impl Iterator<Item = String>) -> Result<DataDirConfig, String> {
@@ -3391,6 +3571,7 @@ fn print_help() {
     println!("  bitty cp SOURCE DEST");
     println!("  bitty settings get|set|path");
     println!("  bitty logs [--lines N|--path|--clear]");
+    println!("  bitty ask NODE logs|restart");
     println!("  bitty invite [--name NAME] [--replace]");
     println!("  bitty join INVITE_OR_NAME [--name NAME] [--model PATH]");
     println!("  bitty use NAME_OR_INVITE [--name NAME]");
@@ -3852,6 +4033,33 @@ mod tests {
             Cli::parse(vec!["clusters".into()]).unwrap(),
             CliCommand::Clusters(DataDirConfig { .. })
         ));
+    }
+
+    #[test]
+    fn a_report_for_the_leader_carries_no_token_and_no_repeats() {
+        assert_eq!(
+            without_tokens("iroh://abc?token=Secret_1-2&relay=x token=other end"),
+            "iroh://abc?token=...&relay=x token=... end"
+        );
+        let log = "[1] started\n[2] timed out\n[3] timed out\n[4] bitty command: start --if-started\n[5] failed\n";
+        assert_eq!(
+            last_distinct_lines(log, 10),
+            "[1] started\n[3] timed out\n[5] failed\n"
+        );
+        assert_eq!(last_distinct_lines(log, 1), "[5] failed\n");
+    }
+
+    #[test]
+    fn parses_ask() {
+        assert_eq!(
+            Cli::parse(vec!["ask".into(), "bitty-1234".into(), "logs".into()]).unwrap(),
+            CliCommand::Ask(AskConfig {
+                node: "bitty-1234".into(),
+                order: "logs".into(),
+                data_dir: None,
+            })
+        );
+        assert!(Cli::parse(vec!["ask".into(), "bitty-1234".into(), "dance".into()]).is_err());
     }
 
     #[test]

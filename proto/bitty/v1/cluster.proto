@@ -150,11 +150,16 @@ message HeartbeatRequest {
   // What the node holds of the model and what it is still fetching, in words for the log
   // of the leader.
   string holdings = 6;
+  // The last lines of the logs of the node, sent once after the leader asked for them.
+  string report = 7;
 }
 
 message HeartbeatResponse {
   bool accepted = 1;
   string topology_epoch = 2;
+  // What the leader asks of the node: "logs" for a report in its next heartbeat, "restart"
+  // to end so that its updater starts it again. Empty most of the time.
+  string order = 3;
 }
 
 message TopologyUpdate {
