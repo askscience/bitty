@@ -24,10 +24,27 @@ pub struct RegisteredNode {
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     nodes: HashMap<NodeId, RegisteredNode>,
+    /// Engines that died while loading, for each node, with the build that was running. It
+    /// outlives a registration: a node that restarts on the same build is no different.
+    engine_deaths: HashMap<NodeId, (String, u32)>,
 }
 
+/// After this many engines died loading, a node gets no layers until it runs another build.
+const ENGINE_DEATHS_BEFORE_LEFT_OUT: u32 = 2;
+
 impl Registry {
-    pub fn register(&mut self, profile: HardwareProfile) {
+    pub fn register(&mut self, mut profile: HardwareProfile) {
+        match self.engine_deaths.get(&profile.node_id) {
+            Some((build, deaths)) if build == &profile.build => {
+                if *deaths >= ENGINE_DEATHS_BEFORE_LEFT_OUT {
+                    profile.layer_eligible = false;
+                }
+            }
+            Some(_) => {
+                self.engine_deaths.remove(&profile.node_id);
+            }
+            None => {}
+        }
         let baseline = profile.effective_compute_score().max(0.1);
         let backend_type = node_backend(&profile);
         self.nodes.insert(
@@ -80,16 +97,29 @@ impl Registry {
         }
     }
 
-    /// Lowers the free memory of a node, never raises it.
-    pub fn lower_free_memory(&mut self, node_id: &NodeId, memory_mb: u64) {
+    /// The engine of a node died while it loaded its layers. The first time the node is
+    /// planned with less memory, never more than it had. After that it is left out, and the
+    /// answer is `true`.
+    pub fn engine_died(&mut self, node_id: &NodeId, memory_mb: u64) -> bool {
         let Some(node) = self.nodes.get_mut(node_id) else {
-            return;
+            return false;
         };
+        let deaths = self
+            .engine_deaths
+            .entry(node_id.clone())
+            .or_insert_with(|| (node.profile.build.clone(), 0));
+        deaths.1 += 1;
+        if deaths.1 >= ENGINE_DEATHS_BEFORE_LEFT_OUT {
+            node.profile.layer_eligible = false;
+            return true;
+        }
         let known = node.profile.available_ram_mb;
         if known == 0 || memory_mb < known {
             node.profile.available_ram_mb = memory_mb.clamp(1, node.profile.ram_mb.max(1));
         }
+        false
     }
+
     pub fn profiles(&self) -> Vec<HardwareProfile> {
         self.nodes
             .values()
@@ -176,15 +206,24 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_engine_only_lowers_the_free_memory() {
+    fn a_node_whose_engine_keeps_dying_is_left_out_until_another_build() {
         let mut registry = Registry::default();
         registry.register(profile(16384, 11000));
         let id = NodeId::new("node-a");
 
-        registry.lower_free_memory(&id, 9000);
-        assert_eq!(registry.profile(&id).unwrap().available_ram_mb, 9000);
-        registry.lower_free_memory(&id, 10000);
-        assert_eq!(registry.profile(&id).unwrap().available_ram_mb, 9000);
+        assert!(!registry.engine_died(&id, 12000));
+        assert_eq!(registry.profile(&id).unwrap().available_ram_mb, 11000);
+        registry.register(profile(16384, 11000));
+        assert!(registry.engine_died(&id, 5000));
+        assert!(!registry.profile(&id).unwrap().layer_eligible);
+
+        // the same build coming back changes nothing, another build gets its layers again
+        registry.register(profile(16384, 11000));
+        assert!(!registry.profile(&id).unwrap().layer_eligible);
+        let mut updated = profile(16384, 11000);
+        updated.build = "newer".into();
+        registry.register(updated);
+        assert!(registry.profile(&id).unwrap().layer_eligible);
     }
 
     #[test]

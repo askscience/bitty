@@ -90,6 +90,17 @@ struct KeptPlan {
     wait_until: Instant,
 }
 
+/// Nodes the leader gives no layers to: `BITTY_LEAVE_OUT`, node ids separated by commas.
+/// They stay registered. The setting is read when a node registers.
+fn left_out_nodes() -> Vec<String> {
+    std::env::var("BITTY_LEAVE_OUT")
+        .unwrap_or_default()
+        .split(',')
+        .map(|node| node.trim().to_string())
+        .filter(|node| !node.is_empty())
+        .collect()
+}
+
 /// How long the leader waits for a node of its plan to come back before it plans without
 /// it: `BITTY_PLAN_WAIT_SECS`, 600 by default. A node that restarts for an update is back
 /// well within that, and its layers stay where they are.
@@ -474,19 +485,25 @@ impl NetworkCoordinator {
                         .note_free(&manifest.node_id, memory_mb, disk_mb);
                 } else if err.message().contains("stage engine exited") {
                     // An engine that dies while it loads most often ran out of memory, and
-                    // the node cannot say so. The leader counts the node as able to take
-                    // three quarters of what it was given, so the next plan asks less of it.
+                    // the node cannot say so: the next plan asks less of it. A second death
+                    // is not about the size, and the node is left out.
                     let lowered_mb = manifest.byte_len / (1024 * 1024) * 3 / 4;
+                    let left_out = self
+                        .registry
+                        .lock()
+                        .await
+                        .engine_died(&manifest.node_id, lowered_mb);
                     println!(
-                        "the engine of worker {} died loading layers {}..{}: planning it with {lowered_mb} MB free",
+                        "the engine of worker {} died loading layers {}..{}: {}",
                         manifest.node_id.0,
                         manifest.range.start_layer,
                         manifest.range.end_layer_exclusive,
+                        if left_out {
+                            "it gets no layers until it runs another build".to_string()
+                        } else {
+                            format!("planning it with at most {lowered_mb} MB free")
+                        }
                     );
-                    self.registry
-                        .lock()
-                        .await
-                        .lower_free_memory(&manifest.node_id, lowered_mb);
                 }
             }
             loaded.map_err(|err| {
@@ -1288,15 +1305,19 @@ impl CoordinatorService for NetworkCoordinator {
         let profile = register
             .profile
             .ok_or_else(|| Status::invalid_argument("missing worker profile"))?;
-        let profile = HardwareProfile::try_from(profile)
+        let mut profile = HardwareProfile::try_from(profile)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         if !profile.worker_endpoint.is_empty() {
             validate_worker_endpoint_for_dial(&profile.worker_endpoint)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
         }
         let node_id = profile.node_id.clone();
+        let left_out = left_out_nodes().contains(&node_id.0);
+        if left_out {
+            profile.layer_eligible = false;
+        }
         let about = format!(
-            "build={} os={} memory={} MB, free {} MB, disk for layers {} MB",
+            "build={} os={} memory={} MB, free {} MB, disk for layers {} MB, at {}{}",
             if profile.build.is_empty() {
                 "unknown"
             } else {
@@ -1305,7 +1326,17 @@ impl CoordinatorService for NetworkCoordinator {
             profile.os,
             profile.ram_mb,
             profile.available_ram_mb,
-            profile.free_disk_mb
+            profile.free_disk_mb,
+            if profile.worker_endpoint.is_empty() {
+                "no address"
+            } else {
+                profile.worker_endpoint.as_str()
+            },
+            if left_out {
+                ", left out by BITTY_LEAVE_OUT"
+            } else {
+                ""
+            }
         );
 
         // A node that registers again has restarted and holds no layers: it is told to load.

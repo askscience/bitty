@@ -117,7 +117,13 @@ then plans again with the number the node gave. The same holds for the disk:
 a node first removes the layer files of an older plan, and when the new ones
 still do not fit it says how much room it has. An engine that dies while it
 loads its layers is taken as the same answer without a number: the leader
-plans that machine again with three quarters of what it was given.
+plans that machine again with three quarters of what it was given. When the
+engine dies a second time the size is not the reason, and the machine gets no
+layers until it comes back with another build.
+
+`BITTY_LEAVE_OUT=bitty-1234abcd,bitty-5678ef01` on the leader gives no layers
+to those machines. They stay connected. It is for tests, to see what a
+machine adds, and for a machine that is known not to work.
 
 The limits are those of the memory of the machine, also when it has a graphics
 card. The engine puts on the card only the layers `BITTY_GPU_LAYERS` names,
