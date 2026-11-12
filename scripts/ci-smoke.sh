@@ -31,6 +31,19 @@ trap cleanup EXIT
 show_logs() { for log in "$WORK"/*.log; do echo "--- $log"; tail -n 40 "$log"; done; }
 die() { echo "FAILED: $*" >&2; show_logs >&2; exit 1; }
 
+# No call of bitty may hang the release: each one gets a time limit, and a call that runs
+# into it fails the check with the logs of the nodes.
+limited() {
+    local seconds="$1" code=0
+    shift
+    timeout "$seconds" "$@" || code=$?
+    if [ "$code" = 124 ]; then
+        echo "TIMED OUT after $seconds seconds: ${*:2}" >&2
+        show_logs >&2
+    fi
+    return "$code"
+}
+
 "$BITTY" version
 
 leader() {
@@ -40,7 +53,7 @@ leader() {
     PIDS+=("$LEADER")
 }
 generate() {
-    "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+    limited 120 "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
         --prompt "Name three colours." --seed 7 --max-tokens 24 2> "$WORK/client.log"
 }
 # the nodes need a moment to load and to find each other: ask until both layer ranges answer
@@ -66,7 +79,7 @@ echo "$first"
 
 echo "== draft model"
 # the model is its own draft here: nearly every guess is right, so a pass yields several tokens
-drafted="$("$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+drafted="$(limited 120 "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
     --prompt "Name three colours." --seed 7 --max-tokens 24 --draft 4 2>> "$WORK/client.log")" \
     || die "no text with the draft model"
 echo "$drafted"
@@ -81,7 +94,7 @@ echo "== pipeline"
 # the guess for the next token travels behind every token; the text must stay the same,
 # with guesses that are right (greedy) and with guesses that are often wrong (sampled)
 sampled() {
-    "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+    limited 180 "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
         --prompt "Write a short poem about the sea." --seed 11 --max-tokens 48 --temperature "$1" "${@:2}" 2>> "$WORK/client.log"
 }
 for temperature in 0 1.2; do
@@ -100,7 +113,7 @@ for temperature in 0 1.2; do
 done
 
 echo "== the leader asks a node for its logs"
-"$BITTY" ask n1 logs --data-dir "$DATA/n0" || die "bitty ask"
+limited 60 "$BITTY" ask n1 logs --data-dir "$DATA/n0" || die "bitty ask"
 report="$WORK/n0/logs/node-n1.log"
 for _ in $(seq 1 20); do [ -f "$report" ] && break; sleep 2; done
 grep -q "^node n1 build" "$report" || die "the logs of the worker did not reach the leader"
@@ -128,12 +141,12 @@ put "$WORK/m1/models/qwen3.5-35b-a3b/latest" Qwen3.5-35B-A3B-Q4_K_M.gguf "$3"
     --node-id m0 --cluster-token tok --data-dir "$DATA/m0" > "$WORK/m0.log" 2>&1 &
 PIDS+=("$!")
 follower() {
-    "$BITTY" node --no-iroh --model "$1" --layers 24 --join 127.0.0.1:50551 --listen 127.0.0.1:50571 \
+    limited 60 "$BITTY" node --no-iroh --model "$1" --layers 24 --join 127.0.0.1:50551 --listen 127.0.0.1:50571 \
         --node-id m1 --cluster-token tok --data-dir "$DATA/m1" >> "$WORK/m1.log" 2>&1
 }
 other=""
 for _ in $(seq 1 20); do
-    follower qwen3.5-35b-a3b || true
+    follower qwen3.5-35b-a3b || [ "$?" != 124 ] || die "a node with another model did not stop by itself"
     if grep -q "the leader serves qwen3.5-0.8b" "$WORK/m1.log"; then other=seen; break; fi
     sleep 2
 done
@@ -156,16 +169,16 @@ sleep 3
 echo "== background runtime"
 state="$WORK/runtime/runtime/runtime.toml"
 pid_of() { grep -o 'pid = [0-9]*' "$state" | grep -o '[0-9]*'; }
-"$BITTY" start --if-started --data-dir "$DATA/runtime"
+limited 180 "$BITTY" start --if-started --data-dir "$DATA/runtime"
 [ ! -f "$state" ] || die "start --if-started started a node that was never asked for"
-"$BITTY" start --model "$MODEL" --data-dir "$DATA/runtime" || die "bitty start"
+limited 180 "$BITTY" start --model "$MODEL" --data-dir "$DATA/runtime" || die "bitty start"
 one="$(pid_of)"
-"$BITTY" start --if-started --data-dir "$DATA/runtime" | grep -q "running" || die "the node is not running after start"
+limited 180 "$BITTY" start --if-started --data-dir "$DATA/runtime" | grep -q "running" || die "the node is not running after start"
 [ "$(pid_of)" = "$one" ] || die "start replaced a node that was running"
-"$BITTY" restart --if-started --data-dir "$DATA/runtime" || die "bitty restart"
+limited 180 "$BITTY" restart --if-started --data-dir "$DATA/runtime" || die "bitty restart"
 two="$(pid_of)"
 [ "$one" != "$two" ] || die "restart kept the old node"
-"$BITTY" start --if-started --data-dir "$DATA/runtime" | grep -q "running" || die "the node is not running after restart"
-"$BITTY" stop --data-dir "$DATA/runtime" || die "bitty stop"
+limited 180 "$BITTY" start --if-started --data-dir "$DATA/runtime" | grep -q "running" || die "the node is not running after restart"
+limited 180 "$BITTY" stop --data-dir "$DATA/runtime" || die "bitty stop"
 [ ! -f "$state" ] || die "stop left the saved state behind"
 echo "ok"

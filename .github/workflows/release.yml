@@ -121,6 +121,7 @@ jobs:
             cargo test --release --locked -p bitty-inference --test stage_engine -- --nocapture
 
       - name: End-to-end check
+        timeout-minutes: 20
         run: scripts/ci-smoke.sh "$PWD/target/release/bitty${{ matrix.exe }}" "$PWD/engine-bin/bitty-stage${{ matrix.exe }}" "$PWD/test-model/model.gguf"
 
       - name: The engines for older processors
