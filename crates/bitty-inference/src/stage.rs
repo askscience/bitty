@@ -16,7 +16,7 @@ use crate::stage_process::{
 use crate::{ExecutorError, LayerExecutor};
 use async_trait::async_trait;
 use bitty_model::{MetadataError, ModelMetadata};
-use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, Logits};
+use bitty_protocol::{ActivationDType, ActivationTensor, AssignedLayerRange, Logits, Quantization};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -60,10 +60,13 @@ pub struct StageOptions {
     /// that can be checked in one pass. Costs memory: a copy of the state of every recurrent layer for every
     /// request (2.09 MiB a layer and request for Qwen3.5-35B).
     pub rollback: u32,
+    /// Rounds the residual stream to f16 after every layer, in every stage alike. The text is
+    /// then the same wherever the model is cut, and the hidden states can go to the next stage
+    /// as f16 without losing anything. Every node of a ring must do the same.
+    pub round_f16: bool,
     /// Sends the hidden states to the next stage as f16, half the bytes of f32. Every stage
-    /// reads both. Off unless `BITTY_WIRE_F16=1`: on Qwen3.5-0.8B cut in three it moved the
-    /// best logits by up to 0.45 (the hidden states are all small, so this is the precision
-    /// of f16 itself, not a few large values), where f32 gives the whole model bit for bit.
+    /// reads both. Exact with `round_f16`; without it, on Qwen3.5-0.8B cut in three it moved
+    /// the best logits by up to 0.45.
     pub wire_f16: bool,
 }
 
@@ -97,8 +100,10 @@ impl StageOptions {
         if let Some(rollback) = read("BITTY_STAGE_ROLLBACK") {
             options.rollback = rollback;
         }
-        // half the bytes between the stages, at the price of the exact numbers
-        options.wire_f16 = read("BITTY_WIRE_F16") == Some(1);
+        // f16 after every layer and between the stages: `BITTY_ROUND_F16=0` keeps f32 all the
+        // way, and `BITTY_WIRE_F16` decides the wire alone
+        options.round_f16 = read("BITTY_ROUND_F16").is_none_or(|value| value != 0);
+        options.wire_f16 = read("BITTY_WIRE_F16").map_or(options.round_f16, |value| value != 0);
         options
     }
 }
@@ -130,6 +135,7 @@ impl Default for StageOptions {
             gpu_output: false,
             gpu_auto: false,
             rollback: DEFAULT_ROLLBACK,
+            round_f16: false,
             wire_f16: false,
         }
     }
@@ -149,6 +155,8 @@ struct Session {
 #[derive(Default)]
 struct Engine {
     process: Option<StageProcess>,
+    /// The quantization of the layers the process holds.
+    quantization: Option<Quantization>,
     sessions: HashMap<String, Session>,
     next_session_id: u64,
 }
@@ -156,12 +164,19 @@ struct Engine {
 /// Asked while a stage file is being fetched; `true` means the range is no longer wanted.
 pub type CancelCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Returns the model file to open for layers `[start, end)`, fetching it first if needed.
-/// The fetch gives up when the check answers `true`.
-pub type StageSource = Arc<dyn Fn(u32, u32, CancelCheck) -> Result<PathBuf, String> + Send + Sync>;
+/// Returns the model file to open for layers `[start, end)` in a quantization, fetching it first
+/// if needed. The fetch gives up when the check answers `true`.
+pub type StageSource =
+    Arc<dyn Fn(u32, u32, Quantization, CancelCheck) -> Result<PathBuf, String> + Send + Sync>;
 
 fn pack_range(range: &AssignedLayerRange) -> u64 {
-    ((range.start_layer as u64) << 32) | range.end_layer_exclusive as u64
+    let quantization = match range.quantization {
+        Quantization::Fp16 => 0u64,
+        Quantization::Q4 => 1,
+        Quantization::Q3 => 2,
+        Quantization::Q2 => 3,
+    };
+    (quantization << 60) | ((range.start_layer as u64) << 30) | range.end_layer_exclusive as u64
 }
 
 #[derive(Clone)]
@@ -336,7 +351,7 @@ impl StageExecutor {
             let info = process.info();
             info.start_layer == range.start_layer
                 && info.end_layer_exclusive == range.end_layer_exclusive
-        });
+        }) && engine.quantization == Some(range.quantization);
         if matches {
             return Ok(());
         }
@@ -352,10 +367,15 @@ impl StageExecutor {
                 let mine = pack_range(range);
                 let stale: CancelCheck =
                     Arc::new(move || wanted.load(std::sync::atomic::Ordering::Relaxed) != mine);
-                fetched =
-                    source(range.start_layer, range.end_layer_exclusive, stale).map_err(|err| {
-                        ExecutorError::Failed(format!("stage file is not available: {err}"))
-                    })?;
+                fetched = source(
+                    range.start_layer,
+                    range.end_layer_exclusive,
+                    range.quantization,
+                    stale,
+                )
+                .map_err(|err| {
+                    ExecutorError::Failed(format!("stage file is not available: {err}"))
+                })?;
                 &fetched
             }
             None => model,
@@ -365,6 +385,7 @@ impl StageExecutor {
             .map_err(|err| ExecutorError::Failed(err.to_string()))?;
         *self.abort.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(process.abort_handle());
         engine.process = Some(process);
+        engine.quantization = Some(range.quantization);
         Ok(())
     }
 
@@ -391,6 +412,7 @@ impl StageExecutor {
                 sessions: self.options.sessions,
                 top_logits: crate::sampling::top_logits_limit() as u32,
                 rollback: self.options.rollback,
+                round_f16: self.options.round_f16,
             })
         };
         if !self.options.gpu_auto {

@@ -347,14 +347,14 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..05f8a64
+index 0000000..3efb172
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,713 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
-+//               [--top-logits N] [--rollback N]
++//               [--top-logits N] [--rollback N] [--round-f16]
 +//   bitty-stage -m model.gguf --vocab-only
 +//   bitty-stage --list-devices
 +//
@@ -716,11 +716,16 @@ index 0000000..05f8a64
 +    int         gpu_layers = 0; // llama.cpp's count: layers from the top of the whole model
 +    bool        vocab_only = false;
 +    bool        list_devices = false;
++    bool        round_f16 = false;
 +
 +    for (int i = 1; i < argc; ++i) {
 +        const std::string a = argv[i];
 +        if (a == "--list-devices") {
 +            list_devices = true;
++            continue;
++        }
++        if (a == "--round-f16") {
++            round_f16 = true;
 +            continue;
 +        }
 +        if (a == "--vocab-only") {
@@ -767,7 +772,7 @@ index 0000000..05f8a64
 +        srv.begin = srv.end = 0;
 +    }
 +    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1 || srv.rollback < 0) {
-+        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N] [--rollback N]\n"
++        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N] [--rollback N] [--round-f16]\n"
 +                        "       %s -m model.gguf --vocab-only\n"
 +                        "       %s --list-devices\n", argv[0], argv[0], argv[0]);
 +        return 2;
@@ -785,6 +790,7 @@ index 0000000..05f8a64
 +    mparams.n_gpu_layers      = vocab_only ? 0 : gpu_layers;
 +    mparams.stage_layer_start = srv.begin;
 +    mparams.stage_layer_end   = srv.end;
++    mparams.stage_round_f16   = round_f16 && !vocab_only;
 +    mparams.vocab_only        = vocab_only;
 +    srv.model = llama_model_load_from_file(model_path.c_str(), mparams);
 +    if (!srv.model) {
@@ -1059,10 +1065,10 @@ index 0000000..05f8a64
 +    return 0;
 +}
 diff --git a/include/llama.h b/include/llama.h
-index 428f51f..c84b44e 100644
+index 428f51f..134b676 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -355,6 +355,14 @@ extern "C" {
+@@ -355,6 +355,18 @@ extern "C" {
          bool no_host;         // bypass host buffer allowing extra buffers to be used
          bool no_alloc;        // only load metadata and simulate memory allocations
          bool load_mtp;        // whether to load MTP layers
@@ -1074,6 +1080,10 @@ index 428f51f..c84b44e 100644
 +        // (un-normalized, the context must be created with embeddings = true).
 +        int32_t stage_layer_start;
 +        int32_t stage_layer_end;
++        // round the residual stream to f16 after every layer (qwen35, qwen35moe): the result
++        // is then the same wherever the model is cut, and f16 hidden states between stages
++        // lose nothing
++        bool stage_round_f16;
      };
  
      struct llama_sampler_seq_config {
@@ -1159,16 +1169,18 @@ index 20c43e3..ea34a81 100644
      // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
      // or uploaded from ubatch.embd_state
 diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index 7b73840..6bad6a1 100644
+index 7b73840..b0efd9d 100644
 --- a/src/llama-hparams.h
 +++ b/src/llama-hparams.h
-@@ -537,6 +537,20 @@ struct llama_hparams {
+@@ -537,6 +537,22 @@ struct llama_hparams {
      // number of effective layers (excludes nextn layers)
      uint32_t n_layer() const;
  
 +    // stage execution: only the layers [stage_begin, stage_end) are loaded and run (stage_end == 0: all)
 +    uint32_t stage_begin = 0;
 +    uint32_t stage_end   = 0;
++    // round the residual stream to f16 after every layer
++    bool stage_round_f16 = false;
 +
 +    uint32_t stage_il_begin() const { return stage_end == 0 ? 0 : stage_begin; }
 +    uint32_t stage_il_end()   const { return stage_end == 0 ? n_layer() : stage_end; }
@@ -1184,10 +1196,10 @@ index 7b73840..6bad6a1 100644
      // note: inlined on purpose for performance reasons
      // TODO: think of a better place for this function
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index dbc91a1..aecdd1e 100644
+index dbc91a1..4a4eeac 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1651,6 +1651,20 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+@@ -1651,6 +1651,27 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      // per-arch hparams
      load_arch_hparams(ml);
  
@@ -1204,11 +1216,18 @@ index dbc91a1..aecdd1e 100644
 +        hparams.stage_end   = params.stage_layer_end;
 +        LLAMA_LOG_INFO("%s: stage execution, layers [%u, %u) of %u\n", __func__, hparams.stage_begin, hparams.stage_end, hparams.n_layer());
 +    }
++    if (params.stage_round_f16) {
++        if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
++            throw std::runtime_error("f16 rounding of the residual stream is only implemented for qwen35 and qwen35moe");
++        }
++        hparams.stage_round_f16 = true;
++        LLAMA_LOG_INFO("%s: the residual stream is rounded to f16 after every layer\n", __func__);
++    }
 +
      pimpl->n_bytes = ml.n_bytes;
  
      pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
-@@ -2485,6 +2499,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+@@ -2485,6 +2506,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
      if (tn.bid != -1) {
          // blocks that are not model layers (e.g. the blocks of a head) go with the output
          buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
@@ -1221,7 +1240,7 @@ index dbc91a1..aecdd1e 100644
      }
      return ml.create_tensor(
          hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-@@ -3289,10 +3309,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3289,10 +3316,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                          // DSA layers keep a K-only MLA cache plus a per-token indexer key cache,
                          // the KDA layers stay recurrent
                          filter_attn = [&](uint32_t il) {
@@ -1234,7 +1253,7 @@ index dbc91a1..aecdd1e 100644
                          };
                          filter_idx = [&](uint32_t il) {
                              return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
-@@ -3309,10 +3329,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3309,10 +3336,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                          };
                      } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                          filter_attn = [&](uint32_t il) {
@@ -1247,17 +1266,18 @@ index dbc91a1..aecdd1e 100644
                          };
  
                          if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-@@ -3547,6 +3567,8 @@ llama_model_params llama_model_default_params() {
+@@ -3547,6 +3574,9 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
 +        /*.stage_layer_start           =*/ 0,
 +        /*.stage_layer_end             =*/ 0,
++        /*.stage_round_f16             =*/ false,
      };
  
      return result;
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 736e23f..0500168 100644
+index 736e23f..23389b3 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -37,18 +37,24 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
@@ -1320,7 +1340,18 @@ index 736e23f..0500168 100644
              cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
              inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
          }
-@@ -204,6 +214,14 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+@@ -199,11 +209,25 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+         cur = build_cvec(cur, il);
+         cb(cur, "l_out", il);
+ 
++        if (hparams.stage_round_f16) {
++            // the same rounding after every layer, cut or not: the hidden states a stage hands
++            // on are already f16 values, and sending them as f16 changes nothing
++            cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_F16), GGML_TYPE_F32);
++        }
++
+         // Input for next layer
+         inpL = cur;
      }
      cur = inpL;
  
@@ -1336,7 +1367,7 @@ index 736e23f..0500168 100644
  
      cb(cur, "h_nextn", -1);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index c4da3e2..7f1a558 100644
+index c4da3e2..fc51a32 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -40,14 +40,20 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
@@ -1395,7 +1426,18 @@ index c4da3e2..7f1a558 100644
              cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
              inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
          }
-@@ -223,6 +233,14 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+@@ -218,11 +228,25 @@ llama_model_qwen35moe::graph::graph(const llm_graph_params & params) :
+         cur = build_cvec(cur, il);
+         cb(cur, "l_out", il);
+ 
++        if (hparams.stage_round_f16) {
++            // the same rounding after every layer, cut or not: the hidden states a stage hands
++            // on are already f16 values, and sending them as f16 changes nothing
++            cur = ggml_cast(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_F16), GGML_TYPE_F32);
++        }
++
+         // Input for next layer
+         inpL = cur;
      }
      cur = inpL;
  

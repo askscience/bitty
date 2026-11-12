@@ -184,6 +184,47 @@ async fn chained_stages_match_the_whole_model() {
         })
         .fold(0.0f32, f32::max);
     eprintln!("max |logit diff| among the best ten with f16: {best_half}");
+
+    // rounded to f16 after every layer, whole and cut: the same numbers, also with f16 between
+    // the stages, and close to the model without the rounding
+    let rounded = |executor: StageExecutor, wire_f16: bool| {
+        executor.with_options(StageOptions {
+            round_f16: true,
+            wire_f16,
+            ..options
+        })
+    };
+    let whole_rounded = vec![(rounded(load().await, false), range(0, layers))];
+    let (rounded_reference, rounded_logits) =
+        generate(&whole_rounded, "whole-rounded", &prompt, 8).await;
+    let rounded_chain = vec![
+        (rounded(load().await, true), range(0, cut_a)),
+        (rounded(load().await, true), range(cut_a, cut_b)),
+        (rounded(load().await, true), range(cut_b, layers)),
+    ];
+    let (rounded_chained, rounded_chained_logits) =
+        generate(&rounded_chain, "chained-rounded", &prompt, 8).await;
+    assert_eq!(rounded_chained, rounded_reference);
+    let worst_rounded = rounded_logits
+        .iter()
+        .flatten()
+        .zip(rounded_chained_logits.iter().flatten())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |logit diff| between the rounded whole model and the rounded chain with f16: {worst_rounded}");
+    assert!(
+        worst_rounded < 1e-3,
+        "rounding to f16 did not make the cut exact: {worst_rounded}"
+    );
+    let rounding_cost = reference_logits
+        .iter()
+        .flatten()
+        .zip(rounded_logits.iter().flatten())
+        .filter(|(a, b)| a.is_finite() && b.is_finite())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |logit diff| between the model and the model rounded to f16: {rounding_cost}");
+    eprintln!("tokens: plain {reference:?}, rounded {rounded_reference:?}");
     assert!(worst_half < 1.0, "f16 moved the logits by {worst_half}");
 
     // a request the stage never opened is refused instead of running on someone else's state
@@ -263,6 +304,7 @@ fn a_stopped_guess_leaves_no_trace() {
             sessions: 2,
             top_logits: 0,
             rollback: 4,
+            round_f16: false,
         })
         .unwrap()
     };

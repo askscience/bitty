@@ -15,6 +15,14 @@ num_predict = 128
 num_ctx = 8192
 draft_filename = "Qwen3.5-0.8B-Q4_K_M.gguf"
 draft_url = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"
+# Lower quantizations the leader gives to the slower nodes, with the size of the file against
+# the one above (15.23 and 11.32 GiB against 20.50).
+q3_filename = "Qwen3.5-35B-A3B-Q3_K_M.gguf"
+q3_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q3_K_M.gguf"
+q3_ratio = 0.743
+q2_filename = "Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf"
+q2_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf"
+q2_ratio = 0.552
 
 # Small enough for any machine: for tests of the network, where the model is not the point.
 [[model]]

@@ -435,28 +435,47 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     validate_cluster_token(&cluster_token)?;
     // A node that holds the whole model opens it directly. Any other node keeps only the
     // vocabulary file now and fetches the stage file of its layers once they are assigned.
+    // A node given a lower quantization than its file fetches the stage file of that one,
+    // also when it holds the whole model.
     let node_settings = BittySettings::load(data_dir.clone());
-    let (model_file, stage_source) =
-        match model_store::whole_model_path(&node_settings, &config.model) {
-            Some(path) => (path, None),
-            None => {
-                let settings = node_settings.clone();
-                let model = config.model.clone();
-                let vocabulary = tokio::task::spawn_blocking(move || {
-                    model_store::ensure_stage(&settings, &model, 0, 0, None)
-                })
-                .await??;
-                let settings = node_settings.clone();
-                let model = config.model.clone();
-                let source: bitty_inference::StageSource = Arc::new(move |start, end, stale| {
-                    let path =
-                        model_store::ensure_stage(&settings, &model, start, end, Some(stale))?;
-                    refuse_stage_past_memory(&path)?;
-                    Ok(path)
-                });
-                (vocabulary, Some(source))
-            }
-        };
+    let whole = model_store::whole_model_path(&node_settings, &config.model);
+    let model_file = match &whole {
+        Some(path) => path.clone(),
+        None => {
+            let settings = node_settings.clone();
+            let model = config.model.clone();
+            tokio::task::spawn_blocking(move || {
+                model_store::ensure_stage(&settings, &model, 0, 0, None)
+            })
+            .await??
+        }
+    };
+    let stage_source = {
+        let settings = node_settings.clone();
+        let model = config.model.clone();
+        let whole = whole.clone();
+        let source: bitty_inference::StageSource =
+            Arc::new(move |start, end, quantization, stale| {
+                let full = matches!(
+                    quantization,
+                    bitty_protocol::Quantization::Fp16 | bitty_protocol::Quantization::Q4
+                );
+                if let (true, Some(whole)) = (full, &whole) {
+                    return Ok(whole.clone());
+                }
+                let path = model_store::ensure_stage_in(
+                    &settings,
+                    &model,
+                    start,
+                    end,
+                    quantization,
+                    Some(stale),
+                )?;
+                refuse_stage_past_memory(&path)?;
+                Ok(path)
+            });
+        Some(source)
+    };
     let mut executor = StageExecutor::load(&model_file).await?;
     if let Some(source) = stage_source {
         executor = executor.with_stage_source(source);
@@ -513,6 +532,23 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
             .with_model_name(network_model)
             .with_orders(data_dir.join("orders"), data_dir.join("logs"))
             .with_guess_dir(data_dir.join("guesses"))
+            .with_low_quantizations({
+                let low = model_store::low_quantizations(&node_settings, &config.model);
+                if !low.is_empty() {
+                    println!(
+                        "slower nodes may get {}",
+                        low.iter()
+                            .map(|(quantization, ratio)| format!(
+                                "{} ({:.0}% of the size)",
+                                quantization.as_str(),
+                                ratio * 100.0
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                low
+            })
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         // The small model that guesses tokens for the ring. It is used from the moment the
         // file is whole on disk; until then requests go without it.

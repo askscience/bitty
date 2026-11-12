@@ -21,6 +21,7 @@ use bitty_protocol::pb::{
 };
 use bitty_protocol::security::BITTY_TOKEN_HEADER;
 use bitty_protocol::validation::MAX_ACTIVATION_PAYLOAD_BYTES;
+use bitty_protocol::Quantization;
 use bitty_protocol::{
     ActivationDType, ActivationTensor, HardwareProfile, Heartbeat, LayerMetadata, NodeId,
     ShardManifestMessage,
@@ -61,6 +62,9 @@ pub struct NetworkCoordinator {
     /// The small model that guesses tokens for the workers to check, opened on first use.
     draft_path: Option<PathBuf>,
     draft: Arc<Mutex<DraftSlot>>,
+    /// The lower quantizations of the model the nodes can fetch, with their size against the
+    /// model file; the planner gives them to the slower nodes.
+    low_quantizations: Vec<(Quantization, f64)>,
     /// Where the answers given before are kept as a source of guesses, and the history
     /// itself, opened on the first request.
     guess_dir: Option<PathBuf>,
@@ -116,7 +120,8 @@ fn holdings_kind(holdings: &str) -> String {
 /// The ranges of the last plan, and the file they are written to.
 #[derive(Debug)]
 struct KeptPlan {
-    ranges: Vec<(NodeId, u32, u32)>,
+    /// Node, layers and the quantization the node loads them in.
+    ranges: Vec<(NodeId, u32, u32, Quantization)>,
     file: Option<PathBuf>,
     /// Until then a node of the plan that is missing is waited for.
     wait_until: Instant,
@@ -157,7 +162,7 @@ fn plan_wait_time() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn read_plan(file: &std::path::Path) -> Vec<(NodeId, u32, u32)> {
+fn read_plan(file: &std::path::Path) -> Vec<(NodeId, u32, u32, Quantization)> {
     let Ok(contents) = std::fs::read_to_string(file) else {
         return Vec::new();
     };
@@ -168,7 +173,12 @@ fn read_plan(file: &std::path::Path) -> Vec<(NodeId, u32, u32)> {
             let node = parts.next()?;
             let start = parts.next()?.parse().ok()?;
             let end = parts.next()?.parse().ok()?;
-            Some((NodeId::new(node), start, end))
+            // a plan written before quantizations were chosen per node: the model file
+            let quantization = parts
+                .next()
+                .and_then(|name| Quantization::try_from(name).ok())
+                .unwrap_or(Quantization::Fp16);
+            Some((NodeId::new(node), start, end, quantization))
         })
         .collect()
 }
@@ -300,6 +310,7 @@ impl NetworkCoordinator {
             chain_broken: Arc::new(Mutex::new(None)),
             draft_path: None,
             draft: Arc::default(),
+            low_quantizations: Vec::new(),
             guess_dir: None,
             guess_history: Arc::default(),
             guess_tuning: Arc::default(),
@@ -407,6 +418,13 @@ impl NetworkCoordinator {
         self
     }
 
+    /// The lower quantizations of the model the nodes can fetch (`Q3`, `Q2`) with the size of
+    /// their weights against the model file. Without them every node loads the model file.
+    pub fn with_low_quantizations(mut self, quantizations: Vec<(Quantization, f64)>) -> Self {
+        self.low_quantizations = quantizations;
+        self
+    }
+
     /// The directory where the answers given before are kept between restarts, as a source
     /// of guesses. Without it they are kept in memory only.
     pub fn with_guess_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -502,10 +520,14 @@ impl NetworkCoordinator {
                     assignments
                         .iter()
                         .map(|assignment| format!(
-                            "{} {}..{}",
+                            "{} {}..{}{}",
                             assignment.node_id.0,
                             assignment.range.start_layer,
-                            assignment.range.end_layer_exclusive
+                            assignment.range.end_layer_exclusive,
+                            match assignment.range.quantization {
+                                Quantization::Fp16 | Quantization::Q4 => String::new(),
+                                other => format!(" in {}", other.as_str()),
+                            }
                         ))
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -691,7 +713,10 @@ impl NetworkCoordinator {
         }
 
         let started = Instant::now();
-        let halda = Halda::new(SchedulerConfig::default());
+        let halda = Halda::new(SchedulerConfig {
+            low_quantizations: self.low_quantizations.clone(),
+            ..SchedulerConfig::default()
+        });
         let fresh = halda.assign(&profiles, &self.layers);
         record_halda_run(started.elapsed().as_secs_f64() * 1000.0);
 
@@ -700,8 +725,8 @@ impl NetworkCoordinator {
             let missing = plan
                 .ranges
                 .iter()
-                .filter(|(node, _, _)| profiles.iter().all(|profile| &profile.node_id != node))
-                .map(|(node, _, _)| node.0.clone())
+                .filter(|(node, _, _, _)| profiles.iter().all(|profile| &profile.node_id != node))
+                .map(|(node, _, _, _)| node.0.clone())
                 .collect::<Vec<_>>();
             if !missing.is_empty() && Instant::now() < plan.wait_until {
                 return Err(Status::unavailable(format!(
@@ -718,7 +743,7 @@ impl NetworkCoordinator {
                 fresh.iter().all(|assignment| {
                     plan.ranges
                         .iter()
-                        .any(|(node, _, _)| node == &assignment.node_id)
+                        .any(|(node, _, _, _)| node == &assignment.node_id)
                 })
             });
             let dropped = if !missing.is_empty() {
@@ -742,6 +767,7 @@ impl NetworkCoordinator {
                     assignment.node_id.clone(),
                     assignment.range.start_layer,
                     assignment.range.end_layer_exclusive,
+                    assignment.range.quantization,
                 )
             })
             .collect::<Vec<_>>();
@@ -749,7 +775,9 @@ impl NetworkCoordinator {
             if let Some(file) = &plan.file {
                 let text = ranges
                     .iter()
-                    .map(|(node, start, end)| format!("{} {start} {end}\n", node.0))
+                    .map(|(node, start, end, quantization)| {
+                        format!("{} {start} {end} {}\n", node.0, quantization.as_str())
+                    })
                     .collect::<String>();
                 if let Err(err) = std::fs::write(file, text) {
                     eprintln!(

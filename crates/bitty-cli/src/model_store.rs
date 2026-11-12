@@ -21,6 +21,14 @@ pub struct ModelSpec {
     /// A small model with the same vocabulary: on the leader it guesses the next tokens.
     pub draft_filename: String,
     pub draft_url: String,
+    /// Lower quantizations of the same model: their file, where it is published, and the size
+    /// of its weights against the file above. The leader gives them to the slower nodes.
+    pub q3_filename: String,
+    pub q3_url: String,
+    pub q3_ratio: f64,
+    pub q2_filename: String,
+    pub q2_url: String,
+    pub q2_ratio: f64,
 }
 
 impl ModelSpec {
@@ -164,6 +172,78 @@ pub fn pull_model(
     Ok(spec)
 }
 
+/// The registry entry of a model, for what a manifest written by an older bitty does not say.
+fn registry_entry(spec: &ModelSpec) -> Option<ModelSpec> {
+    find_registry_model(&spec.id()).or_else(|| find_registry_model(&spec.name))
+}
+
+/// The lower quantizations a model has, with the size of their weights against its file: what
+/// the leader may give to slower nodes. `BITTY_LOW_QUANT=off` on the leader gives none.
+pub fn low_quantizations(
+    settings: &BittySettings,
+    model: &str,
+) -> Vec<(bitty_protocol::Quantization, f64)> {
+    if std::env::var("BITTY_LOW_QUANT").is_ok_and(|value| value.trim() == "off") {
+        return Vec::new();
+    }
+    let Some(spec) = network_name(settings, model)
+        .and_then(|name| find_registry_model(&name))
+        .or_else(|| resolve_model(settings, model).and_then(|spec| registry_entry(&spec)))
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (quantization, url, ratio) in [
+        (
+            bitty_protocol::Quantization::Q3,
+            &spec.q3_url,
+            spec.q3_ratio,
+        ),
+        (
+            bitty_protocol::Quantization::Q2,
+            &spec.q2_url,
+            spec.q2_ratio,
+        ),
+    ] {
+        if !url.is_empty() && ratio > 0.0 && ratio < 1.0 {
+            found.push((quantization, ratio));
+        }
+    }
+    found
+}
+
+/// The model in a quantization the leader asked for: the entry itself for the quantization of
+/// its file (`fp16` and `q4` mean that one), the published file of a lower one otherwise.
+/// `None` when the model has no such file.
+fn quantized_spec(
+    spec: &ModelSpec,
+    quantization: bitty_protocol::Quantization,
+) -> Option<ModelSpec> {
+    use bitty_protocol::Quantization;
+    let entry = registry_entry(spec);
+    let (filename, url) = match quantization {
+        Quantization::Fp16 | Quantization::Q4 => return Some(spec.clone()),
+        Quantization::Q3 => {
+            let entry = entry?;
+            (entry.q3_filename, entry.q3_url)
+        }
+        Quantization::Q2 => {
+            let entry = entry?;
+            (entry.q2_filename, entry.q2_url)
+        }
+    };
+    if filename.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some(ModelSpec {
+        filename,
+        url,
+        quantization: quantization.as_str().into(),
+        path: None,
+        ..spec.clone()
+    })
+}
+
 /// Where the stage file for layers `[start, end)` of a model lives.
 pub fn stage_path(settings: &BittySettings, spec: &ModelSpec, start: u32, end: u32) -> PathBuf {
     let stem = Path::new(&spec.filename)
@@ -217,6 +297,20 @@ pub fn pull_stage(
     cancel: Option<bitty_model::CancelCheck>,
 ) -> Result<(PathBuf, bitty_model::StageFileReport), Box<dyn std::error::Error>> {
     let (spec, is_url) = stage_spec(settings, model)?;
+    pull_stage_of(settings, &spec, is_url, start, end, output, cancel)
+}
+
+/// [`pull_stage`] for a model already resolved.
+fn pull_stage_of(
+    settings: &BittySettings,
+    spec: &ModelSpec,
+    is_url: bool,
+    start: u32,
+    end: u32,
+    output: Option<&Path>,
+    cancel: Option<bitty_model::CancelCheck>,
+) -> Result<(PathBuf, bitty_model::StageFileReport), Box<dyn std::error::Error>> {
+    let spec = spec.clone();
     let dest = match output {
         Some(path) => path.to_path_buf(),
         None => stage_path(settings, &spec, start, end),
@@ -260,13 +354,24 @@ fn wider_stage(
     if start >= end {
         return None;
     }
+    // only stage files of the same file: the stages of another quantization share the folder
+    let stem = Path::new(&spec.filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("model")
+        .to_string();
     std::fs::read_dir(spec.model_dir(settings).join("stages"))
         .ok()?
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path != dest)
         .filter_map(|path| {
-            let (from, to) = stage_range(path.file_name()?.to_str()?)?;
+            let name = path.file_name()?.to_str()?;
+            let (file, _) = name.rsplit_once(".layers-")?;
+            if file != stem {
+                return None;
+            }
+            let (from, to) = stage_range(name)?;
             (from <= start && end <= to).then_some((to - from, path))
         })
         .min()
@@ -281,13 +386,50 @@ pub fn ensure_stage(
     end: u32,
     cancel: Option<bitty_model::CancelCheck>,
 ) -> Result<PathBuf, String> {
-    let (spec, _) = stage_spec(settings, model)?;
+    ensure_stage_in(
+        settings,
+        model,
+        start,
+        end,
+        bitty_protocol::Quantization::Fp16,
+        cancel,
+    )
+}
+
+/// [`ensure_stage`] in the quantization the leader asked for. A model without a file of that
+/// quantization gives the stage of its own file, and says so.
+pub fn ensure_stage_in(
+    settings: &BittySettings,
+    model: &str,
+    start: u32,
+    end: u32,
+    quantization: bitty_protocol::Quantization,
+    cancel: Option<bitty_model::CancelCheck>,
+) -> Result<PathBuf, String> {
+    let (base, is_url) = stage_spec(settings, model)?;
+    let (spec, is_url) = match quantized_spec(&base, quantization) {
+        Some(spec) if spec.filename != base.filename => (spec, false),
+        Some(spec) => (spec, is_url),
+        None => {
+            eprintln!(
+                "bitty: {} has no {} file: layers {start}..{end} come from {}",
+                base.id(),
+                quantization.as_str(),
+                base.filename
+            );
+            (base, is_url)
+        }
+    };
     let dest = stage_path(settings, &spec, start, end);
     if dest.is_file() {
         return Ok(dest);
     }
-    eprintln!("bitty: fetching layers {start}..{end} of {}", spec.id());
-    let mut fetched = pull_stage(settings, model, start, end, None, cancel.clone());
+    eprintln!(
+        "bitty: fetching layers {start}..{end} of {} from {}",
+        spec.id(),
+        spec.filename
+    );
+    let mut fetched = pull_stage_of(settings, &spec, is_url, start, end, None, cancel.clone());
     let no_space = |err: &Box<dyn std::error::Error>| {
         matches!(
             err.downcast_ref::<bitty_model::StageFileError>(),
@@ -296,7 +438,7 @@ pub fn ensure_stage(
     };
     // Layers of an older plan are of no use once the plan has changed: they make room first.
     if fetched.as_ref().is_err_and(no_space) && remove_other_stages(settings, &spec, &dest) > 0 {
-        fetched = pull_stage(settings, model, start, end, None, cancel);
+        fetched = pull_stage_of(settings, &spec, is_url, start, end, None, cancel);
     }
     let (dest, report) = fetched.map_err(|err| {
         eprintln!("bitty: layers {start}..{end} not fetched: {err}");
@@ -621,6 +763,12 @@ fn set_spec_value(spec: &mut ModelSpec, key: &str, value: &str) {
         "path" => spec.path = Some(PathBuf::from(value)),
         "draft_filename" => spec.draft_filename = value.into(),
         "draft_url" => spec.draft_url = value.into(),
+        "q3_filename" => spec.q3_filename = value.into(),
+        "q3_url" => spec.q3_url = value.into(),
+        "q3_ratio" => spec.q3_ratio = value.parse().unwrap_or(0.0),
+        "q2_filename" => spec.q2_filename = value.into(),
+        "q2_url" => spec.q2_url = value.into(),
+        "q2_ratio" => spec.q2_ratio = value.parse().unwrap_or(0.0),
         _ => {}
     }
 }
@@ -643,5 +791,40 @@ mod tests {
     fn registry_contains_qwen() {
         let model = find_registry_model("qwen3.5-35b-a3b").unwrap();
         assert_eq!(model.filename, "Qwen3.5-35B-A3B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn the_registry_names_the_lower_quantizations() {
+        use bitty_protocol::Quantization;
+        let model = find_registry_model("qwen3.5-35b-a3b").unwrap();
+        let q2 = quantized_spec(&model, Quantization::Q2).unwrap();
+        assert_eq!(q2.filename, "Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf");
+        assert!(q2.url.ends_with("/Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf"));
+        assert_eq!(q2.name, model.name);
+        let q3 = quantized_spec(&model, Quantization::Q3).unwrap();
+        assert_eq!(q3.filename, "Qwen3.5-35B-A3B-Q3_K_M.gguf");
+        assert_eq!(quantized_spec(&model, Quantization::Fp16).unwrap(), model);
+        // a model without lower files has none
+        let small = find_registry_model("qwen3.5-0.8b").unwrap();
+        assert!(quantized_spec(&small, Quantization::Q2).is_none());
+    }
+
+    #[test]
+    fn a_stage_of_another_quantization_is_never_cut_from() {
+        let dir = std::env::temp_dir().join(format!("bitty-stages-{}", std::process::id()));
+        let mut settings = BittySettings::defaults(dir.clone());
+        settings.models_dir = dir.clone();
+        let model = find_registry_model("qwen3.5-35b-a3b").unwrap();
+        let q2 = quantized_spec(&model, bitty_protocol::Quantization::Q2).unwrap();
+        let wide = stage_path(&settings, &model, 10, 40);
+        std::fs::create_dir_all(wide.parent().unwrap()).unwrap();
+        std::fs::write(&wide, b"q4 layers").unwrap();
+        let dest = stage_path(&settings, &q2, 20, 30);
+        assert_ne!(dest, stage_path(&settings, &model, 20, 30));
+        // the Q4 file holds 20..30, but not in Q2
+        assert_eq!(wider_stage(&settings, &q2, 20, 30, &dest), None);
+        let q4_dest = stage_path(&settings, &model, 20, 30);
+        assert_eq!(wider_stage(&settings, &model, 20, 30, &q4_dest), Some(wide));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

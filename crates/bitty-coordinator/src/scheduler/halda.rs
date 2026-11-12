@@ -12,6 +12,10 @@ pub struct SchedulerConfig {
     /// Memory a stage engine needs on top of its layers: the embeddings or the output head, the
     /// context of every session, the engine itself.
     pub stage_overhead_bytes: u64,
+    /// The lower quantizations of the model that nodes can fetch, with the size of their
+    /// weights against the model file (`Q2` about 0.55 for Qwen3.5-35B). Empty: every node
+    /// loads the layers of the model file as they are.
+    pub low_quantizations: Vec<(Quantization, f64)>,
 }
 
 impl Default for SchedulerConfig {
@@ -20,9 +24,16 @@ impl Default for SchedulerConfig {
             memory_reserve_fraction: bitty_protocol::MEMORY_RESERVE_FRACTION,
             critical_quantization: Quantization::Fp16,
             stage_overhead_bytes: bitty_protocol::stage_overhead_bytes(),
+            low_quantizations: Vec::new(),
         }
     }
 }
+
+/// A node at least this share of the fastest keeps the quantization of the model file.
+const FULL_QUANT_SHARE: f64 = 0.5;
+/// Under the full share and at least this one, a node takes the middle quantization (Q3);
+/// under it the lowest (Q2).
+const MIDDLE_QUANT_SHARE: f64 = 0.25;
 
 /// A node that answers the leader faster than this is near: it is beside it, or a short
 /// direct link away. A node that has not measured its link yet counts as near.
@@ -139,40 +150,91 @@ impl Halda {
             if near.is_empty() {
                 continue;
             }
-            if let Ok((found, false)) = self.lay_out(&near, layers) {
-                lens = Some(found);
+            if let Ok((found, false, quants)) = self.lay_out(&near, layers) {
+                lens = Some((found, quants));
                 ranked = near;
                 break;
             }
         }
-        let lens = match lens {
-            Some(lens) => lens,
-            None => self.lay_out(&ranked, layers)?.0,
+        let (lens, quants) = match lens {
+            Some(found) => found,
+            None => {
+                let (lens, _, quants) = self.lay_out(&ranked, layers)?;
+                (lens, quants)
+            }
         };
 
         let mut cursor = 0_u32;
         let ranges = ranked
             .iter()
             .zip(lens)
-            .map(|(node, len)| {
+            .zip(quants)
+            .map(|((node, len), (quantization, _))| {
                 let start = cursor;
                 cursor += len;
-                (node, start, cursor)
+                (node, start, cursor, quantization)
             })
             .collect::<Vec<_>>();
         self.build(&ranges, nodes, layers)
     }
 
-    /// How many layers each node takes, in the order of `ranked`, and whether a node had to
-    /// go past the memory it has free.
+    /// The quantization a node loads its layers in, and the size of its weights against the
+    /// model file. The first node, which holds the embeddings, and every node at least half as
+    /// fast as the fastest keep the model file; slower ones take a lower one, the slowest the
+    /// lowest. A node whose weights are smaller reads less memory for every token and holds
+    /// more layers.
+    fn node_quantization(
+        &self,
+        node: &HardwareProfile,
+        strongest: f64,
+        first: bool,
+    ) -> (Quantization, f64) {
+        let full = (self.config.critical_quantization, 1.0);
+        if first || self.config.low_quantizations.is_empty() {
+            return full;
+        }
+        let share = node.effective_compute_score() / strongest.max(f64::MIN_POSITIVE);
+        let wanted = if share >= FULL_QUANT_SHARE {
+            return full;
+        } else if share >= MIDDLE_QUANT_SHARE {
+            [Quantization::Q3, Quantization::Q2]
+        } else {
+            [Quantization::Q2, Quantization::Q3]
+        };
+        wanted
+            .iter()
+            .find_map(|wanted| {
+                self.config
+                    .low_quantizations
+                    .iter()
+                    .find(|(have, _)| have == wanted)
+                    .copied()
+            })
+            .unwrap_or(full)
+    }
+
+    /// How many layers each node takes, in the order of `ranked`, whether a node had to go
+    /// past the memory it has free, and the quantization of each node.
+    #[allow(clippy::type_complexity)]
     fn lay_out(
         &self,
         ranked: &[HardwareProfile],
         layers: &[LayerMetadata],
-    ) -> Result<(Vec<u32>, bool), HaldaError> {
-        let total_score = ranked
+    ) -> Result<(Vec<u32>, bool, Vec<(Quantization, f64)>), HaldaError> {
+        let strongest = ranked
             .iter()
             .map(HardwareProfile::effective_compute_score)
+            .fold(0.0, f64::max);
+        let quants: Vec<(Quantization, f64)> = ranked
+            .iter()
+            .enumerate()
+            .map(|(index, node)| self.node_quantization(node, strongest, index == 0))
+            .collect();
+        // smaller weights are read faster: a node on a lower quantization does more layers in
+        // the same time
+        let score = |index: usize| ranked[index].effective_compute_score() / quants[index].1;
+        let total_score = (0..ranked.len())
+            .map(score)
             .sum::<f64>()
             .max(f64::MIN_POSITIVE);
 
@@ -180,21 +242,29 @@ impl Halda {
         // Two limits. The free limit is what the node had free when it started: inside it the
         // node keeps working as it did before. The hard limit is its whole memory less a
         // reserve: past it the node swaps. Layers go inside the free limit first.
-        let weights = |start: u32, len: u32| assignment_weight_bytes(start, start + len, layers);
-        let memory = |start: u32, len: u32| assignment_memory_bytes(start, start + len, layers);
-        let on_disk = |node: &HardwareProfile, start: u32, len: u32| {
-            node.disk_bytes()
-                .is_none_or(|disk| weights(start, len) <= disk)
+        let weights = |index: usize, start: u32, len: u32| {
+            scaled(
+                assignment_weight_bytes(start, start + len, layers),
+                quants[index].1,
+            )
         };
-        let fits = |node: &HardwareProfile, start: u32, len: u32| {
-            on_disk(node, start, len)
-                && memory(start, len) + self.config.stage_overhead_bytes
-                    <= node.free_memory_bytes(self.config.memory_reserve_fraction)
+        let memory = |index: usize, start: u32, len: u32| {
+            weights(index, start, len) + assignment_state_bytes(start, start + len, layers)
         };
-        let fits_hard = |node: &HardwareProfile, start: u32, len: u32| {
-            on_disk(node, start, len)
-                && memory(start, len) + self.config.stage_overhead_bytes
-                    <= available_memory_bytes(node, self.config.memory_reserve_fraction)
+        let on_disk = |index: usize, start: u32, len: u32| {
+            ranked[index]
+                .disk_bytes()
+                .is_none_or(|disk| weights(index, start, len) <= disk)
+        };
+        let fits = |index: usize, start: u32, len: u32| {
+            on_disk(index, start, len)
+                && memory(index, start, len) + self.config.stage_overhead_bytes
+                    <= ranked[index].free_memory_bytes(self.config.memory_reserve_fraction)
+        };
+        let fits_hard = |index: usize, start: u32, len: u32| {
+            on_disk(index, start, len)
+                && memory(index, start, len) + self.config.stage_overhead_bytes
+                    <= available_memory_bytes(&ranked[index], self.config.memory_reserve_fraction)
         };
 
         // First pass: a share of the layers in proportion to each node's speed.
@@ -206,7 +276,7 @@ impl Halda {
             }
             let remaining_nodes = ranked.len() - index;
             let remaining_layers = total_layers - cursor;
-            let score_share = node.effective_compute_score() / total_score;
+            let score_share = score(index) / total_score;
             let target_len = ((layers.len() as f64) * score_share).round() as u32;
             let mut len = target_len
                 .max(1)
@@ -215,7 +285,7 @@ impl Halda {
             if remaining_layers > remaining_nodes as u32 {
                 len = len.min(remaining_layers.saturating_sub((remaining_nodes - 1) as u32));
             }
-            while len > 1 && !fits(node, cursor, len) {
+            while len > 1 && !fits(index, cursor, len) {
                 len -= 1;
             }
             lens.push(len);
@@ -237,9 +307,9 @@ impl Halda {
                 while left_over > 0
                     && lens[index] < node.max_layers.max(1)
                     && if hard {
-                        fits_hard(node, start, lens[index] + 1)
+                        fits_hard(index, start, lens[index] + 1)
                     } else {
-                        fits(node, start, lens[index] + 1)
+                        fits(index, start, lens[index] + 1)
                     }
                 {
                     lens[index] += 1;
@@ -256,7 +326,7 @@ impl Halda {
             });
         }
 
-        Ok((lens, past_free))
+        Ok((lens, past_free, quants))
     }
 
     /// A plan made earlier, as it stands on the nodes of now: the same ranges on the same
@@ -264,12 +334,12 @@ impl Halda {
     /// that still holds is worth keeping: every range that moves is a download of gigabytes.
     pub fn keep(
         &self,
-        ranges: &[(NodeId, u32, u32)],
+        ranges: &[(NodeId, u32, u32, Quantization)],
         nodes: &[HardwareProfile],
         layers: &[LayerMetadata],
     ) -> Result<Vec<LayerAssignment>, HaldaError> {
         let mut placed = Vec::new();
-        for (node_id, start, end) in ranges {
+        for (node_id, start, end, quantization) in ranges {
             let node = nodes
                 .iter()
                 .find(|node| &node.node_id == node_id)
@@ -280,28 +350,31 @@ impl Halda {
                     "node {node_id} no longer takes {len} layers"
                 )));
             }
-            let weights = assignment_weight_bytes(*start, *end, layers);
+            let weights = scaled(
+                assignment_weight_bytes(*start, *end, layers),
+                self.quantization_ratio(*quantization),
+            );
             if node.disk_bytes().is_some_and(|disk| weights > disk) {
                 return Err(HaldaError::InvalidAssignment(format!(
                     "the disk of node {node_id} no longer holds its layers"
                 )));
             }
-            placed.push((node, *start, *end));
+            placed.push((node, *start, *end, *quantization));
         }
-        placed.sort_by_key(|(_, start, _)| *start);
+        placed.sort_by_key(|(_, start, _, _)| *start);
         self.build(&placed, nodes, layers)
     }
 
     fn build(
         &self,
-        ranges: &[(&HardwareProfile, u32, u32)],
+        ranges: &[(&HardwareProfile, u32, u32, Quantization)],
         nodes: &[HardwareProfile],
         layers: &[LayerMetadata],
     ) -> Result<Vec<LayerAssignment>, HaldaError> {
         let mut assignments = Vec::new();
-        for &(node, cursor, end) in ranges {
-            let quantization = quantization_for(node, cursor, end, layers, &self.config);
-            let assigned_weight_bytes = assignment_weight_bytes(cursor, end, layers);
+        for &(node, cursor, end, quantization) in ranges {
+            let ratio = self.quantization_ratio(quantization);
+            let assigned_weight_bytes = scaled(assignment_weight_bytes(cursor, end, layers), ratio);
             assignments.push(LayerAssignment {
                 node_id: node.node_id.clone(),
                 range: AssignedLayerRange {
@@ -314,7 +387,9 @@ impl Halda {
                 next_node_id: None,
                 disk_offload_fraction: disk_offload_fraction(
                     node,
-                    assignment_memory_bytes(cursor, end, layers) + self.config.stage_overhead_bytes,
+                    assigned_weight_bytes
+                        + assignment_state_bytes(cursor, end, layers)
+                        + self.config.stage_overhead_bytes,
                 ),
                 model_stage: ModelStage::LayerRange,
             });
@@ -341,6 +416,15 @@ impl Halda {
         if let Some(last) = assignments.last_mut() {
             last.model_stage = ModelStage::FinalLayersAndLmHead;
         }
+    }
+
+    /// The size of the weights of a quantization against the model file.
+    fn quantization_ratio(&self, quantization: Quantization) -> f64 {
+        self.config
+            .low_quantizations
+            .iter()
+            .find(|(have, _)| *have == quantization)
+            .map_or(1.0, |(_, ratio)| *ratio)
     }
 
     pub fn validate(
@@ -419,25 +503,9 @@ pub enum HaldaError {
     InvalidAssignment(String),
 }
 
-fn quantization_for(
-    node: &HardwareProfile,
-    start: u32,
-    end: u32,
-    layers: &[LayerMetadata],
-    config: &SchedulerConfig,
-) -> Quantization {
-    if layers[start as usize..end as usize]
-        .iter()
-        .any(|layer| layer.precision_critical)
-    {
-        return config.critical_quantization;
-    }
-
-    match node.tier {
-        NodeTier::S | NodeTier::A => Quantization::Q4,
-        NodeTier::B => Quantization::Q3,
-        NodeTier::C | NodeTier::D => Quantization::Q2,
-    }
+/// Bytes of the model file scaled to a quantization `ratio` of its size.
+fn scaled(bytes: u64, ratio: f64) -> u64 {
+    (bytes as f64 * ratio).ceil() as u64
 }
 
 /// The bytes of the layers as they are in the model file: a stage file holds these very bytes,
@@ -449,12 +517,12 @@ fn assignment_weight_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u6
         .sum()
 }
 
-/// The memory a range takes on a node, less the fixed overhead of a stage: its weights and
-/// the state its recurrent layers keep.
-fn assignment_memory_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u64 {
+/// The state the recurrent layers of a range keep: memory on top of the weights, whatever
+/// their quantization.
+fn assignment_state_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u64 {
     layers[start as usize..end as usize]
         .iter()
-        .map(|layer| layer.weight_bytes + layer.state_bytes)
+        .map(|layer| layer.state_bytes)
         .sum()
 }
 
@@ -592,6 +660,70 @@ mod tests {
         assert_eq!(holders(&plan), ["node-0", "node-1"]);
     }
 
+    fn with_low_quantizations() -> Halda {
+        Halda::new(SchedulerConfig {
+            low_quantizations: vec![(Quantization::Q3, 0.75), (Quantization::Q2, 0.55)],
+            ..SchedulerConfig::default()
+        })
+    }
+
+    #[test]
+    fn slower_nodes_get_lower_quantizations_and_more_layers() {
+        let mut fast = cpu_node(0, 32, 28);
+        fast.cpu_tflops = 4.0;
+        let mut middle = cpu_node(1, 16, 14);
+        middle.cpu_tflops = 1.2;
+        let mut slow = cpu_node(2, 16, 14);
+        // a fifth of the fastest: slow, and still above the share that leaves a node out
+        slow.cpu_tflops = 0.8;
+        let nodes = vec![fast, middle, slow];
+        let plain = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        let mixed = with_low_quantizations()
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        let quant = |plan: &[LayerAssignment], node: &str| {
+            plan.iter()
+                .find(|assignment| assignment.node_id.0 == node)
+                .map(|assignment| assignment.range.quantization)
+        };
+        let len = |plan: &[LayerAssignment], node: &str| {
+            plan.iter()
+                .find(|assignment| assignment.node_id.0 == node)
+                .map_or(0, |assignment| assignment.range.len())
+        };
+        // without lower quantizations every node loads the model file
+        assert!(plain
+            .iter()
+            .all(|assignment| assignment.range.quantization == Quantization::Fp16));
+        assert_eq!(quant(&mixed, "node-0"), Some(Quantization::Fp16));
+        assert_eq!(quant(&mixed, "node-1"), Some(Quantization::Q3));
+        assert_eq!(quant(&mixed, "node-2"), Some(Quantization::Q2));
+        // the smaller weights are read faster: the slow node does more of the work
+        assert!(len(&mixed, "node-2") > len(&plain, "node-2"));
+        let total: u32 = mixed.iter().map(|assignment| assignment.range.len()).sum();
+        assert_eq!(total, 40);
+        // and the size the node is told is the size of its quantization
+        let slow_bytes = mixed
+            .iter()
+            .find(|assignment| assignment.node_id.0 == "node-2")
+            .unwrap()
+            .assigned_weight_bytes;
+        let full = len(&mixed, "node-2") as u64 * 527 * 1024 * 1024;
+        assert!(slow_bytes < full * 6 / 10, "{slow_bytes} of {full}");
+    }
+
+    #[test]
+    fn the_node_with_the_first_layers_keeps_the_model_file() {
+        let mut slow = cpu_node(0, 32, 28);
+        slow.cpu_tflops = 0.1;
+        let plan = with_low_quantizations()
+            .assign(&[slow], &big_layers())
+            .unwrap();
+        assert_eq!(plan[0].range.quantization, Quantization::Fp16);
+    }
+
     #[test]
     fn a_slow_node_is_kept_when_the_model_needs_its_memory() {
         // the leader can hold 14 layers, the fast far node about 20: the slow ones must help
@@ -725,6 +857,7 @@ mod tests {
                     assignment.node_id.clone(),
                     assignment.range.start_layer,
                     assignment.range.end_layer_exclusive,
+                    assignment.range.quantization,
                 )
             })
             .collect::<Vec<_>>();

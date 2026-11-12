@@ -117,6 +117,8 @@ pub struct StageProcessConfig {
     /// How many tokens of its last request a session can take back. Each one costs a copy of
     /// the recurrent state of every session.
     pub rollback: u32,
+    /// Rounds the residual stream to f16 after every layer (`--round-f16`).
+    pub round_f16: bool,
 }
 
 /// Output of one decode call.
@@ -241,6 +243,9 @@ impl StageProcess {
         }
         if config.rollback > 0 {
             command.arg("--rollback").arg(config.rollback.to_string());
+        }
+        if config.round_f16 {
+            command.arg("--round-f16");
         }
         Self::start(command, &config.engine)
     }

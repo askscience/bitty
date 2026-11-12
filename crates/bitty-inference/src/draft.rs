@@ -62,6 +62,7 @@ impl DraftModel {
             sessions: SESSIONS,
             top_logits: 1,
             rollback: 0,
+            round_f16: false,
         })?;
         Ok(Self {
             process,

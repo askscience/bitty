@@ -176,13 +176,56 @@ by default); a request with a larger `--top-k` samples among the 64. It was
 1024 until a pass came to carry up to 9 tokens: 72 KB on the way back through
 the relays for a pass of 8 guesses, 4.5 KB now.
 
-The hidden states go from stage to stage as f32, 8 KB per token on the 35B
-model. `BITTY_WIRE_F16=1` on the nodes sends them as f16, half of that, and
-every stage reads both. It is off because it is not exact: on the 0.8B model
-cut in three it gave the same tokens but moved the best ten logits by up to
-0.45 (the largest difference among all the logits returned was 0.59), against
-0 with f32. The hidden states of that model are all below 4, so this is the
-precision of f16 itself and keeping a few large values aside would not help.
+### f16 after every layer
+
+The hidden states go from stage to stage, 8 KB per token as f32 on the 35B
+model. Sent as f16 they are half of that, but rounding them only where the
+model is cut makes the text depend on where the cuts are: on the 0.8B model cut
+in three that moved the best ten logits by up to 0.45, against 0 with f32. The
+hidden states of that model are all below 4, so this is the precision of f16
+itself, and keeping a few large values aside would not help.
+
+So the engine rounds the residual stream to f16 after every layer, in every
+stage alike (`bitty-stage --round-f16`, `stage_round_f16` in
+`llama_model_params`, for `qwen35` and `qwen35moe`). The result is then the
+same wherever the model is cut, and the stages send f16 without losing
+anything: on the 0.8B model the rounded whole model and a rounded chain of three
+stages sending f16 give the same logits to the last bit. The rounding itself
+moves the logits by up to 0.54 against the model without it (the same tokens
+there). On the 35B model it costs about 5% of the compute (290.8 ms against
+276.0 for a token through four stages of ten layers on the CPU) and saves 4 KB a
+token on every hop; on the ring of four machines with relays that is about 70 ms
+a token. The text differs a little from the one without the rounding.
+
+It is on by default. `BITTY_ROUND_F16=0` on every node turns it off, and the
+hidden states then go as f32 unless `BITTY_WIRE_F16=1`; every stage reads both.
+All the nodes of a ring should have the same setting.
+
+### Lower quantizations for slower nodes
+
+A node can hold its layers in a lower quantization than the model file. The
+hidden states have the same form whatever the quantization of the weights, so
+stages of different quantizations work together. For the 35B model the registry
+names `Q3_K_M` (74% of the size) and `UD-Q2_K_XL` (55%) beside the `Q4_K_M` file.
+
+The leader chooses per node by speed: the first node, which holds the
+embeddings, and every node at least half as fast as the fastest keep the model
+file; a node between a quarter and a half takes Q3, a slower one Q2. In the plan
+a node on a lower quantization counts as faster in proportion to its smaller
+weights (a token reads less memory) and its layers as smaller, so it takes more
+of them. Its log shows the quantization beside the range (`bitty-1234 34..40 in
+q2`); the plan file keeps it, so a node keeps its files while the plan holds.
+The node fetches the stage file of that quantization from its published file,
+with range requests, also when it holds the whole model in another one.
+
+A chain of layers 0..38 from the Q4 file and 38..40 from the Q2 file (825 MiB
+for the two layers and the output head, against 1408 in Q4) answers "The capital
+of France is Paris. It is the country's most populous city and serves as its
+center for finance, commerce", where the Q4 file alone writes "It is also the
+country's largest city and serves as its major center for finance". The text
+depends on which node holds which layers, so it changes when the ring does.
+
+`BITTY_LOW_QUANT=off` on the leader keeps every node on the model file.
 
 ## A draft model on the leader
 

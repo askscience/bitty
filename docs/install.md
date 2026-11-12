@@ -203,6 +203,13 @@ The answers are kept in `guesses/` in the data directory of the leader.
 `BITTY_GUESS_CACHE=request` keeps nothing between requests, `off` turns it off.
 See "Guesses from text" in [engine/README.md](../engine/README.md).
 
+Slower nodes get their layers in a lower quantization of the model (Q3 or
+Q2), which they fetch by themselves: smaller weights are read faster and more
+of them fit. `BITTY_LOW_QUANT=off` on the leader keeps every node on the model
+file. Every stage rounds the residual stream to f16 after every layer, so the
+machines send each other half the data without changing the text;
+`BITTY_ROUND_F16=0` on every node turns that off. See [engine/README.md](../engine/README.md).
+
 `BITTY_ALL_NODES=1` on the leader does the opposite: every machine that can
 hold a layer gets some, near or far, fast or slow. It is for tests, to measure
 a ring of all the machines; a far or slow machine usually makes it slower.
