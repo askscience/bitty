@@ -512,6 +512,7 @@ async fn run_node(mut config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
             .with_plan_file(data_dir.join(plan_file_name(network_model.as_deref())))
             .with_model_name(network_model)
             .with_orders(data_dir.join("orders"), data_dir.join("logs"))
+            .with_guess_dir(data_dir.join("guesses"))
             .with_auth_mode(AuthMode::PreSharedToken(cluster_token.clone()));
         // The small model that guesses tokens for the ring. It is used from the moment the
         // file is whole on disk; until then requests go without it.

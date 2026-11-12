@@ -2,7 +2,8 @@ use crate::security::{request_rate_limiter, AuthMode, SharedRateLimiter};
 use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
 use bitty_inference::{
-    DraftModel, Sampler, SamplingOptions, StageOptions, TextCodec, TextStream, DEFAULT_TOP_K,
+    guess_cache_mode, guess_count, history_file_name, lookup_in_text, DraftModel, GuessCacheMode,
+    GuessHistory, Sampler, SamplingOptions, StageOptions, TextCodec, TextStream, DEFAULT_TOP_K,
     DEFAULT_TOP_P,
 };
 #[cfg(test)]
@@ -28,7 +29,7 @@ use futures::stream;
 use iroh::Endpoint;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +61,10 @@ pub struct NetworkCoordinator {
     /// The small model that guesses tokens for the workers to check, opened on first use.
     draft_path: Option<PathBuf>,
     draft: Arc<Mutex<DraftSlot>>,
+    /// Where the answers given before are kept as a source of guesses, and the history
+    /// itself, opened on the first request.
+    guess_dir: Option<PathBuf>,
+    guess_history: Arc<std::sync::Mutex<Option<GuessHistory>>>,
     /// The plan in use. It is kept while it holds, also across a restart of the leader.
     plan: Arc<Mutex<KeptPlan>>,
     /// The model as the nodes can fetch it, told to each node that registers.
@@ -280,6 +285,8 @@ impl NetworkCoordinator {
             chain_broken: Arc::new(Mutex::new(None)),
             draft_path: None,
             draft: Arc::default(),
+            guess_dir: None,
+            guess_history: Arc::default(),
             plan: Arc::new(Mutex::new(KeptPlan {
                 ranges: Vec::new(),
                 file: None,
@@ -381,6 +388,13 @@ impl NetworkCoordinator {
     /// the workers check several of them in one pass.
     pub fn with_draft_model(mut self, draft_path: impl Into<PathBuf>) -> Self {
         self.draft_path = Some(draft_path.into());
+        self
+    }
+
+    /// The directory where the answers given before are kept between restarts, as a source
+    /// of guesses. Without it they are kept in memory only.
+    pub fn with_guess_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.guess_dir = Some(dir.into());
         self
     }
 
@@ -1068,6 +1082,20 @@ impl NetworkCoordinator {
         let mut trace_lines = Vec::new();
         // the whole text: the prompt and every token chosen so far
         let mut text_tokens = std::mem::take(&mut current_input);
+        let prompt_len = text_tokens.len();
+        // Guesses taken from text: the request itself and the answers given before. They
+        // cost nothing to make, so they come before the draft model. `--no-draft` turns
+        // every guess off.
+        let guess_mode = if request.draft_tokens < 0 || pipeline {
+            GuessCacheMode::Off
+        } else {
+            guess_cache_mode()
+        };
+        if guess_mode == GuessCacheMode::All {
+            self.open_guess_history(model_path, codec.vocab_size());
+        }
+        let take_back_limit = StageOptions::from_env().rollback as usize;
+        let (mut text_guessed, mut text_kept) = (0usize, 0usize);
         // how many of them the workers hold
         let mut fed = 0usize;
         // the workers hold guesses after `fed` that were wrong
@@ -1080,9 +1108,36 @@ impl NetworkCoordinator {
             let started = Instant::now();
             let pending = text_tokens[fed..].to_vec();
             let mut guesses = Vec::new();
+            let mut guess_source = "";
+            if pending.len() == 1 && guess_mode != GuessCacheMode::Off {
+                let room = (max_new_tokens - produced).saturating_sub(1) as usize;
+                let count = guess_count(text_kept, text_guessed, take_back_limit).min(room);
+                if let Some(found) = lookup_in_text(&text_tokens, count) {
+                    guesses = found;
+                    guess_source = "the request";
+                } else if guess_mode == GuessCacheMode::All {
+                    let history = self
+                        .guess_history
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if let Some(found) = history
+                        .as_ref()
+                        .and_then(|history| history.propose(&text_tokens, count))
+                    {
+                        guesses = found;
+                        guess_source = "earlier answers";
+                    }
+                }
+                // nothing is worth guessing past the end of the text
+                if let Some(end) = guesses.iter().position(|token| codec.is_end(*token)) {
+                    guesses.truncate(end + 1);
+                }
+            }
             // The workers can only take back tokens of their last pass, and not its first
             // one: a guess goes with one certain token, not with the prompt.
-            if let (Some(model), 1, false) = (&draft, pending.len(), pipeline) {
+            if let (Some(model), 1, false, true) =
+                (&draft, pending.len(), pipeline, guesses.is_empty())
+            {
                 let count =
                     draft_tokens.min((max_new_tokens - produced).saturating_sub(1) as usize);
                 let (model, codec) = (model.clone(), codec.clone());
@@ -1095,7 +1150,10 @@ impl NetworkCoordinator {
                 .map_err(|err| err.to_string())
                 .and_then(|result| result.map_err(|err| err.to_string()));
                 match proposed {
-                    Ok(tokens) => guesses = tokens,
+                    Ok(tokens) => {
+                        guesses = tokens;
+                        guess_source = "the draft model";
+                    }
                     Err(err) => {
                         eprintln!(
                             "bitty-coordinator: the draft model failed ({err}); the request goes on without it"
@@ -1352,7 +1410,12 @@ impl NetworkCoordinator {
             rewind = accepted < guesses.len();
             guessed += guesses.len();
             kept += accepted;
-            if let (Some(model), false) = (&draft, guesses.is_empty()) {
+            let checked = (accepted, guesses.len());
+            if guess_source != "the draft model" {
+                text_guessed += guesses.len();
+                text_kept += accepted;
+            }
+            if let (Some(model), "the draft model") = (&draft, guess_source) {
                 model
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
@@ -1386,8 +1449,16 @@ impl NetworkCoordinator {
                     .iter()
                     .map(|micros| format!("{:.0}", ms(*micros)))
                     .collect();
+                let checked = if checked.1 > 0 {
+                    format!(
+                        ", {} of {} guesses from {guess_source} kept",
+                        checked.0, checked.1
+                    )
+                } else {
+                    String::new()
+                };
                 trace_lines.push(format!(
-                    "pass {pass_step}: {} {:.0} ms, draft {:.0}, wait for the answer {:.0}, workers [{}], {guess_fate}, take back {:.0}",
+                    "pass {pass_step}: {} {:.0} ms, draft {:.0}, wait for the answer {:.0}, workers [{}], {guess_fate}, take back {:.0}{checked}",
                     if rode { "rode a guess" } else { "sent" },
                     ms(pass_micros),
                     ms(draft_micros),
@@ -1414,6 +1485,11 @@ impl NetworkCoordinator {
             .await;
         }
 
+        if guess_mode == GuessCacheMode::All && text_tokens.len() > prompt_len {
+            self.remember_answer(&text_tokens[..prompt_len], &text_tokens[prompt_len..])
+                .await;
+        }
+
         for line in &trace_lines {
             println!("{line}");
         }
@@ -1434,7 +1510,7 @@ impl NetworkCoordinator {
                 .collect();
             let in_hops = hop_micros.iter().sum::<u64>() as f64 / steps / 1000.0;
             println!(
-                "timing ({}): {} tokens in {:.1}s, {} passes, {} of {} draft tokens kept; ms per token after the first pass: {:.1}, of which workers {:.1} [{}]",
+                "timing ({}): {} tokens in {:.1}s, {} passes, {} of {} draft tokens kept ({} of {} taken from text); ms per token after the first pass: {:.1}, of which workers {:.1} [{}]",
                 if route.is_some() {
                     "worker to worker"
                 } else {
@@ -1445,6 +1521,8 @@ impl NetworkCoordinator {
                 step,
                 kept,
                 guessed,
+                text_kept,
+                text_guessed,
                 token_micros as f64 / steps / 1000.0,
                 in_hops,
                 hops.join(", ")
@@ -1469,6 +1547,46 @@ impl NetworkCoordinator {
         match failure {
             Some(status) => Err(status),
             None => Ok(outputs),
+        }
+    }
+
+    /// Opens the history of answers on the first request that wants it.
+    fn open_guess_history(&self, model: &Path, vocab_size: u32) {
+        let mut slot = self
+            .guess_history
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let history = match &self.guess_dir {
+            Some(dir) => GuessHistory::open(dir.join(history_file_name(model, vocab_size))),
+            None => GuessHistory::new(1 << 20),
+        };
+        if !history.is_empty() {
+            println!(
+                "bitty-coordinator: {} tokens of earlier answers to guess from",
+                history.len()
+            );
+        }
+        *slot = Some(history);
+    }
+
+    /// Adds an answer to the history and writes it to disk, off the async threads.
+    async fn remember_answer(&self, prompt: &[u32], answer: &[u32]) {
+        let (history, prompt, answer) =
+            (self.guess_history.clone(), prompt.to_vec(), answer.to_vec());
+        let saved = tokio::task::spawn_blocking(move || {
+            let mut history = history.lock().unwrap_or_else(|poison| poison.into_inner());
+            let Some(history) = history.as_mut() else {
+                return Ok(());
+            };
+            history.add(&prompt, &answer);
+            history.save()
+        })
+        .await;
+        if let Ok(Err(err)) = saved {
+            eprintln!("bitty-coordinator: the answers to guess from were not saved: {err}");
         }
     }
 

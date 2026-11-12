@@ -196,6 +196,13 @@ plans that machine again with three quarters of what it was given. When the
 engine dies a second time the size is not the reason, and the machine gets no
 layers until it comes back with another build.
 
+The leader guesses tokens from text it has already seen, the request and the
+answers given before, and the ring checks several of them in one pass: on
+answers that copy the prompt or come back a pass gives more than one token.
+The answers are kept in `guesses/` in the data directory of the leader.
+`BITTY_GUESS_CACHE=request` keeps nothing between requests, `off` turns it off.
+See "Guesses from text" in [engine/README.md](../engine/README.md).
+
 `BITTY_ALL_NODES=1` on the leader does the opposite: every machine that can
 hold a layer gets some, near or far, fast or slow. It is for tests, to measure
 a ring of all the machines; a far or slow machine usually makes it slower.

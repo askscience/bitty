@@ -216,6 +216,38 @@ by one, and where two tokens are that close the choice can fall on the other.
 `engine/spec_check.py` checks that every token chosen this way is within 0.5 of
 the best one when the model reads the same text token by token.
 
+### Guesses from text
+
+The leader also guesses with no model at all, from text it has already seen, and
+it does so by default. Before every pass that carries one certain token it looks
+for the last three tokens of the text (then the last two) earlier in the same
+request, the prompt and what was written so far, and sends what followed them
+there as guesses. If the request has nothing, it looks in the answers the ring
+gave before: the last three tokens are looked up in an index of them, and the
+continuation most of them share is sent. The answers are kept as token ids in
+`guesses/` in the data directory of the leader, about 4 MB for a million tokens
+(`BITTY_GUESS_HISTORY_TOKENS` sets the limit, the oldest half goes first), one
+file per model file and vocabulary size.
+
+The guesses go through the same check as the ones of the draft model, which is
+asked only when the text has none. How many go in a pass follows how often they
+were right in the request: all the engines can take back while at least half of
+them were right, half of that while a quarter were, else one. A pass with no
+match is a plain pass.
+
+It pays on answers that copy the prompt (quotes, summaries, corrections, code)
+and on answers that come back (fixed phrases, formats, the same question asked
+again); on new text it finds little and costs nothing. The text can differ in
+the same rare way as with the draft model.
+
+`BITTY_GUESS_CACHE=request` on the leader keeps nothing between requests,
+`BITTY_GUESS_CACHE=off` turns this off; `--no-draft` turns off every guess for
+one request. Kept answers can be proposed to another person who asks something
+close: a guess is only sent on when it is the token the model chooses anyway,
+but it does reach the workers. `BITTY_TIMING=1` reports how many guessed tokens
+were kept and how many of them came from text; `BITTY_TIMING=2` names the source
+on every pass.
+
 ### The pipeline
 
 `--pipeline` (or `BITTY_PIPELINE=1` on the leader) uses the draft model the

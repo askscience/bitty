@@ -1,6 +1,7 @@
 pub mod draft;
 pub mod executor;
 pub mod gpu;
+pub mod guess_cache;
 pub mod lifecycle;
 pub mod sampling;
 pub mod stage;
@@ -16,6 +17,9 @@ pub use executor::{
 pub use gpu::{
     find_gpu_engine, gpu_lock, gpu_mode, layers_that_fit, probe_gpu_engine, speedup_with_share,
     GpuDevice, GpuEngine, GpuFit, GpuMode,
+};
+pub use guess_cache::{
+    guess_cache_mode, guess_count, history_file_name, lookup_in_text, GuessCacheMode, GuessHistory,
 };
 pub use lifecycle::{
     BatchPolicy, DecodePipeline, InferencePhase, PrefixCacheKey, RequestLifecycle,

@@ -52,9 +52,11 @@ leader() {
     LEADER=$!
     PIDS+=("$LEADER")
 }
+# Without guesses: a pass of several tokens can change a logit by a few tenths, and the
+# text is compared after the restart of the leader.
 generate() {
     limited 120 "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
-        --prompt "Name three colours." --seed 7 --max-tokens 24 2> "$WORK/client.log"
+        --prompt "Name three colours." --seed 7 --max-tokens 24 --no-draft 2> "$WORK/client.log"
 }
 # the nodes need a moment to load and to find each other: ask until both layer ranges answer
 generate_when_ready() {
@@ -89,6 +91,24 @@ grep -q "^n1: holds" "$WORK/n0.log" || die "the leader did not log what the work
 kept="$(grep -o "[0-9]* of [0-9]* draft tokens kept" "$WORK/n0.log" | tail -n 1)"
 echo "$kept"
 [ "${kept%% *}" -ge 8 ] || die "the workers kept too few draft tokens: $kept"
+
+echo "== guesses from text"
+# the answer copies the prompt, so the request itself has guesses to give; the second time
+# the same answer is also among the earlier ones
+repeat() {
+    limited 120 "$BITTY" generate --node 127.0.0.1:50551 --cluster-token tok --data-dir "$DATA/client" \
+        --prompt "Repeat this sentence exactly, twice: the quick brown fox jumps over the lazy dog." \
+        --temperature 0 --max-tokens 40 2>> "$WORK/client.log"
+}
+copied="$(repeat)" || die "no text with guesses from text"
+echo "$copied"
+again="$(repeat)" || die "no text the second time"
+[ -n "$again" ] || die "empty text the second time"
+from_text="$(grep -o "([0-9]* of [0-9]* taken from text)" "$WORK/n0.log" | tail -n 1)"
+echo "$from_text"
+from_text="${from_text#(}"
+[ "${from_text%% *}" -ge 4 ] || die "too few guesses from text were kept: $from_text"
+[ -n "$(ls "$WORK/n0/guesses" 2> /dev/null)" ] || die "the earlier answers were not saved"
 
 echo "== pipeline"
 # the guess for the next token travels behind every token; the text must stay the same,

@@ -25,3 +25,6 @@ path = "src/bin/tiny_lm.rs"
 [[bin]]
 name = "bitty-client"
 path = "src/bin/client.rs"
+
+[dev-dependencies]
+proptest.workspace = true
