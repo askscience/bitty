@@ -1274,11 +1274,7 @@ async fn register_and_heartbeat(
             token,
         } => {
             let scheduler = RemoteScheduler::Iroh {
-                client: IrohSchedulerClient {
-                    endpoint: endpoint.clone(),
-                    remote: remote.clone(),
-                    token: token.clone(),
-                },
+                client: IrohSchedulerClient::new(endpoint.clone(), remote.clone(), token.clone()),
                 invite: remote.clone(),
             };
             stay_registered(scheduler, config, &profile, worker_stats).await
@@ -1577,6 +1573,8 @@ impl RemoteScheduler {
             )),
         };
         if result.is_err() {
+            // also after no answer in time: the connection may be to a leader that is gone
+            client.forget_connection();
             client.remote = if client.remote.is_empty() {
                 invite.clone()
             } else {
@@ -1848,11 +1846,11 @@ async fn run_generate(config: GenerateConfig) -> Result<(), Box<dyn std::error::
     let node = resolve_cluster_node(config.node.as_str(), config.data_dir.as_deref())?;
     if let Some(target) = iroh_transport::parse_iroh_target(&node) {
         let endpoint = start_iroh_client(target.endpoint_addr.is_empty()).await?;
-        let client = IrohSchedulerClient {
+        let client = IrohSchedulerClient::new(
             endpoint,
-            remote: target.endpoint_addr,
-            token: target.token.unwrap_or_default(),
-        };
+            target.endpoint_addr,
+            target.token.unwrap_or_default(),
+        );
         let response: GenerateResponse = client
             .request(
                 SCHEDULER_GENERATE,
@@ -1991,11 +1989,11 @@ async fn fetch_cluster_status(
     let node = resolve_cluster_node(node.unwrap_or(""), data_dir)?;
     let status = if let Some(target) = iroh_transport::parse_iroh_target(&node) {
         let endpoint = start_iroh_client(target.endpoint_addr.is_empty()).await?;
-        let client = IrohSchedulerClient {
+        let client = IrohSchedulerClient::new(
             endpoint,
-            remote: target.endpoint_addr,
-            token: target.token.unwrap_or_default(),
-        };
+            target.endpoint_addr,
+            target.token.unwrap_or_default(),
+        );
         client
             .request::<_, ClusterStatusResponse>(SCHEDULER_CLUSTER_STATUS, &ClusterStatusRequest {})
             .await?
@@ -2806,14 +2804,41 @@ async fn handle_iroh_request(
         .map_err(|err| format!("leader call from {peer}: {err}").into())
 }
 
+/// A node keeps one connection to its leader and sends each request on a stream of its own.
+/// The requests are answered side by side: a long one does not hold a heartbeat back.
 async fn handle_scheduler_connection(
     connection: iroh::endpoint::Connection,
     remote_id: EndpointId,
     coordinator: NetworkCoordinator,
     cluster_token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT).await?;
+    let peer = remote_id.fmt_short().to_string();
+    // ends when the node closes the connection or goes away
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        let coordinator = coordinator.clone();
+        let cluster_token = cluster_token.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            let answered =
+                answer_scheduler_request(send, recv, remote_id, coordinator, cluster_token).await;
+            if let Err(err) = answered {
+                eprintln!("iroh request failed: leader call from {peer}: {err}");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn answer_scheduler_request(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    remote_id: EndpointId,
+    coordinator: NetworkCoordinator,
+    cluster_token: String,
+) -> Result<(), String> {
+    let frame = iroh_transport::read_frame(&mut recv, DEFAULT_FRAME_LIMIT)
+        .await
+        .map_err(|err| err.to_string())?;
     if !constant_time_eq(frame.token.as_bytes(), cluster_token.as_bytes()) {
         return Err("invalid cluster token".into());
     }
@@ -2822,9 +2847,11 @@ async fn handle_scheduler_connection(
         Ok(response) => response,
         Err(err) => iroh_transport::error_frame(err),
     };
-    iroh_transport::write_frame(&mut send, &response).await?;
-    send.finish()?;
-    // the answer is on its way; how the caller ends the connection is not an error
+    iroh_transport::write_frame(&mut send, &response)
+        .await
+        .map_err(|err| err.to_string())?;
+    send.finish().map_err(|err| err.to_string())?;
+    // the answer is on its way; how the caller ends the stream is not an error
     let _ = send.stopped().await;
     Ok(())
 }
@@ -2979,9 +3006,21 @@ struct IrohSchedulerClient {
     endpoint: Endpoint,
     remote: EndpointAddr,
     token: String,
+    /// Kept between requests: a heartbeat every second on a connection of its own is a
+    /// handshake every second, and the ones that went through a relay were seen to time out.
+    connection: tokio::sync::Mutex<Option<iroh::endpoint::Connection>>,
 }
 
 impl IrohSchedulerClient {
+    fn new(endpoint: Endpoint, remote: EndpointAddr, token: String) -> Self {
+        Self {
+            endpoint,
+            remote,
+            token,
+            connection: Default::default(),
+        }
+    }
+
     async fn request<M, R>(
         &self,
         op: u8,
@@ -2991,15 +3030,54 @@ impl IrohSchedulerClient {
         M: prost::Message,
         R: prost::Message + Default,
     {
-        let response = iroh_transport::request_addr(
-            &self.endpoint,
-            self.remote.clone(),
-            BITTY_SCHEDULER_ALPN,
-            IrohFrame::message(op, self.token.clone(), message),
-            DEFAULT_FRAME_LIMIT,
-        )
-        .await?;
-        response.decode_message(op)
+        let frame = IrohFrame::message(op, self.token.clone(), message);
+        // a connection that died while idle fails here, before anything was sent, so
+        // connecting again cannot run a request twice
+        let kept = self.connection.lock().await.clone();
+        let open = match &kept {
+            Some(connection) => connection.open_bi().await.ok(),
+            None => None,
+        };
+        let (send, recv) = match open {
+            Some(streams) => streams,
+            None => {
+                let connection = self
+                    .endpoint
+                    .connect(self.remote.clone(), BITTY_SCHEDULER_ALPN)
+                    .await?;
+                let streams = connection.open_bi().await?;
+                *self.connection.lock().await = Some(connection);
+                streams
+            }
+        };
+        match iroh_transport::request_on_stream(send, recv, frame, DEFAULT_FRAME_LIMIT).await {
+            Ok(response) => response.decode_message(op),
+            // the leader answered: the connection is good
+            Err(err @ iroh_transport::IrohTransportError::Remote(_)) => Err(err),
+            Err(err) => {
+                // the next request starts with a new connection
+                if let Some(connection) = self.connection.lock().await.take() {
+                    connection.close(0u32.into(), b"failed");
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+impl IrohSchedulerClient {
+    /// The next request opens a new connection.
+    fn forget_connection(&mut self) {
+        // said aloud, so the leader does not keep the connection until it times out
+        if let Some(connection) = self.connection.get_mut().take() {
+            connection.close(0u32.into(), b"done");
+        }
+    }
+}
+
+impl Drop for IrohSchedulerClient {
+    fn drop(&mut self) {
+        self.forget_connection();
     }
 }
 

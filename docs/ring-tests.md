@@ -90,5 +90,31 @@ What it says:
 - The office PC fetched 36..40 from the model URL although it held 25..40.
   Corrected since: a stage is cut out of a wider one that is on the disk.
 
-Not measured yet: the Windows PC in the ring, a cut that gives the office PC
-more layers, the 0.8B runs.
+## A machine behind a relay in the ring (12 November 2026)
+
+The kept plan was changed by hand to leader 0..34, the new Windows PC 34..36
+(8 GB, a processor without AVX2, reached only through the European relay),
+office PC 36..40. Same prompt and seed as above, three runs, no draft.
+
+| ring | ms per token | leader | Windows 34..36 | office PC | outside the stages |
+| --- | --- | --- | --- | --- | --- |
+| two machines, direct | 362 to 386 | 263 | none | 91 to 118 | 6 |
+| three machines, one behind the relay | 575 | 243 | 14 to 23 | 133 | 180 |
+
+What it says:
+
+- The text is the same, byte for byte, with the Windows engine in the ring.
+- Two layers on that PC take 14 to 23 ms: its processor is not the problem.
+- The relay is: the leader sees a round trip of 160 to 190 ms to that PC, and
+  the two hand-overs through the relay put about 180 ms on every token. A far
+  machine pays only when the model does not fit without it, which is what the
+  planner assumes.
+- The first run after the layers load is always slow (480 to 780 ms per token)
+  and is left out of the numbers.
+
+The plain run of the day before measured 488 ms on the older build and 375 ms
+on the new one. The stages took the same time in both (leader 262 to 271,
+office PC 107 to 129): the 88 ms outside the stages became 6. That came with
+the build that runs chain steps in lines on the workers.
+
+Not measured yet: a cut that gives the office PC more layers, the 0.8B runs.

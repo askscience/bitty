@@ -199,6 +199,14 @@ impl StageExecutor {
         let mut executor = Self::new(metadata);
         executor.model_path = Some(path);
         executor.engine_path = find_stage_engine();
+        // said once, so the log of a node tells which build of the engine its processor got
+        if let Some(name) = executor
+            .engine_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+        {
+            eprintln!("bitty: engine {}", name.to_string_lossy());
+        }
         Ok(executor)
     }
 

@@ -117,6 +117,10 @@ heartbeat. The shortest of the last eight round trips counts.
 `BITTY_NETWORK_RTT_MS=120` in the `env` file of a node gives the number by
 hand and turns the measuring off.
 
+A node keeps one connection to its leader and sends every heartbeat on it, so
+the number is one round trip and not a handshake. The log of a node says
+which build of the engine its processor got (`bitty: engine bitty-stage-avx`).
+
 The number is the trip to the leader, not the trip between two nodes. Two far
 nodes that sit beside each other are still counted as two far trips.
 

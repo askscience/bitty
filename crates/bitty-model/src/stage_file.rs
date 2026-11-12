@@ -59,7 +59,7 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
     while !existing.exists() {
         existing = existing.parent()?;
     }
-    let existing = existing.canonicalize().ok()?;
+    let existing = without_long_path_mark(existing.canonicalize().ok()?);
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .list()
@@ -67,6 +67,15 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
         .filter(|disk| existing.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
         .map(|disk| disk.available_space())
+}
+
+/// Windows gives a full path as `\\?\C:\...`, while its disks are named `C:\`: without the
+/// mark in front the path is found on its disk.
+fn without_long_path_mark(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
+        _ => path,
+    }
 }
 
 /// The bytes a download into the folder of `path` may use.
@@ -897,5 +906,25 @@ mod resume_tests {
         let source = HttpSource::new(flaky_server(data.clone(), 4_000));
         let bytes = source.read_range(100, 9_000).unwrap();
         assert_eq!(bytes, &data[100..9_100]);
+    }
+}
+
+#[cfg(test)]
+mod long_path_tests {
+    use super::without_long_path_mark;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_windows_full_path_loses_its_mark_and_others_stay() {
+        let plain = |text: &str| without_long_path_mark(PathBuf::from(text));
+        assert_eq!(
+            plain(r"\\?\C:\Users\a\.bitty"),
+            PathBuf::from(r"C:\Users\a\.bitty")
+        );
+        assert_eq!(
+            plain(r"\\?\UNC\server\share"),
+            PathBuf::from(r"\\?\UNC\server\share")
+        );
+        assert_eq!(plain("/home/a/.bitty"), PathBuf::from("/home/a/.bitty"));
     }
 }
