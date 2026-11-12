@@ -64,9 +64,12 @@ impl StageOptions {
                 .and_then(|value| value.trim().parse::<u32>().ok())
         };
         let mut options = Self::default();
-        if let Some(threads) = read("BITTY_STAGE_THREADS") {
-            options.threads = threads;
-        }
+        // One thread for each core: the engine alone picks 4 on any machine, which left half
+        // of an 8-core leader idle (13% slower in the ring). The second threads of the cores
+        // are not counted, they make it slower.
+        options.threads = read("BITTY_STAGE_THREADS")
+            .or_else(bitty_model::physical_cores)
+            .unwrap_or(0);
         if let Some(gpu_layers) = read("BITTY_GPU_LAYERS") {
             options.gpu_layers = gpu_layers;
         }

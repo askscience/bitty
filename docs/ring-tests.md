@@ -117,4 +117,25 @@ on the new one. The stages took the same time in both (leader 262 to 271,
 office PC 107 to 129): the 88 ms outside the stages became 6. That came with
 the build that runs chain steps in lines on the workers.
 
+### Threads of the engine
+
+The engine on the leader ran with four threads: bitty passed no thread count
+and llama.cpp picks four by itself. Same ring of two machines, same prompt,
+`BITTY_STAGE_THREADS` on the leader (eight cores, sixteen threads):
+
+| threads | ms per token | leader | office PC |
+| --- | --- | --- | --- |
+| 4 (the old default) | 362 to 386 | 263 | 91 to 118 |
+| 6 | 336 to 342 | | |
+| 8 | 316 to 329 | 225 to 228 | 83 to 99 |
+
+About 13% for free, so bitty now gives the engine one thread per physical
+core when the variable is not set.
+
+With eight threads on the stage the pipeline does not win any more: 333 to
+348 ms against 316 to 329 plain. The passes of the leader cost 35 to 40 ms
+more in pipeline mode (265 against 227) even with the draft on one thread,
+and the two machines overlap for about 30 ms where the design says 70. The
+cause is not known yet.
+
 Not measured yet: a cut that gives the office PC more layers, the 0.8B runs.

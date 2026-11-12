@@ -105,8 +105,8 @@ node:
 
 - `BITTY_GPU_LAYERS=N`: keep N layers of the node's range on the GPU, counted
   from the top of the range. More than the range holds means all of it.
-- `BITTY_STAGE_THREADS=N`: CPU threads of the engine (llama.cpp picks 4 when
-  unset).
+- `BITTY_STAGE_THREADS=N`: CPU threads of the engine. Unset, bitty gives it
+  one thread per physical core (llama.cpp alone would pick 4).
 - `BITTY_GPU_OUTPUT=1`: when the node holds the final stage and no block was
   asked on the GPU, put the output layer alone there. It is the most expensive
   single step of the model (47 ms against 64 for the last five-block stage of
@@ -227,6 +227,11 @@ a token is noticed only by a timeout, 10 minutes unless
 token, the part of it spent in every worker, and which of the two ways was
 used. From worker to worker the workers count their own time; through the
 coordinator it is the coordinator's wait, so it includes the network.
+
+`BITTY_TIMING=2` adds one line for every pass: whether it rode a guess of the
+pipeline or was sent, its whole time, the time of the draft model, the wait
+for the answer, the time of each worker, what became of the guess sent behind
+it and how long taking a wrong one back took.
 
 See `docs/split-on-one-machine.md` for the measurements behind all this.
 `engine/stage_ab.py` compares engine settings on one stage.

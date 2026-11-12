@@ -13,8 +13,8 @@ pub use gguf::{
 pub use metadata::{MetadataError, ModelMetadata, ShardPlan, TensorMetadata};
 pub use shard::{MappedWeightShard, ShardError, WeightShard, WeightShardManifest};
 pub use stage_file::{
-    free_disk_bytes, stage_holds_tensor, usable_disk_bytes, write_stage_file, ByteSource,
-    CancelCheck, FileSource, HttpSource, StageFileError, StageFileReport, STAGE_END_KEY,
-    STAGE_START_KEY,
+    free_disk_bytes, physical_cores, stage_holds_tensor, usable_disk_bytes, write_stage_file,
+    ByteSource, CancelCheck, FileSource, HttpSource, StageFileError, StageFileReport,
+    STAGE_END_KEY, STAGE_START_KEY,
 };
 pub use tensor::{LowBitTensor, TensorShape};

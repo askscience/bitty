@@ -1063,6 +1063,9 @@ impl NetworkCoordinator {
             .await;
         // the step of the guess that is on its way through the workers
         let mut flying: Option<u32> = None;
+        // BITTY_TIMING=2: one line for every pass
+        let trace = std::env::var("BITTY_TIMING").is_ok_and(|value| value.trim() == "2");
+        let mut trace_lines = Vec::new();
         // the whole text: the prompt and every token chosen so far
         let mut text_tokens = std::mem::take(&mut current_input);
         // how many of them the workers hold
@@ -1122,9 +1125,13 @@ impl NetworkCoordinator {
 
             // the token this pass is expected to choose, already sent on as a guess
             let mut ahead = None;
+            let mut rode = false;
+            let (mut draft_micros, mut wait_micros) = (0u64, 0u64);
+            let mut pass_hops = Vec::new();
             if let Some(endpoints) = &route {
                 // a guess that was right is the pass of its token: it went out a pass ago
                 let riding = flying.take().is_some();
+                rode = riding;
                 let result = async {
                     let (first, last) = Self::chain_ends(&mut worker_clients)?;
                     if !riding {
@@ -1138,6 +1145,7 @@ impl NetworkCoordinator {
                     if let Some(model) = model {
                         let (model, codec) = (model.clone(), codec.clone());
                         let (request, text) = (request_id.clone(), text_tokens.clone());
+                        let draft_started = Instant::now();
                         let proposed = tokio::task::spawn_blocking(move || {
                             let mut model =
                                 model.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1148,6 +1156,7 @@ impl NetworkCoordinator {
                             })
                         })
                         .await;
+                        draft_micros = draft_started.elapsed().as_micros() as u64;
                         match proposed {
                             Ok(Ok(Some(token))) => {
                                 let mut guess = ActivationTensor::new(
@@ -1174,11 +1183,17 @@ impl NetworkCoordinator {
                             ),
                         }
                     }
-                    Self::chain_wait(last, &run_id, step).await
+                    let wait_started = Instant::now();
+                    let result = Self::chain_wait(last, &run_id, step).await;
+                    wait_micros = wait_started.elapsed().as_micros() as u64;
+                    result
                 }
                 .await;
                 match result {
                     Ok((output, micros)) => {
+                        if trace {
+                            pass_hops = micros.clone();
+                        }
                         if step > 0 {
                             for (total, micros) in hop_micros.iter_mut().zip(micros) {
                                 *total += micros;
@@ -1343,22 +1358,46 @@ impl NetworkCoordinator {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .settle(&request_id, accepted);
             }
+            let pass_micros = started.elapsed().as_micros() as u64;
+            let pass_step = step;
             step += 1;
-            if done {
-                break;
-            }
-            if let Some(token) = ahead {
+            let mut guess_fate = "no guess";
+            let mut take_back_micros = 0u64;
+            if let (Some(token), false) = (ahead, done) {
                 guessed += 1;
                 if text_tokens.last() == Some(&token) {
                     // the next pass is the guess: it has the number this one is given now
                     kept += 1;
+                    guess_fate = "guess right";
                 } else {
                     if let Some(step) = flying.take() {
+                        let take_back_started = Instant::now();
                         Self::chain_take_back(&mut worker_clients, &run_id, step).await;
+                        take_back_micros = take_back_started.elapsed().as_micros() as u64;
                     }
                     rewind = true;
                     step += 1;
+                    guess_fate = "guess wrong";
                 }
+            }
+            if trace {
+                let ms = |micros: u64| micros as f64 / 1000.0;
+                let hops: Vec<String> = pass_hops
+                    .iter()
+                    .map(|micros| format!("{:.0}", ms(*micros)))
+                    .collect();
+                trace_lines.push(format!(
+                    "pass {pass_step}: {} {:.0} ms, draft {:.0}, wait for the answer {:.0}, workers [{}], {guess_fate}, take back {:.0}",
+                    if rode { "rode a guess" } else { "sent" },
+                    ms(pass_micros),
+                    ms(draft_micros),
+                    ms(wait_micros),
+                    hops.join(" "),
+                    ms(take_back_micros),
+                ));
+            }
+            if done {
+                break;
             }
         }
         if let Some(step) = flying {
@@ -1375,6 +1414,9 @@ impl NetworkCoordinator {
             .await;
         }
 
+        for line in &trace_lines {
+            println!("{line}");
+        }
         if std::env::var_os("BITTY_TIMING").is_some() && outputs.len() > first_pass_tokens {
             let steps = (outputs.len() - first_pass_tokens) as f64;
             let hops: Vec<String> = assignments

@@ -69,6 +69,12 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
         .map(|disk| disk.available_space())
 }
 
+/// The cores of this machine, without counting the second thread of each. `None` when the
+/// system does not say.
+pub fn physical_cores() -> Option<u32> {
+    sysinfo::System::physical_core_count().map(|cores| cores as u32)
+}
+
 /// Windows gives a full path as `\\?\C:\...`, while its disks are named `C:\`: without the
 /// mark in front the path is found on its disk.
 fn without_long_path_mark(path: PathBuf) -> PathBuf {

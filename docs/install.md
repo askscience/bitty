@@ -87,6 +87,10 @@ BITTY_GPU_LAYERS=12
 
 A variable set in the environment wins over the file.
 
+Without `BITTY_STAGE_THREADS` the engine gets one thread per physical core of
+the machine. On the eight-core leader that is 316-329 ms per token against
+362-386 with the four threads llama.cpp picks by itself.
+
 ## A network of machines
 
 ```bash
