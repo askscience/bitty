@@ -196,6 +196,13 @@ plans that machine again with three quarters of what it was given. When the
 engine dies a second time the size is not the reason, and the machine gets no
 layers until it comes back with another build.
 
+`BITTY_ALL_NODES=1` on the leader does the opposite: every machine that can
+hold a layer gets some, near or far, fast or slow. It is for tests, to measure
+a ring of all the machines; a far or slow machine usually makes it slower.
+
+Without it a machine much slower than the fastest (under 15%) stays out, but
+only while the others can hold the model without it.
+
 `BITTY_LEAVE_OUT=bitty-1234abcd,bitty-5678ef01` on the leader gives no layers
 to those machines. They stay connected. It is for tests, to see what a
 machine adds, and for a machine that is known not to work.

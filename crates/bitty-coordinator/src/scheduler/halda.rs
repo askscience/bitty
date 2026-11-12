@@ -67,11 +67,21 @@ impl Halda {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.node_id.0.cmp(&b.node_id.0))
         });
-        if ranked.len() > 1 {
+        let all_nodes = all_nodes_wanted();
+        if ranked.len() > 1 && !all_nodes {
             let strongest = ranked[0].effective_compute_score().max(0.001);
-            ranked.retain(|node| {
-                node.gpu_tflops > 0.0 || node.effective_compute_score() >= strongest * 0.15
-            });
+            let strong = ranked
+                .iter()
+                .filter(|node| {
+                    node.gpu_tflops > 0.0 || node.effective_compute_score() >= strongest * 0.15
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            // A slow node is left out only while the others can hold the model without it:
+            // a slow ring is better than none.
+            if self.lay_out(&strong, layers).is_ok() {
+                ranked = strong;
+            }
         }
         if ranked.is_empty() {
             ranked = nodes.to_vec();
@@ -112,6 +122,9 @@ impl Halda {
             let band = |node: &HardwareProfile| (node.network_rtt_ms / FAR_BAND_MS) as u64;
             band(a).cmp(&band(b))
         });
+        if all_nodes {
+            far.clear();
+        }
         let mut lens = None;
         for count in 0..far.len() {
             let allowed = &far[..count];
@@ -439,6 +452,13 @@ fn available_memory_bytes(node: &HardwareProfile, reserve_fraction: f64) -> u64 
     node.hard_memory_bytes(reserve_fraction)
 }
 
+/// `BITTY_ALL_NODES=1` on the leader gives layers to every machine that can hold one, near or
+/// far, fast or slow. It is for tests: a far or slow machine usually makes the ring slower.
+fn all_nodes_wanted() -> bool {
+    std::env::var("BITTY_ALL_NODES")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
 fn estimate_latency_ms(
     node: &HardwareProfile,
     start: u32,
@@ -559,6 +579,21 @@ mod tests {
             .assign(&nodes, &big_layers())
             .unwrap();
         assert_eq!(holders(&plan), ["node-0", "node-1"]);
+    }
+
+    #[test]
+    fn a_slow_node_is_kept_when_the_model_needs_its_memory() {
+        // the leader can hold 14 layers, the fast far node about 20: the slow ones must help
+        let mut leader = linked(cpu_node(0, 32, 28), 0.0);
+        leader.max_layers = 14;
+        leader.cpu_tflops = 4.0;
+        let mut slow = linked(cpu_node(1, 8, 6), 1.5);
+        slow.cpu_tflops = 0.1;
+        let nodes = vec![leader, slow, linked(cpu_node(2, 16, 14), 70.0)];
+        let plan = Halda::new(SchedulerConfig::default())
+            .assign(&nodes, &big_layers())
+            .unwrap();
+        assert_eq!(holders(&plan), ["node-0", "node-1", "node-2"]);
     }
 
     #[test]
