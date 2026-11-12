@@ -73,7 +73,7 @@ update_binaries() {
         latest="$(tr -d '[:space:]' < "$work/VERSION")"
         [ -n "$latest" ] || fail "the release has an empty VERSION file"
         if [ "$latest" = "$current" ] && [ -x "$PREFIX/bin/bitty" ] && [ -x "$PREFIX/bin/bitty-stage" ] \
-            && [ -x "$PREFIX/bin/bitty-stage-sse" ]; then
+            && [ -x "$PREFIX/bin/bitty-stage-sse" ] && [ -x "$PREFIX/bin/bitty-stage-vulkan-sse" ]; then
             return 1
         fi
         archive="$work/$name.tar.gz"
@@ -97,9 +97,10 @@ update_binaries() {
     # ever sees half a binary
     local pair source target
     local pairs=("bitty:bin/bitty" "bitty-stage:bin/bitty-stage" "install.sh:bin/bitty-update" "VERSION:VERSION")
-    # the engines for older processors: bitty picks the one its machine can run
+    # the engines for older processors and for graphics cards: bitty picks the one its
+    # machine can run
     local variant
-    for variant in avx sse; do
+    for variant in avx sse vulkan vulkan-avx vulkan-sse; do
         if [ -f "$work/new/$name/bitty-stage-$variant" ]; then
             pairs+=("bitty-stage-$variant:bin/bitty-stage-$variant")
         fi

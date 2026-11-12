@@ -112,8 +112,10 @@ function Update-Binaries {
             $latest = "$latest".Trim()
             if (-not $latest) { throw 'the release has an empty VERSION file' }
             # an installation made by an older updater lacks the engines for older processors
+            # or the ones for graphics cards
             $complete = (Test-Path $Bitty) -and (Test-Path (Join-Path $BinDir 'bitty-stage.exe')) -and
-                (Test-Path (Join-Path $BinDir 'bitty-stage-sse.exe'))
+                (Test-Path (Join-Path $BinDir 'bitty-stage-sse.exe')) -and
+                (Test-Path (Join-Path $BinDir 'bitty-stage-vulkan-sse.exe'))
             if ($latest -eq (Get-InstalledVersion) -and $complete) { return $false }
 
             $archive = Join-Path $work "$Name.zip"
@@ -140,8 +142,9 @@ function Update-Binaries {
         New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
         Install-File (Join-Path $new 'bitty.exe') $Bitty
         Install-File (Join-Path $new 'bitty-stage.exe') (Join-Path $BinDir 'bitty-stage.exe')
-        # the engines for older processors: bitty picks the one its machine can run
-        foreach ($variant in 'bitty-stage-avx.exe', 'bitty-stage-sse.exe') {
+        # the engines for older processors and for graphics cards: bitty picks the one its
+        # machine can run
+        foreach ($variant in 'bitty-stage-avx.exe', 'bitty-stage-sse.exe', 'bitty-stage-vulkan.exe', 'bitty-stage-vulkan-avx.exe', 'bitty-stage-vulkan-sse.exe') {
             if (Test-Path (Join-Path $new $variant)) { Install-File (Join-Path $new $variant) (Join-Path $BinDir $variant) }
         }
         Copy-Item -Path (Join-Path $new 'install.ps1') -Destination $Updater -Force

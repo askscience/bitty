@@ -631,13 +631,22 @@ impl Drop for StageProcess {
 /// A release carries the engine three times, and the one this processor can run is taken:
 /// `bitty-stage` needs AVX2, `bitty-stage-avx` only AVX, `bitty-stage-sse` neither. Starting the
 /// wrong one ends in an illegal instruction the moment the first layer is computed.
+///
+/// This is the engine that computes on the processor. The one for graphics cards is found by
+/// [`crate::gpu::find_gpu_engine`].
 pub fn find_stage_engine() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BITTY_STAGE_BIN") {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    // "bitty-stage.exe" on Windows; the plain name is the fallback of every variant
-    let names: Vec<String> = [engine_variant(cpu_level()), ""]
+    // the plain name is the fallback of every variant
+    find_engine_variant(&[engine_variant(cpu_level()), ""])
+}
+
+/// The first of `bitty-stage<variant>` ("bitty-stage<variant>.exe" on Windows) that exists
+/// next to this executable or on `PATH`, in the order of `variants`.
+pub(crate) fn find_engine_variant(variants: &[&str]) -> Option<PathBuf> {
+    let names: Vec<String> = variants
         .iter()
         .map(|variant| format!("bitty-stage{variant}{}", std::env::consts::EXE_SUFFIX))
         .collect();

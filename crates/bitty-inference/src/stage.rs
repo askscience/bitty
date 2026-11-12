@@ -6,6 +6,10 @@
 //! engine binary every compute call fails with [`ExecutorError::Failed`] instead of returning
 //! made-up activations.
 
+use crate::gpu::{
+    find_gpu_engine, gpu_is_faster, gpu_lock, gpu_mode, layers_that_fit, probe_gpu_engine,
+    time_engine, GpuMode,
+};
 use crate::stage_process::{
     find_stage_engine, StageOutput, StageProcess, StageProcessConfig, StageProcessError,
 };
@@ -49,14 +53,19 @@ pub struct StageOptions {
     /// Keeps the output layer on the GPU even when no block of the range is there. It is one
     /// large matrix, about a tenth of the work of a token, and needs little video memory.
     pub gpu_output: bool,
+    /// Lets bitty choose: when the engine for graphics cards finds a card, as many layers as
+    /// fit in its free memory go there, and `gpu_layers` and `gpu_output` are not read.
+    pub gpu_auto: bool,
     /// Tokens of its last request a stage can take back: the longest guess of a draft model
     /// that can be checked in one pass. Costs memory (about 25 MB each for Qwen3.5-35B).
     pub rollback: u32,
 }
 
 impl StageOptions {
-    /// Defaults overridden by `BITTY_STAGE_THREADS`, `BITTY_GPU_LAYERS`, `BITTY_GPU_OUTPUT`
-    /// and `BITTY_STAGE_ROLLBACK`.
+    /// Defaults overridden by `BITTY_STAGE_THREADS`, `BITTY_GPU`, `BITTY_GPU_LAYERS`,
+    /// `BITTY_GPU_OUTPUT` and `BITTY_STAGE_ROLLBACK`. Without `BITTY_GPU_LAYERS` the layers
+    /// for the graphics card are chosen by bitty; `BITTY_GPU=off` keeps everything on the
+    /// processor whatever the others say.
     pub fn from_env() -> Self {
         let read = |name: &str| {
             std::env::var(name)
@@ -70,11 +79,14 @@ impl StageOptions {
         options.threads = read("BITTY_STAGE_THREADS")
             .or_else(bitty_model::physical_cores)
             .unwrap_or(0);
-        if let Some(gpu_layers) = read("BITTY_GPU_LAYERS") {
-            options.gpu_layers = gpu_layers;
-        }
-        if let Some(gpu_output) = read("BITTY_GPU_OUTPUT") {
-            options.gpu_output = gpu_output > 0;
+        if gpu_mode() != GpuMode::Off {
+            match read("BITTY_GPU_LAYERS") {
+                Some(gpu_layers) => options.gpu_layers = gpu_layers,
+                None => options.gpu_auto = true,
+            }
+            if let Some(gpu_output) = read("BITTY_GPU_OUTPUT") {
+                options.gpu_output = gpu_output > 0;
+            }
         }
         if let Some(rollback) = read("BITTY_STAGE_ROLLBACK") {
             options.rollback = rollback;
@@ -108,6 +120,7 @@ impl Default for StageOptions {
             sessions: 4,
             gpu_layers: 0,
             gpu_output: false,
+            gpu_auto: false,
             rollback: DEFAULT_ROLLBACK,
         }
     }
@@ -144,6 +157,8 @@ pub struct StageExecutor {
     metadata: Arc<ModelMetadata>,
     model_path: Option<PathBuf>,
     engine_path: Option<PathBuf>,
+    /// The engine was named by the caller: it is never exchanged for the one for graphics cards.
+    engine_fixed: bool,
     options: StageOptions,
     stage_source: Option<StageSource>,
     /// The range asked for last. A fetch for any other range is stale and stops, so a node
@@ -179,6 +194,7 @@ impl StageExecutor {
             metadata: Arc::new(metadata),
             model_path: None,
             engine_path: None,
+            engine_fixed: false,
             options: StageOptions::from_env(),
             stage_source: None,
             wanted: Arc::default(),
@@ -215,6 +231,7 @@ impl StageExecutor {
 
     pub fn with_engine(mut self, engine_path: impl Into<PathBuf>) -> Self {
         self.engine_path = Some(engine_path.into());
+        self.engine_fixed = true;
         self
     }
 
@@ -311,30 +328,192 @@ impl StageExecutor {
             }
             None => model,
         };
-        let process = StageProcess::spawn(&StageProcessConfig {
-            engine: engine_path.clone(),
-            model: model.clone(),
-            start_layer: range.start_layer,
-            end_layer_exclusive: range.end_layer_exclusive,
-            threads: self.options.threads,
-            gpu_layers: engine_gpu_layers(
-                self.options.gpu_layers,
-                self.options.gpu_output,
-                range.start_layer,
-                range.end_layer_exclusive,
-                self.metadata.layer_count,
-            ),
-            context: self.options.context,
-            sessions: self.options.sessions,
-            top_logits: crate::sampling::top_logits_limit() as u32,
-            rollback: self.options.rollback,
-        })
-        .map_err(|err| ExecutorError::Failed(err.to_string()))?;
+        let process = self
+            .start_engine(engine_path, model, range)
+            .map_err(|err| ExecutorError::Failed(err.to_string()))?;
         *self.abort.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(process.abort_handle());
         engine.process = Some(process);
         Ok(())
     }
+
+    /// Starts the engine for `range` on `model`, the file it opens: on a graphics card when
+    /// that was asked for, or when bitty may choose and the card proves faster than the
+    /// processor.
+    fn start_engine(
+        &self,
+        cpu_engine: &Path,
+        model: &Path,
+        range: &AssignedLayerRange,
+    ) -> Result<StageProcess, StageProcessError> {
+        let (start, end) = (range.start_layer, range.end_layer_exclusive);
+        let layer_count = self.metadata.layer_count;
+        let spawn = |engine: &Path, gpu_layers: u32| {
+            StageProcess::spawn(&StageProcessConfig {
+                engine: engine.to_path_buf(),
+                model: model.to_path_buf(),
+                start_layer: start,
+                end_layer_exclusive: end,
+                threads: self.options.threads,
+                gpu_layers,
+                context: self.options.context,
+                sessions: self.options.sessions,
+                top_logits: crate::sampling::top_logits_limit() as u32,
+                rollback: self.options.rollback,
+            })
+        };
+        if !self.options.gpu_auto {
+            let layers = engine_gpu_layers(
+                self.options.gpu_layers,
+                self.options.gpu_output,
+                start,
+                end,
+                layer_count,
+            );
+            // Asked for by hand. Without an engine for cards that works here the usual one
+            // gets the count as before: it may be a build of one's own.
+            let gpu_engine = (layers > 0 && !self.engine_fixed)
+                .then(probe_gpu_engine)
+                .flatten()
+                .map(|gpu| gpu.path);
+            return spawn(gpu_engine.as_deref().unwrap_or(cpu_engine), layers);
+        }
+        if self.engine_fixed || find_gpu_engine().is_none() {
+            return spawn(cpu_engine, 0);
+        }
+        // a verdict of this process for the same range: the card does not change under it
+        let verdict_key = (start, end);
+        let known = GPU_VERDICTS
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .get(&verdict_key)
+            .copied();
+        if known == Some(false) {
+            return spawn(cpu_engine, 0);
+        }
+        // from reading the free memory to the end of the load, one node of a machine at a time
+        let _lock = gpu_lock();
+        let Some((gpu_engine, candidates)) = self.gpu_candidates(model, range) else {
+            return spawn(cpu_engine, 0);
+        };
+        let check = known.is_none()
+            && std::env::var("BITTY_GPU_CHECK").map_or(true, |value| value.trim() != "0");
+        // The processor first: its time is the one to beat. Its engine goes away before the
+        // card is loaded, a machine has no room for the layers twice.
+        let cpu_time = if check {
+            let mut process = spawn(cpu_engine, 0)?;
+            time_engine(&mut process).ok()
+        } else {
+            None
+        };
+        for (layers, what) in candidates {
+            let loaded = spawn(&gpu_engine, layers).and_then(|mut process| {
+                let time = if check {
+                    Some(time_engine(&mut process)?)
+                } else {
+                    None
+                };
+                Ok((process, time))
+            });
+            let (process, gpu_time) = match loaded {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    // the free memory may have gone to another program, or the driver fails
+                    eprintln!("bitty: {what} could not be loaded on the graphics card ({err})");
+                    continue;
+                }
+            };
+            let faster = match (cpu_time, gpu_time) {
+                (Some(cpu), Some(gpu)) => {
+                    let faster = gpu_is_faster(cpu, gpu);
+                    eprintln!(
+                        "bitty: {what} on the graphics card: {:.1} ms a token, {:.1} on the processor alone: {}",
+                        gpu.as_secs_f64() * 1000.0,
+                        cpu.as_secs_f64() * 1000.0,
+                        if faster { "the card is used" } else { "the card is not used" }
+                    );
+                    faster
+                }
+                _ => {
+                    eprintln!("bitty: {what} on the graphics card");
+                    true
+                }
+            };
+            GPU_VERDICTS
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .insert(verdict_key, faster);
+            if faster {
+                return Ok(process);
+            }
+            drop(process);
+            return spawn(cpu_engine, 0);
+        }
+        eprintln!("bitty: layers {start}..{end} are computed on the processor");
+        spawn(cpu_engine, 0)
+    }
+
+    /// What of `range` to try on a graphics card: the engine for it, and llama.cpp's count of
+    /// layers for each attempt with a description for the log, the largest first. `None`
+    /// when there is no card to use or nothing fits. `model` is the file the engine will open.
+    fn gpu_candidates(
+        &self,
+        model: &Path,
+        range: &AssignedLayerRange,
+    ) -> Option<(PathBuf, Vec<(u32, String)>)> {
+        let (start, end) = (range.start_layer, range.end_layer_exclusive);
+        let layer_count = self.metadata.layer_count;
+        let gpu = probe_gpu_engine().filter(|gpu| gpu.usable(gpu_mode()))?;
+        // A node that fetches its stages was opened on the vocabulary file, which names no
+        // weights: the sizes are in the stage file itself.
+        let stage_file;
+        let tensors = if self.model_path.as_deref() == Some(model) {
+            &self.metadata.tensors
+        } else {
+            stage_file = ModelMetadata::from_gguf_path(model)
+                .map(|metadata| metadata.tensors)
+                .unwrap_or_default();
+            &stage_file
+        };
+        // The sizes of the weights are known, what the engine needs on top of them is not:
+        // if the load fails with all that should fit, half of it is tried.
+        let budget = gpu.weight_budget_bytes();
+        let mut candidates: Vec<(u32, String)> = Vec::new();
+        for budget in [budget, budget / 2] {
+            let fit = layers_that_fit(tensors, start, end, layer_count, budget);
+            let layers = engine_gpu_layers(fit.layers, fit.output, start, end, layer_count);
+            if layers == 0 || candidates.iter().any(|(tried, _)| *tried == layers) {
+                continue;
+            }
+            candidates.push((
+                layers,
+                format!(
+                    "{} of the {} layers {start}..{end}{} ({} MB of weights)",
+                    fit.layers,
+                    end.saturating_sub(start),
+                    if fit.output {
+                        " and the output layer"
+                    } else {
+                        ""
+                    },
+                    fit.bytes / 1024 / 1024
+                ),
+            ));
+        }
+        if candidates.is_empty() {
+            eprintln!(
+                "bitty: graphics card found ({}), but no layer of {start}..{end} fits in its free memory",
+                gpu.summary()
+            );
+            return None;
+        }
+        eprintln!("bitty: graphics card: {}", gpu.summary());
+        Some((gpu.path, candidates))
+    }
 }
+
+/// Whether the card was faster than the processor, for each range this process has timed.
+static GPU_VERDICTS: Mutex<std::collections::BTreeMap<(u32, u32), bool>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 impl Engine {
     /// Maps an engine result; a broken pipe means the process is gone, so forget it.

@@ -15,7 +15,7 @@ resolver = "2"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/askscience/bitty"
-rust-version = "1.78"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"

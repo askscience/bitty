@@ -1503,12 +1503,11 @@ impl NetworkCoordinator {
                     std::env::var(name)
                         .ok()
                         .and_then(|value| value.trim().parse::<u32>().ok())
-                        .unwrap_or(0)
                 };
-                let model = DraftModel::open(
+                let model = DraftModel::open_placed(
                     &engine,
                     &path,
-                    read("BITTY_DRAFT_THREADS"),
+                    read("BITTY_DRAFT_THREADS").unwrap_or(0),
                     read("BITTY_DRAFT_GPU_LAYERS"),
                 )
                 .map_err(|err| format!("{}: {err}", path.display()))?;

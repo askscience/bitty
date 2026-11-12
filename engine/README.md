@@ -100,11 +100,50 @@ again from the beginning.
 
 ## GPU and threads
 
-Build llama.cpp with `-DGGML_VULKAN=ON` (or another GPU backend) and set on the
-node:
+A release carries the engine built with `-DGGML_VULKAN=ON` as
+`bitty-stage-vulkan` (and `bitty-stage-vulkan-avx`, `bitty-stage-vulkan-sse`
+for processors without AVX2), next to the builds for the processor. It is a file of its own because
+it needs the Vulkan library of the system to start.
 
+`bitty-stage --list-devices` loads nothing and writes one line for every card
+the build can compute on: `device`, `gpu` or `igpu`, the free and the whole
+memory in bytes, the name of the backend device and the name of the card,
+separated by tabs. A build without a GPU backend writes nothing. This is how
+bitty knows that the engine works on a machine, and not from a list of
+hardware: a card without a working driver is not there.
+
+When a node gets its layers it asks the engine for cards (`BITTY_STAGE_BIN`
+when set, else `bitty-stage-vulkan`) and reads the sizes of the tensors of its
+range from the model file. As many layers as fit in the free video memory, less
+a reserve of 512 MB, are counted for the card, from the top of the range down;
+on the final stage the output layer goes first. If the engine fails to load
+with them, half of that memory is tried once.
+
+Then the card has to prove itself. The node starts the engine for the
+processor, decodes five tokens of made-up input and keeps the best time of the
+last four; it does the same with the layers on the card (the first token is
+left out because the card builds its programs on it). The card stays when its
+time is at most 0.9 of the processor's, otherwise the engine for the processor
+is started again. The verdict for a range is kept while the node runs. This
+costs two or three loads the first time. A card built into the processor is
+used only when asked for, and software drivers such as llvmpipe never. From
+reading the free memory to the end of the load a node holds a lock file in the
+temporary directory, so two nodes of one machine do not count the same memory.
+The code is in `crates/bitty-inference/src/gpu.rs`.
+
+The node tells the leader about the card only when it may use it. Its weight in
+the plan is the one of its processor times `1 / ((1 - s) + s / 2.5)`, where `s`
+is the video memory for weights over the memory the node can fill, and 2.5 the
+gain of a layer on a card measured below. `BITTY_GPU_TFLOPS` still sets the
+number by hand. The settings:
+
+- `BITTY_GPU=off`: never use a card. `BITTY_GPU=igpu`: also use a built-in one
+  when there is no other.
 - `BITTY_GPU_LAYERS=N`: keep N layers of the node's range on the GPU, counted
-  from the top of the range. More than the range holds means all of it.
+  from the top of the range, in place of bitty's own count. More than the
+  range holds means all of it, 0 none. A load that fails is then an error.
+- `BITTY_GPU_RESERVE_MB=N`: the video memory bitty's own count leaves free.
+- `BITTY_GPU_CHECK=0`: no timing, a card that loads is used.
 - `BITTY_STAGE_THREADS=N`: CPU threads of the engine. Unset, bitty gives it
   one thread per physical core (llama.cpp alone would pick 4).
 - `BITTY_GPU_OUTPUT=1`: when the node holds the final stage and no block was
@@ -155,8 +194,10 @@ more guesses than the workers can take back is cut down to that number.
 The draft model runs whole on the leader, as one more `bitty-stage` process.
 For a model of the registry the file named by `draft_url` is downloaded next
 to the model the first time the leader starts; `BITTY_DRAFT_MODEL` names
-another file, or `off`. `BITTY_DRAFT_THREADS` and `BITTY_DRAFT_GPU_LAYERS`
-set its threads and GPU layers.
+another file, or `off`. `BITTY_DRAFT_THREADS` sets its threads. When it fits
+in the free video memory of the leader it is timed on the card and on the
+processor, and stays where it is faster; `BITTY_DRAFT_GPU_LAYERS` sets the
+layers on the card by hand (0 for none).
 
 It is off unless asked for: `bitty generate --draft 4` or `bitty run MODEL
 --draft 4` for one request, `BITTY_DRAFT_TOKENS=4` on the leader for all.
@@ -352,7 +393,13 @@ BITTY_STAGE_BIN=build-vk/bin/bitty-stage python3 engine/stage_bench.py gpu model
   earlier lines.
 - Stage files are not checked against a hash and old ones are not cleaned up
   when the range of a node changes.
-- GPU settings come from environment variables only, and nothing checks the
-  free video memory before loading.
+- The layers for the card are counted from the weights alone: the context and
+  the buffers of the computation are covered by a fixed reserve, not measured.
+- The verdict of the timing is not kept across restarts of a node.
+- The release builds have no OpenMP, so `GOMP_SPINCOUNT` does nothing in them
+  and each call starts its own threads. Which of the two is faster in a ring
+  is not measured.
+- The prebuilt engines for cards are checked in the release only on a runner
+  without a card.
 - State save/load does not record the range.
 - `llama_model_size` still reports the whole file for a stage loaded from it.

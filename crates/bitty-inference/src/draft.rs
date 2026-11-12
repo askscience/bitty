@@ -5,6 +5,7 @@
 //! sampled on. It must have the vocabulary of the model it guesses for. A guess never changes
 //! the text: the large model has the last word on every token.
 
+use crate::gpu::{gpu_is_faster, gpu_lock, gpu_mode, probe_gpu_engine, time_engine, GpuMode};
 use crate::stage_process::{StageOutput, StageProcess, StageProcessConfig, StageProcessError};
 use bitty_model::ModelMetadata;
 use std::collections::HashMap;
@@ -68,6 +69,67 @@ impl DraftModel {
             sessions: HashMap::new(),
             next_session_id: 0,
         })
+    }
+
+    /// Loads the whole model where it guesses fastest. With `gpu_layers` the card gets that
+    /// many layers and nothing is compared. Without, and unless `BITTY_GPU=off`, the model
+    /// is timed on the processor and, when it fits in the free video memory, on the card:
+    /// the faster one stays. A card that fails leaves the processor.
+    pub fn open_placed(
+        engine: &Path,
+        model: &Path,
+        threads: u32,
+        gpu_layers: Option<u32>,
+    ) -> Result<Self, StageProcessError> {
+        let mode = gpu_mode();
+        if mode == GpuMode::Off {
+            return Self::open(engine, model, threads, 0);
+        }
+        if let Some(gpu_layers) = gpu_layers {
+            let gpu_engine = (gpu_layers > 0)
+                .then(probe_gpu_engine)
+                .flatten()
+                .map(|gpu| gpu.path);
+            return Self::open(
+                gpu_engine.as_deref().unwrap_or(engine),
+                model,
+                threads,
+                gpu_layers,
+            );
+        }
+        let mut on_cpu = Self::open(engine, model, threads, 0)?;
+        let _lock = gpu_lock();
+        let size = std::fs::metadata(model).map_or(u64::MAX, |file| file.len());
+        let Some(gpu) =
+            probe_gpu_engine().filter(|gpu| gpu.usable(mode) && size <= gpu.weight_budget_bytes())
+        else {
+            return Ok(on_cpu);
+        };
+        let Ok(cpu_time) = time_engine(&mut on_cpu.process) else {
+            return Ok(on_cpu);
+        };
+        // more layers than any model has: all of it
+        let on_gpu = Self::open(&gpu.path, model, threads, 999).and_then(|mut draft| {
+            let time = time_engine(&mut draft.process)?;
+            Ok((draft, time))
+        });
+        match on_gpu {
+            Ok((draft, gpu_time)) if gpu_is_faster(cpu_time, gpu_time) => {
+                eprintln!(
+                    "bitty: draft model on the graphics card: {:.1} ms a token, {:.1} on the processor",
+                    gpu_time.as_secs_f64() * 1000.0,
+                    cpu_time.as_secs_f64() * 1000.0
+                );
+                Ok(draft)
+            }
+            Ok(_) => Ok(on_cpu),
+            Err(err) => {
+                eprintln!(
+                    "bitty: the draft model could not be loaded on the graphics card ({err})"
+                );
+                Ok(on_cpu)
+            }
+        }
     }
 
     pub fn vocab_size(&self) -> u32 {

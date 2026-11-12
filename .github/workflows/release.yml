@@ -22,6 +22,8 @@ concurrency:
 env:
   # keep in step with engine/README.md
   LLAMA_COMMIT: 45c8ea837489be1304500dd1d298f2a671c985d4
+  # the SDK the engine for graphics cards is built with on Windows
+  VULKAN_VERSION: 1.4.313.2
   TEST_MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
   CARGO_TERM_COLOR: always
 
@@ -66,6 +68,23 @@ jobs:
           path: engine-bin
           key: engine-${{ matrix.name }}-${{ env.LLAMA_COMMIT }}-${{ hashFiles('engine/llama-cpp-stage.patch', '.github/workflows/release.yml') }}
 
+      - name: Vulkan SDK (Linux)
+        if: steps.engine.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Vulkan SDK (Windows)
+        if: steps.engine.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP/VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
       - name: Build the stage engine
         if: steps.engine.outputs.cache-hit != 'true'
         run: |
@@ -77,7 +96,10 @@ jobs:
           git apply ../engine/llama-cpp-stage.patch
           # no extra libraries, and three builds of the engine: the plain one needs AVX2, "-avx"
           # runs on processors up to 2012 that only have AVX, "-sse" on the ones without it.
-          # bitty starts the one its machine can run.
+          # bitty starts the one its machine can run. Three more compute on a graphics card
+          # through Vulkan, with the same three levels for the layers left on the processor
+          # ("-vulkan", "-vulkan-avx", "-vulkan-sse"): they need the Vulkan library of the
+          # system to start, so bitty asks them for cards first and falls back on the others.
           flags=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TOOLS=OFF
                  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
                  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF)
@@ -98,6 +120,9 @@ jobs:
           build_engine ""
           build_engine -avx "${no_avx2[@]}"
           build_engine -sse "${no_avx2[@]}" -DGGML_AVX=OFF
+          build_engine -vulkan -DGGML_VULKAN=ON
+          build_engine -vulkan-avx "${no_avx2[@]}" -DGGML_VULKAN=ON
+          build_engine -vulkan-sse "${no_avx2[@]}" -DGGML_AVX=OFF -DGGML_VULKAN=ON
 
       - name: Test model cache
         id: model
@@ -133,6 +158,19 @@ jobs:
               cargo test --release --locked -p bitty-inference --test stage_engine
           done
 
+      - name: The engines for graphics cards (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # the runner has no card: the engines must start, list what they find and compute
+          # on the processor like the others
+          sudo apt-get install -y libvulkan1
+          for variant in -vulkan -vulkan-avx -vulkan-sse; do
+            "engine-bin/bitty-stage$variant" --list-devices
+            BITTY_STAGE_BIN="$PWD/engine-bin/bitty-stage$variant" \
+            BITTY_TEST_MODEL="$PWD/test-model/model.gguf" \
+              cargo test --release --locked -p bitty-inference --test stage_engine
+          done
+
       - name: Package
         run: |
           name="bitty-${{ matrix.name }}"
@@ -156,6 +194,7 @@ jobs:
           BITTY_ARCHIVE="$PWD/dist/bitty-linux-x86_64.tar.gz" bash scripts/install.sh --no-auto-update
           "$BITTY_BIN_DIR/bitty" version
           test -x "$BITTY_HOME/bin/bitty-stage" -a -x "$BITTY_HOME/bin/bitty-update"
+          test -x "$BITTY_HOME/bin/bitty-stage-vulkan" -a -x "$BITTY_HOME/bin/bitty-stage-vulkan-sse"
           test "$(cat "$BITTY_HOME/VERSION")" = "$BITTY_GIT_SHA"
           bash scripts/install.sh --uninstall
           test ! -e "$BITTY_HOME"
@@ -172,7 +211,7 @@ jobs:
           Get-Content scripts\install.ps1 -Raw | Invoke-Expression
           & "$env:BITTY_HOME\bin\bitty.exe" version
           if ($LASTEXITCODE -ne 0) { throw 'the installed bitty does not run' }
-          foreach ($file in 'bin\bitty-stage.exe', 'bin\bitty-update.ps1', 'VERSION') {
+          foreach ($file in 'bin\bitty-stage.exe', 'bin\bitty-stage-vulkan.exe', 'bin\bitty-update.ps1', 'VERSION') {
             if (-not (Test-Path (Join-Path $env:BITTY_HOME $file))) { throw "missing $file" }
           }
           if ((Get-Content "$env:BITTY_HOME\VERSION" -Raw).Trim() -ne $env:BITTY_GIT_SHA) { throw 'wrong VERSION' }
@@ -219,7 +258,7 @@ jobs:
           version="${GITHUB_SHA::12}"
           sha256sum bitty-linux-x86_64.tar.gz bitty-windows-x86_64.zip > SHA256SUMS
           echo "$version" > VERSION
-          notes="Rolling build of the qwen-llama-cpp branch, commit $GITHUB_SHA. Installed and kept up to date by scripts/install.sh (Linux) and scripts/install.ps1 (Windows). CPU builds for x86-64: AVX2, AVX and SSE4.2, picked by bitty at run time."
+          notes="Rolling build of the qwen-llama-cpp branch, commit $GITHUB_SHA. Installed and kept up to date by scripts/install.sh (Linux) and scripts/install.ps1 (Windows). Engines for x86-64: AVX2, AVX and SSE4.2 on the processor, and Vulkan for graphics cards, picked by bitty at run time."
           if gh release view nightly > /dev/null 2>&1; then
             gh release edit nightly --notes "$notes" --prerelease
           else

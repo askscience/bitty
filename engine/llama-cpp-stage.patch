@@ -347,18 +347,25 @@ index 0000000..05d762d
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/stage-server/stage-server.cpp b/examples/stage-server/stage-server.cpp
 new file mode 100644
-index 0000000..8de3ea2
+index 0000000..05f8a64
 --- /dev/null
 +++ b/examples/stage-server/stage-server.cpp
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,707 @@
 +// Stage server: serves one layer range of the model to a parent process over stdin/stdout.
 +//
 +//   bitty-stage -m model.gguf --start 8 --end 16 [-t threads] [--ctx 4096] [--sessions 4] [--batch 512]
 +//               [--top-logits N] [--rollback N]
 +//   bitty-stage -m model.gguf --vocab-only
++//   bitty-stage --list-devices
 +//
 +// With --vocab-only no weights are loaded: the process only serves the text ops (5 to 8) and
 +// reports the range [0, 0).
++//
++// With --list-devices nothing is loaded: the process writes one line to stdout for every
++// graphics card this build can compute on, and exits. A build without a GPU backend writes
++// nothing. The fields are separated by tabs:
++//   "device" kind free_bytes total_bytes name description
++// where kind is "gpu" for a card of its own and "igpu" for one built into the processor.
 +//
 +// All integers are little-endian. Logs go to stderr, stdout carries only frames.
 +//
@@ -708,9 +715,14 @@ index 0000000..8de3ea2
 +    int         threads = 0;
 +    int         gpu_layers = 0; // llama.cpp's count: layers from the top of the whole model
 +    bool        vocab_only = false;
++    bool        list_devices = false;
 +
 +    for (int i = 1; i < argc; ++i) {
 +        const std::string a = argv[i];
++        if (a == "--list-devices") {
++            list_devices = true;
++            continue;
++        }
 +        if (a == "--vocab-only") {
 +            vocab_only = true;
 +            continue;
@@ -734,12 +746,30 @@ index 0000000..8de3ea2
 +            return 2;
 +        }
 +    }
++    if (list_devices) {
++        llama_backend_init();
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
++            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
++                continue;
++            }
++            size_t free = 0, total = 0;
++            ggml_backend_dev_memory(dev, &free, &total);
++            printf("device\t%s\t%llu\t%llu\t%s\t%s\n", type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "igpu" : "gpu",
++                   (unsigned long long) free, (unsigned long long) total, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
++        }
++        fflush(stdout);
++        llama_backend_free();
++        return 0;
++    }
 +    if (vocab_only) {
 +        srv.begin = srv.end = 0;
 +    }
 +    if (model_path.empty() || (!vocab_only && srv.end <= srv.begin) || srv.begin < 0 || srv.n_sessions < 1 || srv.n_batch < 1 || srv.n_ctx_seq < 1 || srv.rollback < 0) {
 +        fprintf(stderr, "usage: %s -m model.gguf --start N --end M [-t threads] [--gpu-layers N] [--ctx 4096] [--sessions 4] [--batch 512] [--top-logits N] [--rollback N]\n"
-+                        "       %s -m model.gguf --vocab-only\n", argv[0], argv[0]);
++                        "       %s -m model.gguf --vocab-only\n"
++                        "       %s --list-devices\n", argv[0], argv[0], argv[0]);
 +        return 2;
 +    }
 +

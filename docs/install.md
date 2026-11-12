@@ -91,6 +91,46 @@ Without `BITTY_STAGE_THREADS` the engine gets one thread per physical core of
 the machine. On the eight-core leader that is 316-329 ms per token against
 362-386 with the four threads llama.cpp picks by itself.
 
+## Graphics cards
+
+A node uses the graphics card of its machine by itself. The release carries an
+engine built with Vulkan, which works with the drivers of AMD, NVIDIA and
+Intel cards on Linux and Windows. When the node gets its layers it starts that
+engine once to ask which cards it sees and how much of their memory is free,
+and counts how many of its layers fit there, from the last one down. The rest
+stays on the processor.
+
+A card is not always faster: an old one with little memory can be slower than
+the processor next to it. So the node times one token on the processor alone
+and one with the card, and keeps the card only when it wins by a tenth or
+more. The log says what it did:
+
+```
+bitty: graphics card: AMD Radeon RX 5500M (RADV NAVI14), 3993 of 8176 MB free
+bitty: 6 of the 10 layers 20..30 (3140 MB of weights) on the graphics card: 14.2 ms a token, 27.9 on the processor alone: the card is used
+```
+
+The first load of a range takes longer for this, since the layers are loaded
+two or three times. Nothing has to be installed except the driver of the card.
+On a machine without a card, without a Vulkan driver, or where the card fails
+while the layers load (half as many layers are tried once), the node computes
+on the processor as before.
+
+For the plan of the leader a node counts as faster by the share of its layers
+the card can hold: a card with room for one layer of ten adds a few percent.
+
+- `BITTY_GPU=off` never uses a card.
+- `BITTY_GPU=igpu` also uses a card built into the processor when the machine
+  has no other. It is off by default: such a card shares the memory of the
+  machine and is often no faster than the processor.
+- `BITTY_GPU_LAYERS=N` sets the number of layers by hand, counted from the top
+  of the range of the node; 0 keeps all of them on the processor.
+- `BITTY_GPU_CHECK=0` skips the timing and trusts the card.
+- `BITTY_GPU_RESERVE_MB=512` is the video memory left free on top of the
+  weights, for the engine's own buffers and for the desktop.
+- `GGML_VK_VISIBLE_DEVICES=0` is llama.cpp's own variable, to pick one card
+  when the machine has several.
+
 ## A network of machines
 
 ```bash
@@ -123,7 +163,8 @@ hand and turns the measuring off.
 
 A node keeps one connection to its leader and sends every heartbeat on it, so
 the number is one round trip and not a handshake. The log of a node says
-which build of the engine its processor got (`bitty: engine bitty-stage-avx`).
+which build of the engine its processor got (`bitty: engine bitty-stage-avx`),
+and whether it found a graphics card.
 
 The number is the trip to the leader, not the trip between two nodes. Two far
 nodes that sit beside each other are still counted as two far trips.
@@ -160,10 +201,9 @@ to those machines. They stay connected. It is for tests, to see what a
 machine adds, and for a machine that is known not to work.
 
 The limits are those of the memory of the machine, also when it has a graphics
-card. The engine puts on the card only the layers `BITTY_GPU_LAYERS` names,
-and without that setting the card is not counted at all, neither for speed nor
-for room. With it, a card larger than the memory of the machine raises the
-limit and a smaller one changes nothing.
+card. A card is counted, for speed and for room, when the node uses it (see
+"Graphics cards" below). A card larger than the memory of the machine then
+raises the limit and a smaller one changes nothing.
 
 A download of layers that is cut, by a restart, an update or a line that
 drops, goes on from where it was the next time.
@@ -301,7 +341,12 @@ curl -fsSL https://raw.githubusercontent.com/askscience/bitty/qwen-llama-cpp/scr
 - A node keeps its machine awake while it runs (Windows and Linux with
   systemd), so a machine left alone stays in the ring. `BITTY_ALLOW_SLEEP=1`
   in the `env` file lets it sleep.
-- CPU only. For a GPU build the engine yourself with Vulkan as described in
+- Three more builds of the engine compute on a graphics card through Vulkan:
+  `bitty-stage-vulkan`, `bitty-stage-vulkan-avx` and `bitty-stage-vulkan-sse`,
+  with the same three levels for the layers that stay on the processor. They need the Vulkan
+  library that comes with the driver of the card (`libvulkan.so.1`,
+  `vulkan-1.dll`); a machine without it uses the builds above. For another
+  backend, such as CUDA, build the engine yourself as described in
   [engine/README.md](../engine/README.md) and point `BITTY_STAGE_BIN` at it in
   the `env` file. The updater keeps updating `bitty` and leaves your engine
   alone.

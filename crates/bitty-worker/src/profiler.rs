@@ -39,27 +39,74 @@ impl HardwareProfiler {
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| system.available_memory() / 1024 / 1024)
             .min(ram_mb);
-        let gpu_probe = configured_gpu_probe();
+        let mut gpu_probe = configured_gpu_probe();
+        // The engine loads into the card the layers `BITTY_GPU_LAYERS` names, or without it
+        // the ones bitty finds room for, when the engine for graphics cards works on this
+        // machine. Otherwise the card does no work and holds nothing, and the node is planned
+        // as a CPU node.
+        let gpu_mode = bitty_inference::gpu_mode();
+        let asked_layers = std::env::var("BITTY_GPU_LAYERS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let gpu_engine = (gpu_mode != bitty_inference::GpuMode::Off && asked_layers != Some(0))
+            .then(bitty_inference::probe_gpu_engine)
+            .flatten();
+        let engine_uses_gpu = gpu_mode != bitty_inference::GpuMode::Off
+            && match asked_layers {
+                Some(layers) => layers > 0,
+                None => gpu_engine.as_ref().is_some_and(|gpu| gpu.usable(gpu_mode)),
+            };
+        // The engine knows the cards it will really use, on every system: its list comes
+        // first for the memory, and fills in the cards where nothing else found any.
+        let engine_vram_mb = gpu_engine
+            .as_ref()
+            .filter(|_| engine_uses_gpu)
+            .map(|gpu| gpu.total_bytes() / 1024 / 1024)
+            .filter(|vram_mb| *vram_mb > 0);
+        if let Some(gpu) = gpu_engine.as_ref().filter(|_| engine_uses_gpu) {
+            eprintln!("bitty: graphics card: {}", gpu.summary());
+            if gpu_probe.gpus.is_empty() {
+                gpu_probe.gpus = gpu
+                    .used_devices()
+                    .iter()
+                    .map(|device| GpuInfo {
+                        name: device.description.clone(),
+                        vram_mb: device.total_bytes / 1024 / 1024,
+                        compute_capability: 0,
+                    })
+                    .collect();
+                gpu_probe.backend_type = gpu_probe
+                    .gpus
+                    .first()
+                    .map(|device| format!("vulkan:{}", preferred_backend_for_name(&device.name)));
+            }
+        }
         let gpus = gpu_probe.gpus;
         let vram_mb = std::env::var("BITTY_VRAM_MB")
             .ok()
             .and_then(|value| value.parse().ok())
+            .or(engine_vram_mb)
             .unwrap_or_else(|| gpus.iter().map(|gpu| gpu.vram_mb).max().unwrap_or(0));
-        // The engine loads into the card only the layers `BITTY_GPU_LAYERS` names. Without it
-        // the card does no work and holds nothing, so the node is planned as a CPU node.
-        let engine_uses_gpu = std::env::var("BITTY_GPU_LAYERS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .is_some_and(|layers| layers > 0);
+        // What the card adds depends on how much of the node's layers it holds: a card with
+        // room for one layer of ten makes the node a little faster, not a GPU node. The
+        // share is the video memory for weights against the memory the node can fill.
+        let gpu_share = gpu_engine.as_ref().filter(|_| engine_uses_gpu).map(|gpu| {
+            let room_mb = if available_ram_mb > 0 {
+                available_ram_mb
+            } else {
+                ram_mb
+            };
+            gpu.weight_budget_bytes() as f64 / (room_mb.max(1) * 1024 * 1024) as f64
+        });
         let gpu_tflops = std::env::var("BITTY_GPU_TFLOPS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| {
-                if engine_uses_gpu {
-                    estimate_gpu_tflops(&gpus, vram_mb)
-                } else {
-                    0.0
-                }
+            .unwrap_or_else(|| match gpu_share {
+                // 0.20 is the weight the plan gives a processor
+                Some(share) => cpu_tflops * 0.20 * bitty_inference::speedup_with_share(share),
+                // an engine that cannot say what it would load: the guess by the name
+                None if engine_uses_gpu => estimate_gpu_tflops(&gpus, vram_mb),
+                None => 0.0,
             });
         let tier = tier_for(cpu_count, ram_mb, gpu_tflops, vram_mb);
         let backend_type = std::env::var("BITTY_BACKEND")
