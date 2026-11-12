@@ -38,6 +38,7 @@ pub struct NetworkWorker<E = FakeLayerExecutor> {
     /// Their results are handed to the next worker here, in the same order.
     handovers: Line,
     taken_back: TakenBack,
+    slow_steps: crate::slow::SlowSteps,
 }
 
 // written out because the derive would ask the executor itself to be `Clone`
@@ -57,6 +58,7 @@ impl<E> Clone for NetworkWorker<E> {
             stages: self.stages.clone(),
             handovers: self.handovers.clone(),
             taken_back: self.taken_back.clone(),
+            slow_steps: self.slow_steps.clone(),
         }
     }
 }
@@ -270,6 +272,7 @@ where
             stages: Line::default(),
             handovers: Line::default(),
             taken_back: TakenBack::default(),
+            slow_steps: crate::slow::SlowSteps::default(),
         }
     }
 
@@ -355,13 +358,21 @@ where
         if !self.taken_back.start(&key, guess) {
             return;
         }
+        let one_token = activation.shape.first() == Some(&1);
+        let counters = crate::slow::MachineCounters::now();
         let started = Instant::now();
         let result = self.run_stage(activation).await;
         // a guess that was taken back goes no further, whether the layers finished it or not
         if self.taken_back.finish(&key) {
             return;
         }
-        hop_micros.push(started.elapsed().as_micros() as u64);
+        let micros = started.elapsed().as_micros() as u64;
+        hop_micros.push(micros);
+        if let (true, Ok(_)) = (one_token, &result) {
+            if let Some(line) = self.slow_steps.step(micros, counters) {
+                eprintln!("bitty-worker: {line}");
+            }
+        }
         let output = match result {
             Ok(output) => output,
             Err(status) if guess && status.code() == tonic::Code::Cancelled => return,

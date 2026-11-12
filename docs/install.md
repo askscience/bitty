@@ -244,6 +244,13 @@ token of the cluster. The leader keeps them in
 `~/.bitty/logs/node-bitty-1234abcd.log`. The leader asks by itself when a node
 could not load its layers.
 
+A Linux node writes a line in its log when a token took three times its
+fastest one or more: `slow step: 700 ms, the fastest took 40 ms`, with the
+pages that waited for the disk, the MiB read from it, the pages back from swap,
+the load and the memory still available. Layers read back from the disk mean
+the machine is short of memory; a high load with no reads means something else
+uses its processor.
+
 `restart`: a node that runs in the background ends, and its updater starts it
 again within a minute. A node somebody started in a terminal stays.
 

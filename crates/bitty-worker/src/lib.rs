@@ -4,6 +4,7 @@ pub mod network;
 pub mod profiler;
 pub mod ring;
 pub mod shard;
+pub mod slow;
 
 pub use profiler::HardwareProfiler;
 pub use ring::{RingWorker, RingWorkerError};
