@@ -20,6 +20,11 @@ pub struct ModelMetadata {
     pub quantization: Quantization,
     pub tokenizer_path: Option<PathBuf>,
     pub tensors: Vec<TensorMetadata>,
+    /// The state one recurrent layer (Gated DeltaNet, Mamba) keeps for one request: its
+    /// summary of the text and the window of its convolution. 0 for a model without such
+    /// layers. The engine keeps it once, plus once for every token it can take back.
+    #[serde(default)]
+    pub recurrent_state_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -89,6 +94,7 @@ impl ModelMetadata {
             .or_else(|| infer_hidden_size(&gguf.tensors))
             .unwrap_or(0) as u32;
         let quantization = dominant_quantization(&tensors);
+        let recurrent_state_bytes = recurrent_state_bytes(&gguf, &architecture);
 
         Ok(Self {
             architecture,
@@ -98,7 +104,26 @@ impl ModelMetadata {
             quantization,
             tokenizer_path,
             tensors,
+            recurrent_state_bytes,
         })
+    }
+
+    /// The layers of the model that are recurrent: those with `ssm_` tensors in the file. A
+    /// stage file knows only its own layers.
+    pub fn recurrent_layers(&self) -> std::collections::BTreeSet<u32> {
+        self.tensors
+            .iter()
+            .filter(|tensor| tensor.name.contains(".ssm_"))
+            .filter_map(|tensor| tensor.layer_id)
+            .collect()
+    }
+
+    /// The memory beyond the weights the engine keeps for each recurrent layer of the file,
+    /// with `sessions` requests at a time and `take_back` tokens each can take back.
+    pub fn state_bytes_per_layer(&self, sessions: u32, take_back: u32) -> u64 {
+        self.recurrent_state_bytes
+            .saturating_mul(u64::from(sessions.max(1)))
+            .saturating_mul(1 + u64::from(take_back))
     }
 
     pub fn layer_metadata(&self) -> Vec<LayerMetadata> {
@@ -113,6 +138,7 @@ impl ModelMetadata {
             .map(|layer_id| LayerMetadata {
                 layer_id,
                 weight_bytes: bytes_by_layer.get(&layer_id).copied().unwrap_or_default(),
+                state_bytes: 0,
                 activation_bytes: self.activation_bytes,
                 estimated_flops: estimate_layer_flops(self.hidden_size),
                 precision_critical: layer_id == 0 || layer_id + 1 == self.layer_count,
@@ -161,6 +187,22 @@ fn metadata_u64(gguf: &GgufFileMetadata, keys: &[&str]) -> Option<u64> {
         GgufMetadataValue::I64(value) => Some((*value).try_into().ok()?),
         _ => None,
     })
+}
+
+/// The state of one recurrent layer for one request, in f32 as llama.cpp keeps it: the
+/// summary (`inner_size * state_size`) and the window of the convolution
+/// (`(conv_kernel - 1) * (inner_size + 2 * group_count * state_size)`). Measured on
+/// Qwen3.5-35B-A3B: 2.09 MiB, the size llama.cpp reports.
+fn recurrent_state_bytes(gguf: &GgufFileMetadata, architecture: &str) -> u64 {
+    let read = |name: &str| metadata_u64(gguf, &[format!("{architecture}.ssm.{name}").as_str()]);
+    let (Some(inner), Some(state)) = (read("inner_size"), read("state_size")) else {
+        return 0;
+    };
+    let window = match (read("conv_kernel"), read("group_count")) {
+        (Some(kernel), Some(groups)) => kernel.saturating_sub(1) * (inner + 2 * groups * state),
+        _ => 0,
+    };
+    (inner * state + window) * 4
 }
 
 fn metadata_string(gguf: &GgufFileMetadata, keys: &[&str]) -> Option<String> {

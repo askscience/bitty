@@ -57,7 +57,8 @@ pub struct StageOptions {
     /// fit in its free memory go there, and `gpu_layers` and `gpu_output` are not read.
     pub gpu_auto: bool,
     /// Tokens of its last request a stage can take back: the longest guess of a draft model
-    /// that can be checked in one pass. Costs memory (about 25 MB each for Qwen3.5-35B).
+    /// that can be checked in one pass. Costs memory: a copy of the state of every recurrent layer for every
+    /// request (2.09 MiB a layer and request for Qwen3.5-35B).
     pub rollback: u32,
 }
 
@@ -126,8 +127,11 @@ impl Default for StageOptions {
     }
 }
 
-/// Tokens a stage can take back unless `BITTY_STAGE_ROLLBACK` says otherwise.
-pub const DEFAULT_ROLLBACK: u32 = 4;
+/// Tokens a stage can take back unless `BITTY_STAGE_ROLLBACK` says otherwise: the most
+/// guesses a pass can check. Each one costs a copy of the state of every recurrent layer for
+/// every request, 2.09 MiB a layer and request on Qwen3.5-35B: 8 is about 1.5 GB more than
+/// none on a stage of 28 layers, 100 MB on one of 2. The leader counts it in the plan.
+pub const DEFAULT_ROLLBACK: u32 = 8;
 
 struct Session {
     id: u64,

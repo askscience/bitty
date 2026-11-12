@@ -154,6 +154,7 @@ fn demo_profiles(count: usize) -> Vec<HardwareProfile> {
 fn demo_layers(count: u32) -> Vec<LayerMetadata> {
     (0..count)
         .map(|layer_id| LayerMetadata {
+            state_bytes: 0,
             layer_id,
             weight_bytes: 512_000,
             activation_bytes: 4096,

@@ -187,9 +187,21 @@ tokens.
 
 The stages can only take back tokens of their last decode call, and not its
 first one. `bitty-stage --rollback N` keeps a copy of the recurrent state for
-each of the last N tokens (4 by default, `BITTY_STAGE_ROLLBACK`); on the 35B
-model that is about 25 MB of memory per kept token and node. A request for
-more guesses than the workers can take back is cut down to that number.
+each of the last N tokens (8 by default, `BITTY_STAGE_ROLLBACK`), so a pass
+gives up to 9 tokens. A request for more guesses than the workers can take back
+is cut down to that number.
+
+The copies are not small. The state of one recurrent layer of the 35B model is
+2.09 MiB for one request (llama.cpp reports it: `inner_size * state_size` f32
+plus the window of the convolution), the engine keeps it for each of its 4
+requests, and once more for every token it can take back. Measured on layers
+0..4 (3 recurrent): 25 MiB with none, 126 with 4, 226 with 8; on 0..12 (9
+recurrent): 75 and 678 MiB. A stage of 28 layers (21 recurrent) keeps about
+1.6 GB with 8, a stage of 2 layers about 75 MB. The leader counts this for
+every recurrent layer when it plans (`planning with ... MB of state` in its
+log), with the `BITTY_STAGE_ROLLBACK` and sessions of its own settings, and a
+node counts it again before it loads. Every node should have the same
+`BITTY_STAGE_ROLLBACK` as the leader.
 
 The draft model runs whole on the leader, as one more `bitty-stage` process.
 For a model of the registry the file named by `draft_url` is downloaded next
@@ -222,7 +234,10 @@ The leader also guesses with no model at all, from text it has already seen, and
 it does so by default. Before every pass that carries one certain token it looks
 for the last three tokens of the text (then the last two) earlier in the same
 request, the prompt and what was written so far, and sends what followed them
-there as guesses. If the request has nothing, it looks in the answers the ring
+there as guesses. When neither is found but the model was copying a moment ago,
+it looks for the last token alone a few places around where the copy had
+reached, and goes on from there: a model that corrects a text changes a word and
+copies on right after it. If the request has nothing, it looks in the answers the ring
 gave before: the last three tokens are looked up in an index of them, and the
 continuation most of them share is sent. The answers are kept as token ids in
 `guesses/` in the data directory of the leader, about 4 MB for a million tokens
@@ -231,8 +246,8 @@ file per model file and vocabulary size.
 
 The guesses go through the same check as the ones of the draft model, which is
 asked only when the text has none. How many go in a pass follows how often they
-were right in the request: all the engines can take back while at least half of
-them were right, half of that while a quarter were, else one. A pass with no
+were right in the request: all the engines can take back (8) while at least half
+of them were right, half of that while a quarter were, else one. A pass with no
 match is a plain pass.
 
 It pays on answers that copy the prompt (quotes, summaries, corrections, code)

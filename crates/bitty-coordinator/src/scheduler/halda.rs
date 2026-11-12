@@ -92,7 +92,7 @@ impl Halda {
         if ranked.len() > 1 {
             let largest = layers
                 .iter()
-                .map(|layer| layer.weight_bytes)
+                .map(|layer| layer.weight_bytes + layer.state_bytes)
                 .max()
                 .unwrap_or(0);
             let roomy = ranked
@@ -181,18 +181,19 @@ impl Halda {
         // node keeps working as it did before. The hard limit is its whole memory less a
         // reserve: past it the node swaps. Layers go inside the free limit first.
         let weights = |start: u32, len: u32| assignment_weight_bytes(start, start + len, layers);
+        let memory = |start: u32, len: u32| assignment_memory_bytes(start, start + len, layers);
         let on_disk = |node: &HardwareProfile, start: u32, len: u32| {
             node.disk_bytes()
                 .is_none_or(|disk| weights(start, len) <= disk)
         };
         let fits = |node: &HardwareProfile, start: u32, len: u32| {
             on_disk(node, start, len)
-                && weights(start, len) + self.config.stage_overhead_bytes
+                && memory(start, len) + self.config.stage_overhead_bytes
                     <= node.free_memory_bytes(self.config.memory_reserve_fraction)
         };
         let fits_hard = |node: &HardwareProfile, start: u32, len: u32| {
             on_disk(node, start, len)
-                && weights(start, len) + self.config.stage_overhead_bytes
+                && memory(start, len) + self.config.stage_overhead_bytes
                     <= available_memory_bytes(node, self.config.memory_reserve_fraction)
         };
 
@@ -313,7 +314,7 @@ impl Halda {
                 next_node_id: None,
                 disk_offload_fraction: disk_offload_fraction(
                     node,
-                    assigned_weight_bytes + self.config.stage_overhead_bytes,
+                    assignment_memory_bytes(cursor, end, layers) + self.config.stage_overhead_bytes,
                 ),
                 model_stage: ModelStage::LayerRange,
             });
@@ -448,6 +449,15 @@ fn assignment_weight_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u6
         .sum()
 }
 
+/// The memory a range takes on a node, less the fixed overhead of a stage: its weights and
+/// the state its recurrent layers keep.
+fn assignment_memory_bytes(start: u32, end: u32, layers: &[LayerMetadata]) -> u64 {
+    layers[start as usize..end as usize]
+        .iter()
+        .map(|layer| layer.weight_bytes + layer.state_bytes)
+        .sum()
+}
+
 fn available_memory_bytes(node: &HardwareProfile, reserve_fraction: f64) -> u64 {
     node.hard_memory_bytes(reserve_fraction)
 }
@@ -528,6 +538,7 @@ mod tests {
     fn layers(count: u32) -> Vec<LayerMetadata> {
         (0..count)
             .map(|layer_id| LayerMetadata {
+                state_bytes: 0,
                 layer_id,
                 weight_bytes: 1_000_000,
                 activation_bytes: 4096,

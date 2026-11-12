@@ -61,6 +61,11 @@ fn parse_mode(value: Option<&str>) -> GuessCacheMode {
 /// earlier in it. Tries the last three tokens first, then the last two; `None` when neither
 /// appears before.
 pub fn lookup_in_text(text: &[u32], count: usize) -> Option<Vec<u32>> {
+    find_in_text(text, count).map(|(_, guesses)| guesses)
+}
+
+/// [`lookup_in_text`], with the place in `text` the guesses were taken from.
+fn find_in_text(text: &[u32], count: usize) -> Option<(usize, Vec<u32>)> {
     if count == 0 {
         return None;
     }
@@ -77,11 +82,72 @@ pub fn lookup_in_text(text: &[u32], count: usize) -> Option<Vec<u32>> {
             let from = start + length;
             let end = (from + count).min(text.len());
             if from < end {
-                return Some(text[from..end].to_vec());
+                return Some((from, text[from..end].to_vec()));
             }
         }
     }
     None
+}
+
+/// How far around the place a copy had reached the last token is looked for, once the last
+/// two tokens are found nowhere: a corrected word is seldom more tokens than this away from
+/// the one it replaces.
+const NEAR_BEHIND: usize = 2;
+const NEAR_AHEAD: usize = 8;
+
+/// The guesses of one request from its own text, which keeps track of where in that text
+/// the model was copying from.
+///
+/// [`lookup_in_text`] loses a copy as soon as the model changes a word: the last three
+/// tokens, and often the last two, are then found nowhere. A model that corrects a text goes
+/// on copying right after the word it changed, so when nothing else is found the last token
+/// alone is looked for near the place the copy had reached, and what follows it there is
+/// sent. Alone and anywhere it would find anything; there it is seldom wrong.
+#[derive(Clone, Debug, Default)]
+pub struct TextLookup {
+    /// Where in the text the next token would be if the copy went on.
+    next_source: Option<usize>,
+}
+
+impl TextLookup {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Up to `count` guesses for what follows `text`.
+    pub fn propose(&mut self, text: &[u32], count: usize) -> Option<Vec<u32>> {
+        if let Some((from, guesses)) = find_in_text(text, count) {
+            self.next_source = Some(from);
+            return Some(guesses);
+        }
+        let (Some(hint), Some(&last)) = (self.next_source, text.last()) else {
+            return None;
+        };
+        if count == 0 {
+            return None;
+        }
+        // positions before the last token only: it cannot be found in itself
+        let window = hint.saturating_sub(NEAR_BEHIND)..(hint + NEAR_AHEAD).min(text.len() - 1);
+        let at = window
+            .clone()
+            .find(|&place| place >= hint && text[place] == last)
+            .or_else(|| window.rev().find(|&place| text[place] == last))?;
+        let from = at + 1;
+        let end = (from + count).min(text.len());
+        if from >= end {
+            return None;
+        }
+        self.next_source = Some(from);
+        Some(text[from..end].to_vec())
+    }
+
+    /// Tells the lookup how many tokens the last pass added to the text: the copy has moved
+    /// on by as many.
+    pub fn advance(&mut self, added: usize) {
+        if let Some(next) = self.next_source.as_mut() {
+            *next += added;
+        }
+    }
 }
 
 /// The answers the ring gave before, as token ids, with an index of where each run of three
@@ -364,6 +430,57 @@ mod tests {
     fn the_most_recent_place_wins_in_the_request() {
         let text = [7, 8, 9, 1, 0, 7, 8, 9, 2, 0, 7, 8, 9];
         assert_eq!(lookup_in_text(&text, 1), Some(vec![2]));
+    }
+
+    /// Writes `answer` after `prompt` the way the ring does: a pass sends the guesses, keeps
+    /// those that match and adds one token of the answer after them. Returns the passes.
+    fn passes_to_write(prompt: &[u32], answer: &[u32], near: bool) -> usize {
+        let mut text = prompt.to_vec();
+        let mut lookup = TextLookup::new();
+        let (mut written, mut passes) = (0, 0);
+        while written < answer.len() {
+            let guesses = if near {
+                lookup.propose(&text, 4)
+            } else {
+                lookup_in_text(&text, 4)
+            }
+            .unwrap_or_default();
+            // the guesses the model agrees with, and the token it chooses after them
+            let right = guesses
+                .iter()
+                .zip(&answer[written..])
+                .take_while(|(guess, token)| guess == token)
+                .count();
+            let added = (right + 1).min(answer.len() - written);
+            text.extend_from_slice(&answer[written..written + added]);
+            written += added;
+            lookup.advance(added);
+            passes += 1;
+        }
+        passes
+    }
+
+    #[test]
+    fn a_copy_goes_on_after_a_corrected_word() {
+        // the prompt asks to correct a text; the answer is the text with two words changed
+        let mut prompt: Vec<u32> = vec![900, 901, 902];
+        let original: Vec<u32> = (1..=30).collect();
+        prompt.extend(&original);
+        prompt.extend([903, 904]);
+        let mut answer = original.clone();
+        answer[8] = 500;
+        answer[19] = 501;
+        let plain = passes_to_write(&prompt, &answer, false);
+        let near = passes_to_write(&prompt, &answer, true);
+        assert!(near < plain, "near {near}, plain {plain}");
+        eprintln!("passes: near {near}, plain {plain}");
+    }
+
+    #[test]
+    fn the_near_lookup_needs_a_copy_to_follow() {
+        let mut lookup = TextLookup::new();
+        // nothing was copied yet: the last token alone is no guess
+        assert_eq!(lookup.propose(&[4, 9, 5, 6, 9], 3), None);
     }
 
     #[test]

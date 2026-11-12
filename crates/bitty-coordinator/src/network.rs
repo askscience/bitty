@@ -2,8 +2,8 @@ use crate::security::{request_rate_limiter, AuthMode, SharedRateLimiter};
 use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
 use bitty_inference::{
-    guess_cache_mode, guess_count, history_file_name, lookup_in_text, DraftModel, GuessCacheMode,
-    GuessHistory, Sampler, SamplingOptions, StageOptions, TextCodec, TextStream, DEFAULT_TOP_K,
+    guess_cache_mode, guess_count, history_file_name, DraftModel, GuessCacheMode, GuessHistory,
+    Sampler, SamplingOptions, StageOptions, TextCodec, TextLookup, TextStream, DEFAULT_TOP_K,
     DEFAULT_TOP_P,
 };
 #[cfg(test)]
@@ -1096,6 +1096,7 @@ impl NetworkCoordinator {
         }
         let take_back_limit = StageOptions::from_env().rollback as usize;
         let (mut text_guessed, mut text_kept) = (0usize, 0usize);
+        let mut text_lookup = TextLookup::new();
         // how many of them the workers hold
         let mut fed = 0usize;
         // the workers hold guesses after `fed` that were wrong
@@ -1107,12 +1108,13 @@ impl NetworkCoordinator {
         'passes: while produced < max_new_tokens {
             let started = Instant::now();
             let pending = text_tokens[fed..].to_vec();
+            let text_before_pass = text_tokens.len();
             let mut guesses = Vec::new();
             let mut guess_source = "";
             if pending.len() == 1 && guess_mode != GuessCacheMode::Off {
                 let room = (max_new_tokens - produced).saturating_sub(1) as usize;
                 let count = guess_count(text_kept, text_guessed, take_back_limit).min(room);
-                if let Some(found) = lookup_in_text(&text_tokens, count) {
+                if let Some(found) = text_lookup.propose(&text_tokens, count) {
                     guesses = found;
                     guess_source = "the request";
                 } else if guess_mode == GuessCacheMode::All {
@@ -1407,6 +1409,7 @@ impl NetworkCoordinator {
                 first_pass_tokens = outputs.len();
             }
             fed += pending.len() + accepted;
+            text_lookup.advance(text_tokens.len() - text_before_pass);
             rewind = accepted < guesses.len();
             guessed += guesses.len();
             kept += accepted;
@@ -1945,6 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn reference_generate_is_deterministic() {
         let coordinator = NetworkCoordinator::new(vec![LayerMetadata {
+            state_bytes: 0,
             layer_id: 0,
             weight_bytes: 128,
             activation_bytes: 8,

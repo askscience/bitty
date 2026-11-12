@@ -324,6 +324,11 @@ impl HardwareProfile {
 pub struct LayerMetadata {
     pub layer_id: u32,
     pub weight_bytes: u64,
+    /// Memory the engine keeps for this layer on top of its weights and the overhead of a
+    /// stage: the state of a recurrent layer for every request and every token it can take
+    /// back. Counted for memory, not for disk.
+    #[serde(default)]
+    pub state_bytes: u64,
     pub activation_bytes: u64,
     pub estimated_flops: f64,
     pub precision_critical: bool,

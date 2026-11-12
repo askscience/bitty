@@ -3751,7 +3751,16 @@ fn refuse_stage_past_memory(stage: &Path) -> Result<(), String> {
         profile.available_ram_mb =
             bitty_worker::profiler::available_ram_mb_now().min(profile.ram_mb);
     }
+    // the state of the recurrent layers of the file, as the leader counted it
+    let options = bitty_inference::StageOptions::from_env();
+    let state = bitty_model::ModelMetadata::from_gguf_path(stage)
+        .map(|metadata| {
+            metadata.state_bytes_per_layer(options.sessions, options.rollback)
+                * metadata.recurrent_layers().len() as u64
+        })
+        .unwrap_or(0);
     let needed = std::fs::metadata(stage).map(|file| file.len()).unwrap_or(0)
+        + state
         + bitty_protocol::stage_overhead_bytes();
     let limit = profile.hard_memory_bytes(bitty_protocol::MEMORY_RESERVE_FRACTION);
     if needed <= limit {
@@ -3786,13 +3795,27 @@ fn request_id() -> String {
 fn leader_layers(model_file: &Path, fallback_count: u32) -> Vec<LayerMetadata> {
     match bitty_model::ModelMetadata::from_gguf_path(model_file) {
         Ok(metadata) => {
-            let layers = metadata.layer_metadata();
+            let mut layers = metadata.layer_metadata();
             if !layers.is_empty() && layers.iter().all(|layer| layer.weight_bytes > 0) {
+                // Every node runs its engine with the settings of this one: the state of
+                // the recurrent layers grows with the requests and the tokens taken back.
+                let options = bitty_inference::StageOptions::from_env();
+                let state = metadata.state_bytes_per_layer(options.sessions, options.rollback);
+                let recurrent = metadata.recurrent_layers();
+                for layer in &mut layers {
+                    if recurrent.contains(&layer.layer_id) {
+                        layer.state_bytes = state;
+                    }
+                }
                 let bytes: u64 = layers.iter().map(|layer| layer.weight_bytes).sum();
                 println!(
-                    "planning with {} layers of about {} MB each",
+                    "planning with {} layers of about {} MB each, and {} MB of state for each of the {} recurrent ones ({} requests, {} tokens taken back)",
                     layers.len(),
-                    bytes / layers.len() as u64 / (1024 * 1024)
+                    bytes / layers.len() as u64 / (1024 * 1024),
+                    state / (1024 * 1024),
+                    recurrent.len(),
+                    options.sessions,
+                    options.rollback
                 );
                 return layers;
             }
@@ -3815,6 +3838,7 @@ fn leader_layers(model_file: &Path, fallback_count: u32) -> Vec<LayerMetadata> {
 fn demo_layers(count: u32) -> Vec<LayerMetadata> {
     (0..count)
         .map(|layer_id| LayerMetadata {
+            state_bytes: 0,
             layer_id,
             weight_bytes: 512_000,
             activation_bytes: 4096,
