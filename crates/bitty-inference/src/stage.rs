@@ -60,6 +60,11 @@ pub struct StageOptions {
     /// that can be checked in one pass. Costs memory: a copy of the state of every recurrent layer for every
     /// request (2.09 MiB a layer and request for Qwen3.5-35B).
     pub rollback: u32,
+    /// Sends the hidden states to the next stage as f16, half the bytes of f32. Every stage
+    /// reads both. Off unless `BITTY_WIRE_F16=1`: on Qwen3.5-0.8B cut in three it moved the
+    /// best logits by up to 0.45 (the hidden states are all small, so this is the precision
+    /// of f16 itself, not a few large values), where f32 gives the whole model bit for bit.
+    pub wire_f16: bool,
 }
 
 impl StageOptions {
@@ -92,6 +97,8 @@ impl StageOptions {
         if let Some(rollback) = read("BITTY_STAGE_ROLLBACK") {
             options.rollback = rollback;
         }
+        // half the bytes between the stages, at the price of the exact numbers
+        options.wire_f16 = read("BITTY_WIRE_F16") == Some(1);
         options
     }
 }
@@ -123,6 +130,7 @@ impl Default for StageOptions {
             gpu_output: false,
             gpu_auto: false,
             rollback: DEFAULT_ROLLBACK,
+            wire_f16: false,
         }
     }
 }
@@ -172,6 +180,26 @@ pub struct StageExecutor {
     /// Stops a guess of the running engine; reachable while `engine` is locked by the
     /// thread that waits for the guess.
     abort: Arc<Mutex<Option<crate::stage_process::StageAbort>>>,
+}
+
+/// Hidden states as little-endian f16, rounded to the nearest. Values past the range of f16
+/// (65504) become infinite; the residual stream of the models served stays far below it.
+fn f32_to_f16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| half::f16::from_f32(*value).to_le_bytes())
+        .collect()
+}
+
+fn f16_to_f32_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .chunks_exact(2)
+        .flat_map(|pair| {
+            half::f16::from_le_bytes([pair[0], pair[1]])
+                .to_f32()
+                .to_le_bytes()
+        })
+        .collect()
 }
 
 /// The name a guess has for the engine: one request never has two with the same position.
@@ -578,6 +606,7 @@ impl LayerExecutor for StageExecutor {
 
         let hidden_size = self.metadata.hidden_size as usize;
         self.blocking(move |this, engine| {
+            let mut activation = activation;
             let first = range.start_layer == 0;
             let tokens = if first {
                 if activation.payload.is_empty() || activation.payload.len() % 4 != 0 {
@@ -587,13 +616,18 @@ impl LayerExecutor for StageExecutor {
                 }
                 activation.payload.len() / 4
             } else {
+                // the engine reads f32: hidden states that came as f16 are widened here
+                if activation.dtype == ActivationDType::Fp16 {
+                    activation.payload = f16_to_f32_bytes(&activation.payload);
+                    activation.dtype = ActivationDType::F32;
+                }
                 let row = hidden_size * 4;
                 if activation.dtype != ActivationDType::F32
                     || activation.payload.is_empty()
                     || activation.payload.len() % row != 0
                 {
                     return Err(ExecutorError::Failed(format!(
-                        "stage {}..{} expects f32 hidden states of width {hidden_size}",
+                        "stage {}..{} expects f32 or f16 hidden states of width {hidden_size}",
                         range.start_layer, range.end_layer_exclusive
                     )));
                 }
@@ -737,17 +771,24 @@ impl LayerExecutor for StageExecutor {
             };
             let (rewind_to, every_row, guess) =
                 (activation.rewind_to, activation.every_row, activation.guess);
-            let mut payload = Vec::with_capacity(values.len() * 4);
-            for value in &values {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
+            // hidden states go to the next stage, logits of the whole vocabulary to the leader
+            let hidden = shape.len() == 2;
+            let (dtype, payload) = if hidden && this.options.wire_f16 {
+                (ActivationDType::Fp16, f32_to_f16_bytes(&values))
+            } else {
+                let mut payload = Vec::with_capacity(values.len() * 4);
+                for value in &values {
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+                (ActivationDType::F32, payload)
+            };
             let mut output = ActivationTensor::new(
                 activation.request_id,
                 activation.token_position,
                 range.start_layer,
                 range.end_layer_exclusive,
                 shape,
-                ActivationDType::F32,
+                dtype,
                 payload,
             );
             // the stages that follow must go back and answer in the same way

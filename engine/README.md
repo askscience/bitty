@@ -167,12 +167,22 @@ to change is not worth a download of several gigabytes.
 `BITTY_PREPARE_SETTLE_SECS` changes the wait; 0 turns this off, and the layers
 are loaded by the first request as before.
 
-The final stage sends the coordinator only the best 1024 logits, as pairs of
-token id and logit: a few KB per token where the whole vocabulary is about
-1 MB. The engine picks them itself (`bitty-stage --top-logits N`), so an engine
-built before this option has to be rebuilt. `BITTY_TOP_LOGITS` changes the
-number; 0 sends everything. Sampling gives the same text as long as the number
-is not below `--top-k`.
+The final stage sends the coordinator only the best 64 logits of each token, as
+pairs of token id and logit: 512 bytes where the whole vocabulary is about 1 MB.
+The engine picks them itself (`bitty-stage --top-logits N`). `BITTY_TOP_LOGITS`
+on the node that holds the final stage changes the number; 0 sends everything.
+Sampling gives the same text as long as the number is not below `--top-k` (20
+by default); a request with a larger `--top-k` samples among the 64. It was
+1024 until a pass came to carry up to 9 tokens: 72 KB on the way back through
+the relays for a pass of 8 guesses, 4.5 KB now.
+
+The hidden states go from stage to stage as f32, 8 KB per token on the 35B
+model. `BITTY_WIRE_F16=1` on the nodes sends them as f16, half of that, and
+every stage reads both. It is off because it is not exact: on the 0.8B model
+cut in three it gave the same tokens but moved the best ten logits by up to
+0.45 (the largest difference among all the logits returned was 0.59), against
+0 with f32. The hidden states of that model are all below 4, so this is the
+precision of f16 itself and keeping a few large values aside would not help.
 
 ## A draft model on the leader
 
@@ -250,11 +260,13 @@ asked only when the text has none. A pass with no match is a plain pass.
 How many guesses go in a pass is chosen by speed. With `k` guesses that are each
 right with chance `p` a pass gives `(1 - p^(k+1)) / (1 - p)` tokens on average,
 and it costs what a pass with `k` guesses costs on this ring. The leader keeps
-the average time of the passes by their number of guesses (a straight line
-through those averages for the sizes not tried yet, forgotten when the plan
-changes), estimates `p` from the request, starting from the earlier ones, and
-sends the number, between 0 and the 8 the engines can take back, that gives the
-most tokens a second. On the four-machine ring of the measurements a pass of 8
+the average time of the passes by their number of guesses, forgotten when the
+plan changes. A pass without guesses keeps its own average; for the passes with
+guesses it fits a straight line, a fixed cost plus a cost for each guess, through
+the averages of the sizes tried, each weighed by the square of the passes behind
+it, so that one pass that met a slow relay does not decide. It estimates `p`
+from the request, starting from the earlier ones, and sends the number, between
+0 and the 8 the engines can take back, that gives the most tokens a second. On the four-machine ring of the measurements a pass of 8
 guesses cost about twice one of 4, so a text that was guessed nearly whole went
 faster with 4. On one machine, where no trip is saved, it seldom sends any;
 then every 16th pass still carries two, to notice a text that starts to repeat.

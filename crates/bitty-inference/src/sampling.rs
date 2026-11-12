@@ -141,13 +141,20 @@ fn by_logit(left: &(u32, f32), right: &(u32, f32)) -> std::cmp::Ordering {
     right.1.total_cmp(&left.1).then(left.0.cmp(&right.0))
 }
 
-/// How many logits the final stage sends to the coordinator: `BITTY_TOP_LOGITS`, 1024 by
-/// default. 0 sends the whole vocabulary.
+/// How many logits the final stage sends to the coordinator for each token: `BITTY_TOP_LOGITS`,
+/// 64 by default. 0 sends the whole vocabulary.
+///
+/// The sampler keeps the best `top_k` of them (20 by default) and the text is the same as long
+/// as the limit is not below it; a request with a larger `top_k` samples among these. Every
+/// one costs 8 bytes on the way back to the leader for every token of a pass: 1024 made a pass
+/// with 8 guesses carry 72 KB through the relays, 64 makes it 4.5 KB.
+pub const DEFAULT_TOP_LOGITS: usize = 64;
+
 pub fn top_logits_limit() -> usize {
     std::env::var("BITTY_TOP_LOGITS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(1024)
+        .unwrap_or(DEFAULT_TOP_LOGITS)
 }
 
 /// The `limit` best logits as pairs of token and logit, best first.

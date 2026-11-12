@@ -316,8 +316,9 @@ impl GuessHistory {
 const PRIOR_PASSES: f64 = 4.0;
 /// The chance that a guess is right before anything was seen: a match of three tokens.
 const FIRST_CHANCE: f64 = 0.6;
-/// Weight of a new pass in the average time of the passes with as many guesses.
-const TIME_WEIGHT: f64 = 0.25;
+/// The average time of the passes with as many guesses is a plain mean of the first ones,
+/// then follows the last this many.
+const TIME_MEMORY: f64 = 8.0;
 /// Before two sizes of pass were timed: how much longer each guess makes a pass, as a share
 /// of a pass. Measured on a ring of four with three hops through a relay: about 0.2.
 const ASSUMED_COST_PER_GUESS: f64 = 0.2;
@@ -330,18 +331,23 @@ const CHANCE_FADE: f64 = 0.98;
 ///
 /// A pass with `k` guesses that are each right with chance `p` (as long as the ones before
 /// them were) gives `(1 - p^(k+1)) / (1 - p)` tokens on average, and costs the time of a
-/// pass with `k` guesses. That time is measured: the average of the passes with as many
-/// guesses, and a straight line through those averages for the sizes not tried yet. The
-/// count that gives the most tokens a second wins, 0 included: on a ring where long passes
-/// cost a lot and guesses are seldom right, no guess at all is the fastest.
+/// pass with `k` guesses. That time is measured. A pass without guesses has its own average;
+/// the passes with guesses lie on a straight line, fixed cost plus a cost for each guess,
+/// fitted through the averages of every size tried, each weighed by the square of the passes
+/// behind it.
+/// The line and not the averages themselves is used, since on a ring with relays one slow
+/// pass would otherwise decide. The count that gives the most tokens a second wins, 0
+/// included: on a ring where long passes cost a lot and guesses are seldom right, no guess at
+/// all is the fastest.
 ///
 /// The times belong to one plan of the ring: [`GuessTuning::follow_plan`] forgets them when
 /// it changes.
 #[derive(Clone, Debug, Default)]
 pub struct GuessTuning {
     plan: String,
-    /// The average time of a pass in ms, by the number of guesses it carried.
-    times: Vec<Option<f64>>,
+    /// The average time of a pass in ms and the passes behind it, by the number of guesses
+    /// it carried.
+    times: Vec<Option<(f64, u32)>>,
     /// Guesses that were right, and passes where one was wrong, over earlier requests.
     right: f64,
     wrong: f64,
@@ -384,8 +390,12 @@ impl GuessTuning {
         }
         let slot = &mut self.times[guesses];
         *slot = Some(match *slot {
-            Some(average) => average + (ms - average) * TIME_WEIGHT,
-            None => ms,
+            Some((average, passes)) => {
+                let passes = passes.saturating_add(1);
+                let weight = 1.0 / f64::from(passes).min(TIME_MEMORY);
+                (average + (ms - average) * weight, passes)
+            }
+            None => (ms, 1),
         });
     }
 
@@ -407,38 +417,68 @@ impl GuessTuning {
         ((right + earlier * PRIOR_PASSES) / (right + wrong + PRIOR_PASSES)).clamp(0.0, 0.999)
     }
 
-    /// The time of a pass with `guesses` guesses: measured, or from the line through the
-    /// measured sizes. `None` before any pass was timed.
+    /// The time of a pass with `guesses` guesses: the average of the passes without any, and
+    /// the line through the passes with some for the others. `None` before any pass was
+    /// timed.
     pub fn pass_ms(&self, guesses: usize) -> Option<f64> {
-        if let Some(Some(measured)) = self.times.get(guesses) {
-            return Some(*measured);
+        let plain = self.times.first().copied().flatten().map(|(time, _)| time);
+        if guesses == 0 {
+            if plain.is_some() {
+                return plain;
+            }
         }
-        let points: Vec<(f64, f64)> = self
+        // (guesses, average, weight) of every size of pass with guesses that was timed
+        let points: Vec<(f64, f64, f64)> = self
             .times
             .iter()
             .enumerate()
-            .filter_map(|(size, time)| time.map(|time| (size as f64, time)))
+            .skip(1)
+            .filter_map(|(size, time)| {
+                // an average of many passes counts far more than a single pass, which may
+                // have met a slow relay
+                time.map(|(time, passes)| {
+                    (
+                        size as f64,
+                        time,
+                        f64::from(passes).min(TIME_MEMORY).powi(2),
+                    )
+                })
+            })
             .collect();
-        let (base, slope) = match points.as_slice() {
-            [] => return None,
-            [(size, time)] => {
+        let (base, slope) = match (points.as_slice(), plain) {
+            ([], None) => return None,
+            // nothing with guesses yet: each makes the pass a share longer
+            ([], Some(plain)) => (plain, plain * ASSUMED_COST_PER_GUESS),
+            // one size: the line from the pass without guesses to it, or the assumed share
+            ([(size, time, _)], Some(plain)) => (plain, ((time - plain) / size).max(0.0)),
+            ([(size, time, _)], None) => {
                 let base = time / (1.0 + ASSUMED_COST_PER_GUESS * size);
                 (base, base * ASSUMED_COST_PER_GUESS)
             }
-            points => {
-                let n = points.len() as f64;
-                let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / n;
-                let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / n;
-                let spread: f64 = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
+            (points, _) => {
+                let weight: f64 = points.iter().map(|(_, _, w)| w).sum();
+                let mean_x = points.iter().map(|(x, _, w)| x * w).sum::<f64>() / weight;
+                let mean_y = points.iter().map(|(_, y, w)| y * w).sum::<f64>() / weight;
+                let spread: f64 = points
+                    .iter()
+                    .map(|(x, _, w)| w * (x - mean_x).powi(2))
+                    .sum();
                 let joint: f64 = points
                     .iter()
-                    .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                    .map(|(x, y, w)| w * (x - mean_x) * (y - mean_y))
                     .sum();
                 // a pass never gets cheaper with more tokens in it
-                let slope = (joint / spread).max(0.0);
+                let slope = if spread > 0.0 {
+                    (joint / spread).max(0.0)
+                } else {
+                    0.0
+                };
                 ((mean_y - slope * mean_x).max(1.0), slope)
             }
         };
+        if guesses == 0 {
+            return Some(base);
+        }
         Some(base + slope * guesses as f64)
     }
 
@@ -472,7 +512,9 @@ impl GuessTuning {
             .times
             .iter()
             .enumerate()
-            .filter_map(|(size, time)| time.map(|time| format!("{size}: {time:.0}")))
+            .filter_map(|(size, time)| {
+                time.map(|(time, passes)| format!("{size}: {time:.0} ({passes})"))
+            })
             .collect();
         format!(
             "ms per pass by guesses [{}], a guess is right {:.0}% of the time",
@@ -707,18 +749,35 @@ mod tests {
     }
 
     #[test]
-    fn expensive_long_passes_get_fewer_guesses() {
-        // the ring measured today: 0.8 s with none, 1.5 s with 4, 3.3 s with 8
+    fn the_line_through_the_passes_with_guesses_has_its_own_fixed_cost() {
+        // a pass with any guess costs a step more than one without
         let mut tuning = GuessTuning::default();
-        tuning.record_pass(0, 790.0);
-        tuning.record_pass(4, 1500.0);
-        tuning.record_pass(8, 3300.0);
-        let best = tuning.best_count(0.95, 8);
-        assert!((3..8).contains(&best), "{best}");
-        // the measured times are used as they are, the line only between them
-        assert_eq!(tuning.pass_ms(4), Some(1500.0));
-        let between = tuning.pass_ms(6).unwrap();
-        assert!(between > 1500.0 && between < 3300.0, "{between}");
+        tuning.record_pass(0, 600.0);
+        for _ in 0..4 {
+            tuning.record_pass(2, 1400.0);
+            tuning.record_pass(6, 1800.0);
+        }
+        assert_eq!(tuning.pass_ms(0), Some(600.0));
+        assert!((tuning.pass_ms(4).unwrap() - 1600.0).abs() < 1e-6);
+        assert!((tuning.pass_ms(1).unwrap() - 1300.0).abs() < 1e-6);
+        // the step is not worth it when guesses are right half of the time
+        assert_eq!(tuning.best_count(0.5, 8), 0);
+        // it is when they are nearly always right
+        assert!(tuning.best_count(0.98, 8) >= 6);
+    }
+
+    #[test]
+    fn one_slow_pass_does_not_decide() {
+        let mut tuning = GuessTuning::default();
+        tuning.record_pass(0, 600.0);
+        for _ in 0..8 {
+            tuning.record_pass(4, 1000.0);
+            tuning.record_pass(7, 1300.0);
+        }
+        // a single pass of 8 that met a slow relay
+        tuning.record_pass(8, 5400.0);
+        let eight = tuning.pass_ms(8).unwrap();
+        assert!(eight < 2000.0, "{eight}");
     }
 
     #[test]
@@ -729,6 +788,9 @@ mod tests {
         assert!(tuning.best_count(0.9, 8) >= 5);
         tuning.record_pass(0, 1000.0);
         assert!((tuning.pass_ms(5).unwrap() - 2000.0).abs() < 1e-6);
+        tuning.record_pass(5, 1500.0);
+        assert!((tuning.pass_ms(5).unwrap() - 1500.0).abs() < 1e-6);
+        assert!((tuning.pass_ms(1).unwrap() - 1100.0).abs() < 1e-6);
     }
 
     #[test]

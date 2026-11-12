@@ -337,6 +337,7 @@ dependencies = [
  "async-trait",
  "bitty-model",
  "bitty-protocol",
+ "half",
  "metrics",
  "proptest",
  "rand 0.8.6",

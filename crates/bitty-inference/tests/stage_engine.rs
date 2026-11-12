@@ -141,6 +141,51 @@ async fn chained_stages_match_the_whole_model() {
     let (again, _) = generate(&chain, "chained-again", &prompt, 8).await;
     assert_eq!(again, reference);
 
+    // hidden states sent as f16 between the stages (BITTY_WIRE_F16=1): the same tokens here,
+    // logits off by the precision of f16
+    let half = |executor: StageExecutor| {
+        executor.with_options(StageOptions {
+            wire_f16: true,
+            ..options
+        })
+    };
+    let half_chain = vec![
+        (half(load().await), range(0, cut_a)),
+        (half(load().await), range(cut_a, cut_b)),
+        (half(load().await), range(cut_b, layers)),
+    ];
+    let (halved, halved_logits) = generate(&half_chain, "chained-f16", &prompt, 8).await;
+    assert_eq!(
+        halved, reference,
+        "f16 between the stages changed the tokens"
+    );
+    // only the best logits come back: at the edge of that set one run can have a token the
+    // other left out, so the logits both runs have are compared
+    let worst_half = reference_logits
+        .iter()
+        .flatten()
+        .zip(halved_logits.iter().flatten())
+        .filter(|(a, b)| a.is_finite() && b.is_finite())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |logit diff| with f16 between the stages: {worst_half}");
+    // the logits that decide: the best ten of every position
+    let best_half = reference_logits
+        .iter()
+        .zip(&halved_logits)
+        .map(|(a, b)| {
+            let mut order: Vec<usize> = (0..a.len()).filter(|&i| a[i].is_finite()).collect();
+            order.sort_by(|&x, &y| a[y].total_cmp(&a[x]));
+            order
+                .iter()
+                .take(10)
+                .map(|&i| (a[i] - b[i]).abs())
+                .fold(0.0f32, f32::max)
+        })
+        .fold(0.0f32, f32::max);
+    eprintln!("max |logit diff| among the best ten with f16: {best_half}");
+    assert!(worst_half < 1.0, "f16 moved the logits by {worst_half}");
+
     // a request the stage never opened is refused instead of running on someone else's state
     let stray = chain[0]
         .0

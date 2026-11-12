@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 bitty-model.workspace = true
 bitty-protocol.workspace = true
+half.workspace = true
 metrics.workspace = true
 rand.workspace = true
 serde.workspace = true
