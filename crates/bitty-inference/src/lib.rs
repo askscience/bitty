@@ -19,8 +19,8 @@ pub use gpu::{
     GpuDevice, GpuEngine, GpuFit, GpuMode,
 };
 pub use guess_cache::{
-    guess_cache_mode, guess_count, history_file_name, lookup_in_text, GuessCacheMode, GuessHistory,
-    TextLookup,
+    guess_cache_mode, history_file_name, lookup_in_text, GuessCacheMode, GuessHistory, GuessTuning,
+    RequestGuesses, TextLookup,
 };
 pub use lifecycle::{
     BatchPolicy, DecodePipeline, InferencePhase, PrefixCacheKey, RequestLifecycle,

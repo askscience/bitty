@@ -2,9 +2,9 @@ use crate::security::{request_rate_limiter, AuthMode, SharedRateLimiter};
 use crate::worker_client::{connect_worker, WorkerRpcClient};
 use crate::{Halda, Registry, SchedulerConfig};
 use bitty_inference::{
-    guess_cache_mode, guess_count, history_file_name, DraftModel, GuessCacheMode, GuessHistory,
-    Sampler, SamplingOptions, StageOptions, TextCodec, TextLookup, TextStream, DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
+    guess_cache_mode, history_file_name, DraftModel, GuessCacheMode, GuessHistory, GuessTuning,
+    RequestGuesses, Sampler, SamplingOptions, StageOptions, TextCodec, TextLookup, TextStream,
+    DEFAULT_TOP_K, DEFAULT_TOP_P,
 };
 #[cfg(test)]
 use bitty_inference::{LayerExecutor, LowBitReferenceExecutor};
@@ -65,6 +65,9 @@ pub struct NetworkCoordinator {
     /// itself, opened on the first request.
     guess_dir: Option<PathBuf>,
     guess_history: Arc<std::sync::Mutex<Option<GuessHistory>>>,
+    /// What passes cost by the number of guesses in them, and how often guesses are right:
+    /// what decides how many guesses a pass carries.
+    guess_tuning: Arc<std::sync::Mutex<GuessTuning>>,
     /// The plan in use. It is kept while it holds, also across a restart of the leader.
     plan: Arc<Mutex<KeptPlan>>,
     /// The model as the nodes can fetch it, told to each node that registers.
@@ -191,6 +194,18 @@ fn default_draft_tokens() -> usize {
         .unwrap_or(0)
 }
 
+/// `BITTY_GUESS_COUNT=N` on the leader: every pass with a match carries N guesses from text,
+/// whatever the passes cost. For tests and for comparing by hand.
+fn fixed_guess_count() -> Option<usize> {
+    std::env::var("BITTY_GUESS_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// When the guesses are found not worth their cost, a pass in this many still carries two,
+/// to see whether that has changed.
+const PROBE_EVERY_PASSES: u32 = 16;
+
 /// `BITTY_PIPELINE=1` sends a guess for the next token behind every token, for every
 /// request (`--pipeline` asks for it with one request).
 fn pipeline_wanted() -> bool {
@@ -287,6 +302,7 @@ impl NetworkCoordinator {
             draft: Arc::default(),
             guess_dir: None,
             guess_history: Arc::default(),
+            guess_tuning: Arc::default(),
             plan: Arc::new(Mutex::new(KeptPlan {
                 ranges: Vec::new(),
                 file: None,
@@ -1097,6 +1113,21 @@ impl NetworkCoordinator {
         let take_back_limit = StageOptions::from_env().rollback as usize;
         let (mut text_guessed, mut text_kept) = (0usize, 0usize);
         let mut text_lookup = TextLookup::new();
+        let mut request_guesses = RequestGuesses::default();
+        // the times of the passes belong to this plan of the ring
+        let plan_key = assignments
+            .iter()
+            .map(|assignment| {
+                format!(
+                    "{} {}..{}",
+                    assignment.node_id.0,
+                    assignment.range.start_layer,
+                    assignment.range.end_layer_exclusive
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.tuning().follow_plan(&plan_key);
         // how many of them the workers hold
         let mut fed = 0usize;
         // the workers hold guesses after `fed` that were wrong
@@ -1113,7 +1144,18 @@ impl NetworkCoordinator {
             let mut guess_source = "";
             if pending.len() == 1 && guess_mode != GuessCacheMode::Off {
                 let room = (max_new_tokens - produced).saturating_sub(1) as usize;
-                let count = guess_count(text_kept, text_guessed, take_back_limit).min(room);
+                let mut count = {
+                    let tuning = self.tuning();
+                    tuning.best_count(tuning.chance(request_guesses), take_back_limit.min(room))
+                };
+                // Without guesses the chance is never seen again: now and then a short guess
+                // goes out anyway, so that a text that starts to repeat is noticed.
+                if count == 0 && step % PROBE_EVERY_PASSES == 0 {
+                    count = 2.min(take_back_limit).min(room);
+                }
+                if let Some(fixed) = fixed_guess_count() {
+                    count = fixed.min(take_back_limit).min(room);
+                }
                 if let Some(found) = text_lookup.propose(&text_tokens, count) {
                     guesses = found;
                     guess_source = "the request";
@@ -1417,6 +1459,16 @@ impl NetworkCoordinator {
             if guess_source != "the draft model" {
                 text_guessed += guesses.len();
                 text_kept += accepted;
+                // A pass with the last token stopped at the end, not at a wrong guess. The
+                // prompt and the passes with the draft model cost something else.
+                let mut tuning = self.tuning();
+                if !done && !guesses.is_empty() {
+                    request_guesses.record(guesses.len(), accepted);
+                    tuning.record_outcome(guesses.len(), accepted);
+                }
+                if step > 0 && guess_mode != GuessCacheMode::Off {
+                    tuning.record_pass(guesses.len(), started.elapsed().as_secs_f64() * 1000.0);
+                }
             }
             if let (Some(model), "the draft model") = (&draft, guess_source) {
                 model
@@ -1530,6 +1582,9 @@ impl NetworkCoordinator {
                 in_hops,
                 hops.join(", ")
             );
+            if guess_mode != GuessCacheMode::Off {
+                println!("guesses: {}", self.tuning().summary());
+            }
         }
 
         for client in &mut worker_clients {
@@ -1551,6 +1606,12 @@ impl NetworkCoordinator {
             Some(status) => Err(status),
             None => Ok(outputs),
         }
+    }
+
+    fn tuning(&self) -> std::sync::MutexGuard<'_, GuessTuning> {
+        self.guess_tuning
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Opens the history of answers on the first request that wants it.

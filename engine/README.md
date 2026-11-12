@@ -245,10 +245,21 @@ continuation most of them share is sent. The answers are kept as token ids in
 file per model file and vocabulary size.
 
 The guesses go through the same check as the ones of the draft model, which is
-asked only when the text has none. How many go in a pass follows how often they
-were right in the request: all the engines can take back (8) while at least half
-of them were right, half of that while a quarter were, else one. A pass with no
-match is a plain pass.
+asked only when the text has none. A pass with no match is a plain pass.
+
+How many guesses go in a pass is chosen by speed. With `k` guesses that are each
+right with chance `p` a pass gives `(1 - p^(k+1)) / (1 - p)` tokens on average,
+and it costs what a pass with `k` guesses costs on this ring. The leader keeps
+the average time of the passes by their number of guesses (a straight line
+through those averages for the sizes not tried yet, forgotten when the plan
+changes), estimates `p` from the request, starting from the earlier ones, and
+sends the number, between 0 and the 8 the engines can take back, that gives the
+most tokens a second. On the four-machine ring of the measurements a pass of 8
+guesses cost about twice one of 4, so a text that was guessed nearly whole went
+faster with 4. On one machine, where no trip is saved, it seldom sends any;
+then every 16th pass still carries two, to notice a text that starts to repeat.
+`BITTY_TIMING=1` prints the times it holds and the chance; `BITTY_GUESS_COUNT=N`
+on the leader fixes the number for every pass with a match.
 
 It pays on answers that copy the prompt (quotes, summaries, corrections, code)
 and on answers that come back (fixed phrases, formats, the same question asked

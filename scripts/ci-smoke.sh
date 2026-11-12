@@ -16,6 +16,9 @@ MODEL="$(native "$3")"
 BITTY_STAGE_BIN="$(native "$2")"
 export BITTY_STAGE_BIN BITTY_STAGE_THREADS=2
 export BITTY_DRAFT_MODEL="$MODEL" BITTY_DRAFT_THREADS=2 BITTY_TIMING=1
+# On one machine a pass with guesses costs more than the trip it saves, and the leader would
+# send few: the check is that guesses from text work, so they go out every time.
+export BITTY_GUESS_COUNT=4
 WORK="$(mktemp -d)"
 DATA="$(native "$WORK")"
 PIDS=()

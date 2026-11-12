@@ -311,24 +311,174 @@ impl GuessHistory {
     }
 }
 
-/// How many guesses to send in a pass: as many as the engines can take back when the guesses
-/// of the request have mostly been right, fewer when they have mostly been wrong.
-/// `kept` and `guessed` count the guesses of this request so far.
-pub fn guess_count(kept: usize, guessed: usize, limit: usize) -> usize {
-    if limit == 0 {
-        return 0;
+/// Weight, in passes, of the chance carried over from earlier requests against the passes
+/// of the request itself.
+const PRIOR_PASSES: f64 = 4.0;
+/// The chance that a guess is right before anything was seen: a match of three tokens.
+const FIRST_CHANCE: f64 = 0.6;
+/// Weight of a new pass in the average time of the passes with as many guesses.
+const TIME_WEIGHT: f64 = 0.25;
+/// Before two sizes of pass were timed: how much longer each guess makes a pass, as a share
+/// of a pass. Measured on a ring of four with three hops through a relay: about 0.2.
+const ASSUMED_COST_PER_GUESS: f64 = 0.2;
+/// The memory of the chance across requests fades by this much at every pass, so the leader
+/// follows what it is asked now.
+const CHANCE_FADE: f64 = 0.98;
+
+/// How many guesses a pass should carry, from what passes cost on this ring and how often
+/// guesses turn out right.
+///
+/// A pass with `k` guesses that are each right with chance `p` (as long as the ones before
+/// them were) gives `(1 - p^(k+1)) / (1 - p)` tokens on average, and costs the time of a
+/// pass with `k` guesses. That time is measured: the average of the passes with as many
+/// guesses, and a straight line through those averages for the sizes not tried yet. The
+/// count that gives the most tokens a second wins, 0 included: on a ring where long passes
+/// cost a lot and guesses are seldom right, no guess at all is the fastest.
+///
+/// The times belong to one plan of the ring: [`GuessTuning::follow_plan`] forgets them when
+/// it changes.
+#[derive(Clone, Debug, Default)]
+pub struct GuessTuning {
+    plan: String,
+    /// The average time of a pass in ms, by the number of guesses it carried.
+    times: Vec<Option<f64>>,
+    /// Guesses that were right, and passes where one was wrong, over earlier requests.
+    right: f64,
+    wrong: f64,
+}
+
+/// How the guesses of one request went: guesses right, and passes where one was wrong.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestGuesses {
+    pub right: usize,
+    pub wrong: usize,
+}
+
+impl RequestGuesses {
+    /// Counts a pass that sent `sent` guesses and kept `kept`.
+    pub fn record(&mut self, sent: usize, kept: usize) {
+        self.right += kept;
+        if kept < sent {
+            self.wrong += 1;
+        }
     }
-    // no record yet: a match of three tokens is right often enough to try them all
-    if guessed < 4 {
-        return limit;
+}
+
+impl GuessTuning {
+    /// Forgets the times when the ring has another plan: the passes cost something else.
+    pub fn follow_plan(&mut self, plan: &str) {
+        if self.plan != plan {
+            self.plan = plan.to_string();
+            self.times.clear();
+        }
     }
-    let rate = kept as f64 / guessed as f64;
-    if rate >= 0.5 {
-        limit
-    } else if rate >= 0.25 {
-        limit.div_ceil(2)
-    } else {
-        1
+
+    /// The time of a pass that carried `guesses` guesses. The prompt is not a pass of this
+    /// kind and is not to be recorded.
+    pub fn record_pass(&mut self, guesses: usize, ms: f64) {
+        if !ms.is_finite() || ms <= 0.0 {
+            return;
+        }
+        if self.times.len() <= guesses {
+            self.times.resize(guesses + 1, None);
+        }
+        let slot = &mut self.times[guesses];
+        *slot = Some(match *slot {
+            Some(average) => average + (ms - average) * TIME_WEIGHT,
+            None => ms,
+        });
+    }
+
+    /// Counts the outcome of a pass with guesses for later requests.
+    pub fn record_outcome(&mut self, sent: usize, kept: usize) {
+        if sent == 0 {
+            return;
+        }
+        self.right = self.right * CHANCE_FADE + kept as f64;
+        self.wrong = self.wrong * CHANCE_FADE + f64::from(u8::from(kept < sent));
+    }
+
+    /// The chance that a guess is right for this request: what the request has shown, with
+    /// what the earlier ones showed as a start.
+    pub fn chance(&self, request: RequestGuesses) -> f64 {
+        let earlier =
+            (self.right + FIRST_CHANCE * PRIOR_PASSES) / (self.right + self.wrong + PRIOR_PASSES);
+        let (right, wrong) = (request.right as f64, request.wrong as f64);
+        ((right + earlier * PRIOR_PASSES) / (right + wrong + PRIOR_PASSES)).clamp(0.0, 0.999)
+    }
+
+    /// The time of a pass with `guesses` guesses: measured, or from the line through the
+    /// measured sizes. `None` before any pass was timed.
+    pub fn pass_ms(&self, guesses: usize) -> Option<f64> {
+        if let Some(Some(measured)) = self.times.get(guesses) {
+            return Some(*measured);
+        }
+        let points: Vec<(f64, f64)> = self
+            .times
+            .iter()
+            .enumerate()
+            .filter_map(|(size, time)| time.map(|time| (size as f64, time)))
+            .collect();
+        let (base, slope) = match points.as_slice() {
+            [] => return None,
+            [(size, time)] => {
+                let base = time / (1.0 + ASSUMED_COST_PER_GUESS * size);
+                (base, base * ASSUMED_COST_PER_GUESS)
+            }
+            points => {
+                let n = points.len() as f64;
+                let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / n;
+                let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / n;
+                let spread: f64 = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
+                let joint: f64 = points
+                    .iter()
+                    .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                    .sum();
+                // a pass never gets cheaper with more tokens in it
+                let slope = (joint / spread).max(0.0);
+                ((mean_y - slope * mean_x).max(1.0), slope)
+            }
+        };
+        Some(base + slope * guesses as f64)
+    }
+
+    /// How many guesses a pass should carry, at most `limit`, when each is right with
+    /// `chance`. 0 means a pass without guesses is the fastest.
+    pub fn best_count(&self, chance: f64, limit: usize) -> usize {
+        let tokens = |guesses: usize| {
+            if chance >= 0.999 {
+                guesses as f64 + 1.0
+            } else {
+                (1.0 - chance.powi(guesses as i32 + 1)) / (1.0 - chance)
+            }
+        };
+        let cost = |guesses: usize| {
+            self.pass_ms(guesses)
+                .unwrap_or(1.0 + ASSUMED_COST_PER_GUESS * guesses as f64)
+        };
+        (0..=limit)
+            .map(|guesses| (guesses, tokens(guesses) / cost(guesses)))
+            .fold(
+                (0, f64::MIN),
+                |best, next| if next.1 > best.1 { next } else { best },
+            )
+            .0
+    }
+
+    /// One line for the log: the time of a pass by its guesses, and the chance across
+    /// requests.
+    pub fn summary(&self) -> String {
+        let times: Vec<String> = self
+            .times
+            .iter()
+            .enumerate()
+            .filter_map(|(size, time)| time.map(|time| format!("{size}: {time:.0}")))
+            .collect();
+        format!(
+            "ms per pass by guesses [{}], a guess is right {:.0}% of the time",
+            times.join(", "),
+            self.chance(RequestGuesses::default()) * 100.0
+        )
     }
 }
 
@@ -545,12 +695,69 @@ mod tests {
     }
 
     #[test]
-    fn the_count_follows_how_often_the_guesses_were_right() {
-        assert_eq!(guess_count(0, 0, 4), 4);
-        assert_eq!(guess_count(6, 10, 4), 4);
-        assert_eq!(guess_count(3, 10, 4), 2);
-        assert_eq!(guess_count(1, 10, 4), 1);
-        assert_eq!(guess_count(5, 5, 0), 0);
+    fn many_guesses_go_out_when_they_are_right_and_passes_are_cheap() {
+        let mut tuning = GuessTuning::default();
+        tuning.follow_plan("a");
+        tuning.record_pass(0, 800.0);
+        tuning.record_pass(4, 900.0);
+        // right nine times in ten: the longest pass gives the most
+        assert_eq!(tuning.best_count(0.9, 8), 8);
+        // right one time in fifty: a guess is not worth its cost
+        assert_eq!(tuning.best_count(0.02, 8), 0);
+    }
+
+    #[test]
+    fn expensive_long_passes_get_fewer_guesses() {
+        // the ring measured today: 0.8 s with none, 1.5 s with 4, 3.3 s with 8
+        let mut tuning = GuessTuning::default();
+        tuning.record_pass(0, 790.0);
+        tuning.record_pass(4, 1500.0);
+        tuning.record_pass(8, 3300.0);
+        let best = tuning.best_count(0.95, 8);
+        assert!((3..8).contains(&best), "{best}");
+        // the measured times are used as they are, the line only between them
+        assert_eq!(tuning.pass_ms(4), Some(1500.0));
+        let between = tuning.pass_ms(6).unwrap();
+        assert!(between > 1500.0 && between < 3300.0, "{between}");
+    }
+
+    #[test]
+    fn one_timed_size_is_enough_to_start() {
+        let mut tuning = GuessTuning::default();
+        assert_eq!(tuning.pass_ms(3), None);
+        // with nothing timed, the assumed cost decides: long passes, guesses being right
+        assert!(tuning.best_count(0.9, 8) >= 5);
+        tuning.record_pass(0, 1000.0);
+        assert!((tuning.pass_ms(5).unwrap() - 2000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_new_plan_forgets_the_times() {
+        let mut tuning = GuessTuning::default();
+        tuning.follow_plan("a");
+        tuning.record_pass(2, 500.0);
+        tuning.follow_plan("a");
+        assert_eq!(tuning.pass_ms(2), Some(500.0));
+        tuning.follow_plan("b");
+        assert_eq!(tuning.pass_ms(2), None);
+    }
+
+    #[test]
+    fn the_chance_follows_the_request_and_starts_from_the_earlier_ones() {
+        let mut tuning = GuessTuning::default();
+        let fresh = RequestGuesses::default();
+        assert!((tuning.chance(fresh) - FIRST_CHANCE).abs() < 1e-9);
+        for _ in 0..50 {
+            tuning.record_outcome(4, 0);
+        }
+        // earlier requests guessed badly: a new one starts low
+        assert!(tuning.chance(fresh) < 0.1);
+        // and climbs as its own guesses are right
+        let mut request = RequestGuesses::default();
+        for _ in 0..10 {
+            request.record(8, 8);
+        }
+        assert!(tuning.chance(request) > 0.9);
     }
 
     #[test]
